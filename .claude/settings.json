@@ -1,7 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "Bash(npm install:*)"
+      "Bash(npm install:*)",
+      "Read(//Users/dejamant/dz/T/Zentrix/source/**)"
+    ],
+    "additionalDirectories": [
+      "/Users/dejamant/dz/T/Zentrix/source/energenius-nexus/infra/main-nginx"
     ]
   }
 }
