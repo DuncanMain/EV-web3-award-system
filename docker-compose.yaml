@@ -1,9 +1,7 @@
 services:
   app:
     container_name: neverflat-app
-    build:
-      context: .
-      dockerfile: Dockerfile.dev
+    image: ghcr.io/zentrixlab/neverflat:latest
     restart: unless-stopped
     env_file:
       - .env
