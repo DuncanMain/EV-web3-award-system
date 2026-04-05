@@ -1,37 +1,46 @@
-name: Deploy Neverflat to Development
+name: Deploy Neverflat
 
 on:
   push:
     branches:
       - main
 
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: zentrixlab/neverflat
+
 jobs:
-  deploy:
+  build-and-push:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
 
     steps:
       - name: Check out code
         uses: actions/checkout@v4
 
-      - name: Generate .env
-        run: |
-          cat <<EOF > .env
-          NODE_ENV=production
-          LOG_DESTINATION=${{ secrets.LOG_DESTINATION }}
-          APP_VERSION=${{ secrets.APP_VERSION }}
-          EOF
-
-      - name: Copy to server via SCP
-        uses: appleboy/scp-action@v0.1.5
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
         with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          port: 22
-          source: '.'
-          target: ~/neverflat/deploy
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: SSH & (re)deploy
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: SSH & deploy
         uses: appleboy/ssh-action@v0.1.5
         with:
           host: ${{ secrets.SERVER_HOST }}
@@ -41,23 +50,12 @@ jobs:
           script: |
             set -euo pipefail
 
-            DEPLOY_DIR=~/neverflat/deploy
-            LIVE_DIR=~/neverflat/live
+            cd ~/neverflat
 
-            # Stop existing containers
-            docker compose -f $LIVE_DIR/docker-compose.yaml down --remove-orphans || true
-
-            # Swap deploy → live
-            rm -rf $LIVE_DIR
-            mv $DEPLOY_DIR $LIVE_DIR
-
-            cd $LIVE_DIR
-
-            # Ensure shared network exists
             docker network create shared-proxy 2>/dev/null || true
 
-            # Build and start
-            echo "Pruning remote build cache older than 24h…"
-            docker builder prune --all --force --filter "until=24h" || true
+            docker compose pull
+            docker compose up -d --remove-orphans
 
-            docker compose up -d --build
+            echo "Pruning old images…"
+            docker image prune -f || true
