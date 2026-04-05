@@ -3,7 +3,7 @@ FROM node:24-alpine AS builder
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm ci
+RUN npm install
 
 COPY . .
 RUN npm run build
@@ -18,4 +18,4 @@ COPY --from=builder /app/package.json ./package.json
 
 EXPOSE 3003
 
-CMD ["node", "dist/main"]
+CMD ["node", "dist/src/main"]

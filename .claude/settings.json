@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "Bash(npm install:*)",
-      "Read(//Users/dejamant/dz/T/Zentrix/source/**)"
+      "Read(//Users/dejamant/dz/T/Zentrix/source/**)",
+      "Bash(docker build:*)",
+      "Bash(docker run:*)",
+      "Bash(curl -s http://localhost:3005/ingest/health)",
+      "Bash(docker stop:*)"
     ],
     "additionalDirectories": [
       "/Users/dejamant/dz/T/Zentrix/source/energenius-nexus/infra/main-nginx"
