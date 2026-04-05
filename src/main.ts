@@ -2,7 +2,7 @@ import { NestFactory } from '@nestjs/core';
 import { ConfigService } from '@nestjs/config';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { ValidationPipe } from '@nestjs/common';
-import { AccessTokenGuard } from './auth/guards/accessToken.guard';
+// import { AccessTokenGuard } from './auth/guards/accessToken.guard';
 import { AppModule } from './app.module';
 
 async function bootstrap() {
@@ -11,14 +11,12 @@ async function bootstrap() {
   const configService = app.get(ConfigService);
   const appVersion = configService.get('APP_VERSION');
 
-  // Retrieve the instance of AccessTokenGuard from Nest's context
-  const accessTokenGuard = app.get(AccessTokenGuard);
-
-  // Set the guard globally using the retrieved instance
-  app.useGlobalGuards(accessTokenGuard);
+  // TODO: Re-enable auth guard when Prisma/Auth modules are restored
+  // const accessTokenGuard = app.get(AccessTokenGuard);
+  // app.useGlobalGuards(accessTokenGuard);
 
   const config = new DocumentBuilder()
-    .setTitle('Change app name')
+    .setTitle('Neverflat API')
     .setVersion(appVersion || '1.0.0')
     .build();
 
