@@ -39,7 +39,7 @@ export default function AdminApp({ onBack }: AdminAppProps) {
   const [loginUsername, setLoginUsername] = useState('admin');
   const [loginPassword, setLoginPassword] = useState('');
   const [loginError, setLoginError] = useState('');
-  const [baseUrl, setBaseUrl] = useState('http://localhost:3000');
+  const [baseUrl, setBaseUrl] = useState(typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000');
 
   async function login(e: FormEvent) {
     e.preventDefault();
