@@ -1,4 +1,19 @@
 services:
+  postgres:
+    image: postgres:17
+    container_name: neverflat-db
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: nvf_award
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - default
+
   app:
     container_name: neverflat-app
     image: ghcr.io/zentrixlab/neverflat:latest
@@ -9,11 +24,14 @@ services:
       - '127.0.0.1:3005:3000'
     environment:
       NODE_ENV: production
-      LOG_DESTINATION: ${LOG_DESTINATION:-console}
-      APP_VERSION: ${APP_VERSION:-1.0.0}
+    depends_on:
+      - postgres
     networks:
       - default
       - shared-proxy
+
+volumes:
+  pgdata:
 
 networks:
   shared-proxy:
