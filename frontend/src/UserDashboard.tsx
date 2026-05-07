@@ -28,7 +28,7 @@ interface UserDashboardProps {
   onBack: () => void;
 }
 
-const DEFAULT_BASE_URL = 'http://localhost:3000';
+const DEFAULT_BASE_URL = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000';
 
 function normalizeUid(value: string): string {
   const trimmed = value.trim();
