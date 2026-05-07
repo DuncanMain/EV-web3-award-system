@@ -927,6 +927,16 @@ app.use((err: any, req: Request, res: Response, next: Function) => {
   });
 });
 
+// Serve frontend static files
+import path from 'path';
+const frontendBuild = path.join(__dirname, '..', 'frontend', 'dist');
+if (fs.existsSync(frontendBuild)) {
+  app.use(express.static(frontendBuild));
+  app.get('*', (req: Request, res: Response) => {
+    res.sendFile(path.join(frontendBuild, 'index.html'));
+  });
+}
+
 // Start server
 app.listen(PORT, () => {
   console.log(`🚀 NVF Award System API running on port ${PORT}`);
