@@ -1,202 +1,419 @@
-## 📦 Tech Stack
+# NVF Award Core
 
-- [NestJS](https://nestjs.com/) – Scalable Node.js framework
-- [Prisma ORM](https://www.prisma.io/) – Next-gen TypeScript ORM
-- [PostgreSQL 17](https://www.postgresql.org/)
-- [Docker + Compose](https://docs.docker.com/)
-- [ESLint + Prettier](https://eslint.org/) – Linting and formatting
-- [Husky](https://typicode.github.io/husky/#/) – Git hooks
-- [Jest](https://jestjs.io/) – Unit + E2E testing
-- [GitHub Actions](https://github.com/features/actions) – CI ready
+Backend core functions for the NEVERFLAT award system.
 
----
+## Overview
 
-## 🚀 Getting Started
+This module provides internal functions for:
 
-### 1. Clone the repo
+- CDR normalisation
+- Rules-based reward logic calculation
+- Award preparation and execution
+- Spend validation and execution
 
-```bash
-git clone https://github.com/your-org/your-repo.git
-cd nestjs-starter
-```
+Built for Polygon Amoy network integration with the NVF contract.
 
-### 2. Install dependencies
+## Identifier Terminology
+
+This project uses **contract ID** as the primary external identifier for a user.
+
+For backward compatibility, parts of the codebase and schema still use the name `uid` (for example, helper names like `resolveUidToAddress` and the `users.uid` column). In this project, treat `uid` as the contract ID value.
+
+If integrating with another platform, this identifier mapping can be reconfigured to match that system's canonical user key.
+
+## Implementation Status
+
+- ✅ **Reward Orchestrator**: Complete pipeline from raw CDR to on-chain settlement (`processAwardFromCDR`)
+- ✅ **Core Normaliser**: OCPI CDR parsing with energy direction detection
+- ✅ **Reward Calculation**: JSON-configured rules (off-peak 0.25 tokens/kWh, V2G 1 token/kWh)
+- ✅ **Executor Functions**: `prepareAward()`, `executeAward()`, `prepareSpend()`, `executeSpend()`
+- ✅ **Award Rules**: Externalized configuration, deduplication key generation
+- ✅ **Off-Peak Windows**: Configurable by country (DE, ES, RO: 22:00-06:00)
+- ✅ **Contract Integration**: ethers.js setup with token calls
+- ✅ **User Accounts**: Deterministic contract ID → Polygon address mapping with auto-enrollment
+- ✅ **PostgreSQL Database**: Mirrors blockchain state for API queries
+- ✅ **Event Listeners**: Real-time sync from contract to database
+- ✅ **Comprehensive Tests**: 54 test cases across all modules, all passing
+- ✅ **REST API**: Identity-context and test-mode endpoints for CDR ingestion, spend processing, and wallet queries
+
+## Installation
 
 ```bash
 npm install
 ```
 
-### 3. Create `.env` from the example
+## Build
 
 ```bash
-cp .env.example .env
+npm run build
 ```
 
-### 4. Start development environment (Docker)
+## Docker
+
+Build the container image and start the application with PostgreSQL:
 
 ```bash
-docker-compose up --build
+docker compose up --build -d
 ```
 
----
+This uses the included `docker-compose.yml` for both the API and PostgreSQL.
 
-## 🧪 Prisma & Database
+### Docker Secrets
 
-### Run migrations (dev DB)
+The service supports a mounted secret file for the treasury private key via `TREASURY_SIGNER_KEY_FILE`.
+In production, use your secret manager or Docker secrets to provide the key at runtime.
+
+## Development Scripts
+
+The `scripts/` directory contains development and testing utilities:
+
+- `test-award-and-spend-debug.js` - End-to-end award and spend flow testing
+- `test-approval-debug.js` - Manual approval testing
+- `test-e2e-flow.js` - Complete end-to-end flow validation
+- `test-full-flow.js` - Full system integration test
+
+Run with: `node scripts/<script-name>.js`
+
+## Demo UI
+
+A Rabby-inspired demo frontend is available in `frontend/`.
+
+Run API and UI in two terminals:
 
 ```bash
-npx prisma migrate dev
+# Terminal 1 (API)
+npm run api
+
+# Terminal 2 (UI)
+cd frontend
+npm run dev
 ```
 
-### Generate Prisma client
+By default, the UI expects API at `http://localhost:3000` and supports `X-API-Key`.
 
-```bash
-npm run prisma:generate
-```
+## Identity And Test Modes
 
-### Seed data
+The user dashboard now supports two access modes:
 
-```bash
-npx ts-node prisma/seed/index.ts
-```
+- **Identity mode (EMP-ready)**: Uses API identity endpoints and resolves contract ID from request header (default `x-contract-id`)
+- **Test mode (current integration fallback)**: Allows manual contract ID lookup for testing transactions and wallet flows before EMP is complete
 
----
+### User Endpoints
 
-## 🧪 Testing
+- `GET /wallet/me` - Wallet for authenticated/forwarded identity context
+- `POST /spend/me` - Spend for authenticated/forwarded identity context
+- `GET /wallet/:uid` - Manual contract ID wallet lookup (legacy/test flow)
+- `POST /spend` - Manual contract ID spend (legacy/test flow)
 
-```bash
-# Unit tests
-npm run test
+The UI attempts identity mode first. If no identity header is present, it automatically falls back to test mode.
 
-# Watch mode
-npm run test:watch
+## Award Rules
 
-# Coverage
-npm run test:cov
-
-# E2E tests
-npm run test:e2e
-```
-
----
-
-## 🧹 Code Quality
-
-### Format code
-
-```bash
-npm run format
-```
-
-### Lint code
-
-```bash
-npm run lint
-```
-
-Pre-commit hooks (via Husky) will auto-check lint and formatting.
-
----
-
-## 🐳 Docker Shortcuts
-
-```bash
-# Start app and db containers
-docker-compose up --build
-
-# Stop containers
-docker-compose down
-
-# Reset DB volumes
-docker-compose down -v
-```
-
----
-
-## 🌱 Environment Variables
-
-Environment variables are defined in:
-
-- `.env.example` – use this as a base to create `.env`
-- Loaded automatically by Docker + NestJS
-
-```env
-# Example
-DATABASE_URL=postgres://postgres:123@localhost:5432/sub
-PORT=3000
-```
-
----
-
-## 🔐 Git Hooks (Husky)
-
-Pre-configured Husky hooks run:
-
-- Lint + Prettier checks before commit
-
----
-
-## 🧠 VS Code Setup
-
-Workspace settings ensure:
-
-- Prettier on save
-- ESLint auto-fix
-
-Make sure you have these extensions:
+Award logic is defined in a JSON configuration file (`src/config/awardRules.json`) for easy maintenance and updates:
 
 ```json
-.vscode/extensions.json
 {
-  "recommendations": [
-    "dbaeumer.vscode-eslint",
-    "esbenp.prettier-vscode"
-  ]
+  "version": "1.0",
+  "rules": {
+    "offPeakCharging": {
+      "enabled": true,
+      "tokensPerKWh": 0.25,
+      "description": "1 SPARKZ per 4 kWh"
+    },
+    "v2gDischarge": {
+      "enabled": true,
+      "tokensPerKWh": 1,
+      "description": "1 SPARKZ per 1 kWh"
+    }
+  },
+  "idempotency": {
+    "deduplicationKey": ["sessionId", "providerId"]
+  }
 }
 ```
 
----
+## User Account System
 
-## 🚦 CI/CD with GitHub Actions
+Each contract ID automatically maps to a Polygon wallet address on first use.
 
-CI runs on every push to main and pull request:
+### Address Generation
 
-- Lint
-- Test
-- Build
+- **Deterministic**: The same contract ID always generates the same address
+- **Automatic**: First time a contract ID appears in a CDR, an address is created and registered
+- **Configurable**: Address generation uses a salt from the `USER_ADDRESS_DERIVATION_SALT` environment variable
 
-Defined in `.github/workflows/development.yaml`.
+```typescript
+import { resolveUidToAddress, isUserRegistered } from 'nvf-award-core';
 
----
+// Auto-creates address on first call (contract ID value)
+const address = resolveUidToAddress('contract-123');
 
-## 📁 Project Structure
+// Subsequent calls return the same address
+const sameAddress = resolveUidToAddress('contract-123');
+assert(address === sameAddress);
 
-```bash
-.
-├── prisma/               # Prisma schema, migrations, seed
-├── src/                  # NestJS app code
-├── test/                 # E2E tests
-├── .husky/               # Git hooks
-├── .vscode/              # Editor settings
-├── docker-compose.yaml   # Local dev env
-├── Dockerfile.dev        # Dev Docker build
-├── nest-cli.json         # Nest CLI config
-├── tsconfig*.json        # TS configs
-└── README.md
+// Check if user has been seen before
+const isKnown = isUserRegistered('contract-456');
 ```
 
----
+## Configuration
 
-## 🤝 Contributing
+Create a `.env` file based on `.env.example`:
 
-1. Fork the repo
-2. Create your feature branch: `git checkout -b feature/awesome`
-3. Commit your changes: `git commit -m 'Add awesome feature'`
-4. Push to the branch: `git push origin feature/awesome`
-5. Open a pull request
+```bash
+# Treasury wallet address (holds SPARKZ tokens)
+TREASURY_ADDRESS=0x605871D30DC278a036F09e2ace771df8a224624B
 
----
+# Optional API key (recommended outside local development)
+API_KEY=your_api_key_here
 
-## 📜 License
+# Salt for deterministic contract ID->address mapping
+USER_ADDRESS_DERIVATION_SALT=nvf-award-core-v1
 
-MIT © 2025 \[Your Name or Organization]
+# Identity header name used by /wallet/me and /spend/me
+USER_IDENTITY_HEADER=x-contract-id
+
+# Keep manual /wallet/:uid lookup enabled for testing
+# Set to false when EMP identity integration is fully live
+ENABLE_TEST_UID_LOOKUP=true
+
+# PostgreSQL connection (database that mirrors blockchain)
+DATABASE_URL=postgres://user:password@localhost:5432/nvf_award
+```
+
+## Database
+
+The system uses PostgreSQL to mirror blockchain state for efficient API queries.
+
+### Setup
+
+1. **Start Docker database:**
+   ```bash
+   docker compose up -d postgres
+   ```
+
+2. **Run migrations:**
+   ```bash
+   npm run db:migrate
+   ```
+
+3. **Stop Docker database when finished:**
+   ```bash
+   docker compose down
+   ```
+
+### Schema
+
+**users** - Maps contract ID to Polygon wallet address
+- `id` - UUID primary key
+- `uid` - Contract identifier (legacy column name)
+- `wallet_address` - Ethereum/Polygon address
+- `created_at` - Registration timestamp
+
+**awards** - Records all token distributions
+- `id` - UUID primary key
+- `user_id` - References users table
+- `session_id`, `provider_id` - From CDR
+- `dedup_key` - (sessionId, providerId) for idempotency
+- `amount` - SPARKZ tokens awarded
+- `tx_hash` - On-chain transaction hash
+- `awarded_at` - Settlement timestamp
+
+**balances** - Current user balances
+- `id` - UUID primary key
+- `user_id` - References users table
+- `wallet_address` - Polygon address
+- `balance` - Current SPARKZ balance
+- `total_awarded` - Cumulative awarded
+- `total_spent` - Cumulative spent
+- `last_synced` - Last blockchain sync
+
+### Real-time Sync
+
+Event listeners automatically sync blockchain state to the database:
+
+```typescript
+import { startEventListener } from 'nvf-award-core';
+import { ethers } from 'ethers';
+
+const provider = new ethers.JsonRpcProvider(process.env.POLYGON_RPC_URL);
+await startEventListener(provider);
+
+// Now all Award and Spend events are synced to the database in real-time
+```
+
+### Database Queries
+
+```typescript
+import { Users, Awards, Balances } from 'nvf-award-core';
+
+// Get user by contract ID
+const user = await Users.findByUid('contract-123');
+
+// Get all awards for a user
+const awards = await Awards.findByUser(user.id);
+
+// Get current balance
+const balance = await Balances.findByUser(user.id);
+
+// Get leaderboard (ordered by total awarded)
+const leaders = await Balances.getAll();
+```
+
+## Usage
+
+### Complete End-to-End: The Reward Executor
+
+Use `processAwardFromCDR()` for end-to-end orchestration from raw CDR to on-chain settlement:
+
+```typescript
+import { processAwardFromCDR } from 'nvf-award-core';
+
+// Raw CDR from charging provider
+const ocpiCDR = {
+  SessionID: 'a1b09f5b-b75d-4c9e-aef2-4f0c74cc7623',
+  ProviderID: 'DE-NWQ',
+  EVSEID: 'DE*GUC*E*EZO*0877',
+  "Session Start": '2026-02-16T02:00:00Z',  // Off-peak in DE
+  "Session End": '2026-02-16T03:00:00Z',
+  "Consumed Energy": '40',  // 40 kWh charged
+  UID: '0475804AA47330',  // Contract ID from source payload - address auto-resolved from this
+};
+
+// Get treasury signer
+const treasurySigner = await getTreasurySigner();
+
+// Single function handles all stages:
+// 1. Normalise CDR
+// 2. Calculate tokens based on rules
+// 3. Resolve contract ID (from UID field) -> Polygon address (creates if first time)
+// 4. Execute on-chain token transfer
+const result = await processAwardFromCDR(ocpiCDR, treasurySigner);
+
+console.log(result);
+// {
+//   success: true,
+//   eligible: true,
+//   amount: 10,                  // 40 kWh / 4 = 10 SPARKZ
+//   uid: '0475804AA47330',        // Contract ID (legacy field name)
+//   dedupKey: 'a1b09f5b-...-DE-NWQ',
+//   txHash: '0x123...',          // User received SPARKZ on-chain
+//   stage: 'complete'
+// }
+```
+
+### With Idempotency Checking
+
+Prevent double-processing by checking if the session was already awarded:
+
+```typescript
+const treasurySigner = await getTreasurySigner();
+
+const result = await processAwardFromCDR(
+  ocpiCDR,
+  treasurySigner,
+  async (dedupKey) => {
+    // Check your DB for existing award
+    return await db.awards.exists(dedupKey);
+  }
+);
+
+if (result.success && result.eligible) {
+  // Mark as processed in your database
+  await db.awards.create({ dedupKey: result.dedupKey, amount: result.amount });
+}
+```
+
+### ExecutionResult Structure
+
+```typescript
+{
+  success: boolean;              // Operation succeeded
+  eligible: boolean;             // Deserves a reward
+  amount: number;                // SPARKZ tokens
+  uid: string;                   // Contract ID (legacy field name)
+  dedupKey: string;              // For database lookup
+  txHash: string;                // On-chain transaction hash (always present if settled)
+  error?: string;                // Error message if failed
+  stage: 'normalisation' | 'calculation' | 'validation' | 'execution' | 'complete'
+}
+```
+
+### Individual Functions (Custom Pipelines)
+
+For more control, use the functions separately:
+
+```typescript
+import { 
+  normaliseSession, 
+  calculateAwardTokens, 
+  getDeduplicationKey,
+  prepareAward, 
+  executeAward 
+} from 'nvf-award-core';
+
+const normalised = normaliseSession(rawCDR);
+const tokens = calculateAwardTokens(normalised);
+const dedupKey = getDeduplicationKey(normalised);
+const award = prepareAward(normalised);
+
+if (award.eligible) {
+  const txHash = await executeAward(signer, userAddress, award.amount);
+}
+```
+
+### Normaliser Output Format
+
+```typescript
+{
+  sessionId: string,
+  providerId: string,
+  uid: string,                   // Contract ID (legacy field name)
+  evseId: string,
+  startTime: Date,
+  endTime: Date,
+  energyKWh: number,        // Always positive (absolute value)
+  energyDirection: 'CHARGE' | 'DISCHARGE'
+}
+```
+
+### Energy Direction
+
+Energy direction is automatically detected from the sign:
+- **Positive value** (e.g., `46.593`) → `CHARGE` direction
+- **Negative value** (e.g., `-5.25`) → `DISCHARGE` direction
+
+### Reward Calculation Rules
+
+1. **Off-peak Charging**: 1 SPARKZ per 4 kWh (only during off-peak hours)
+   - Off-peak windows are country-specific and static
+   - Example DE: 22:00 - 06:00
+2. **V2G Discharge**: 1 SPARKZ per 1 kWh (always)
+
+### Idempotency
+
+Deduplication uses `(sessionId, providerId)` tuple to prevent double-awarding. The `getDeduplicationKey()` function generates this key for database lookups.
+
+## Contract Details
+
+- Network: Polygon Amoy
+- Contract: NVF
+- Token: SPARKZ
+- Address: 0x605871D30DC278a036F09e2ace771df8a224624B
+- Functions: `award(address to, uint256 amount)`, `spend(uint256 amount)`
+
+## Testing
+
+```bash
+npm test
+```
+
+Test suites:
+- Normaliser tests: CDR format handling, field mapping, timestamp parsing
+- Award rules tests: Token calculation, off-peak detection, deduplication, edge cases
+
+## Execution
+
+- `prepareAward` and `prepareSpend` handle business logic validation
+- `executeAward` and `executeSpend` perform on-chain transactions
+- Requires appropriate signers (treasury for awards, user for spends)

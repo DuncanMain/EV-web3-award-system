@@ -1,14 +1,6 @@
 node_modules
-dist
-.prisma
-.env
-.env.*
+npm-debug.log
 Dockerfile
-docker-compose*
-.git
-.gitignore
-.nyc_output
-.vscode
-test
-coverage
+dist
 *.log
+.env

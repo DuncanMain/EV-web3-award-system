@@ -6,7 +6,7 @@ services:
     env_file:
       - .env
     ports:
-      - '127.0.0.1:3005:3003'
+      - '127.0.0.1:3005:3000'
     environment:
       NODE_ENV: production
       LOG_DESTINATION: ${LOG_DESTINATION:-console}

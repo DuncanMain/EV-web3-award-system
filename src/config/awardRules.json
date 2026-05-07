@@ -1,0 +1,19 @@
+{
+  "version": "1.0",
+  "rules": {
+    "offPeakCharging": {
+      "enabled": true,
+      "tokensPerKWh": 0.25,
+      "description": "1 SPARKZ per 4 kWh"
+    },
+    "v2gDischarge": {
+      "enabled": true,
+      "tokensPerKWh": 1,
+      "description": "1 SPARKZ per 1 kWh"
+    }
+  },
+  "idempotency": {
+    "deduplicationKey": ["sessionId", "providerId"],
+    "description": "Prevent double-awarding using (sessionId, providerId) tuple"
+  }
+}

@@ -1,21 +1,26 @@
-FROM node:24-alpine AS builder
+# Node.js Docker image for NVF Award Core
+FROM node:20-alpine AS build
 
-WORKDIR /app
+WORKDIR /usr/src/app
 
-COPY package*.json ./
-RUN npm install
+COPY package.json package-lock.json ./
+RUN npm ci --production=false
 
-COPY . .
+COPY tsconfig.json .
+COPY src ./src
+COPY .env.example ./
+
 RUN npm run build
 
-FROM node:24-alpine
+FROM node:20-alpine AS runtime
+WORKDIR /usr/src/app
 
-WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --production
 
-COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/package.json ./package.json
+COPY --from=build /usr/src/app/dist ./dist
+COPY .env.example ./
 
-EXPOSE 3003
+EXPOSE 3000
 
-CMD ["node", "dist/src/main"]
+CMD ["node", "dist/api.js"]
