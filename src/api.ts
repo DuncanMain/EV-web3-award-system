@@ -285,7 +285,15 @@ async function getOnChainTokenBalance(address: string): Promise<bigint> {
  */
 function validateApiKey(req: Request, res: Response, next: NextFunction): void {
   if (!API_KEY) {
-    // If no API_KEY configured in env, skip validation (development mode)
+    if (process.env.NODE_ENV === 'production') {
+      res.status(503).json({
+        status: 'error',
+        message: 'API key authentication is not configured',
+      });
+      return;
+    }
+
+    // If no API_KEY configured outside production, skip validation for local development.
     return next();
   }
 
