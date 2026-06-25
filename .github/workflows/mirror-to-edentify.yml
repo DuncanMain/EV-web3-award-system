@@ -25,7 +25,7 @@ jobs:
 
       - name: Add EDENTIFY remote
         run: |
-          git remote add edentify https://x-access-token:${{ secrets.EDENTIFY_MIRROR_PAT }}@github.com/edentifyorg/EV-web3-award-system.git
+          git remote add edentify https://x-access-token:${{ secrets.EDEN_GITHUB_PAT }}@github.com/edentifyorg/EV-web3-award-system.git
 
       - name: Push main to EDENTIFY
         run: |
@@ -33,7 +33,7 @@ jobs:
 
       - name: Add personal remote
         run: |
-          git remote add personal https://x-access-token:${{ secrets.PERSONAL_MIRROR_PAT }}@github.com/DuncanMain/EV-web3-award-system.git
+          git remote add personal https://x-access-token:${{ secrets.DUNCS_GITHUB_PAT }}@github.com/DuncanMain/EV-web3-award-system.git
 
       - name: Push main to personal repository
         run: |
