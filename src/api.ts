@@ -317,6 +317,1027 @@ function validateApiKey(req: Request, res: Response, next: NextFunction): void {
   next();
 }
 
+function buildOpenApiSpec(req: Request) {
+  const baseUrl = `${req.protocol}://${req.get('host')}`;
+  const errorResponse = {
+    description: 'Error response',
+    content: {
+      'application/json': {
+        schema: { $ref: '#/components/schemas/ErrorResponse' },
+      },
+    },
+  };
+  const apiKeySecurity = [{ ApiKeyAuth: [] }];
+  const adminSecurity = [{ AdminBearerAuth: [] }];
+
+  return {
+    openapi: '3.0.3',
+    info: {
+      title: 'NEVERFLAT SPARKZ Award System API',
+      version: '1.0.0',
+      description: 'Backend API for CDR ingestion, SPARKZ rewards, spends, wallet management, and award administration.',
+    },
+    servers: [{ url: baseUrl }],
+    tags: [
+      { name: 'Health' },
+      { name: 'Awards' },
+      { name: 'Spends' },
+      { name: 'Wallets' },
+      { name: 'Transactions' },
+      { name: 'Admin' },
+    ],
+    paths: {
+      '/ingest/health': {
+        get: {
+          tags: ['Health'],
+          summary: 'Health check',
+          responses: {
+            200: {
+              description: 'Service is healthy',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      status: { type: 'string', example: 'ok' },
+                      timestamp: { type: 'string', format: 'date-time' },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      '/ingest/cdr': {
+        post: {
+          tags: ['Awards'],
+          summary: 'Ingest a charging CDR and award SPARKZ if eligible',
+          security: apiKeySecurity,
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/CdrRequest' },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: 'CDR accepted, duplicate, or accepted but not eligible',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/CdrResponse' },
+                },
+              },
+            },
+            400: errorResponse,
+            401: errorResponse,
+            403: errorResponse,
+            500: errorResponse,
+          },
+        },
+      },
+      '/spend': {
+        post: {
+          tags: ['Spends'],
+          summary: 'Spend SPARKZ for a contract ID',
+          security: apiKeySecurity,
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/SpendRequest' },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: 'Spend completed',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/SpendResponse' },
+                },
+              },
+            },
+            400: errorResponse,
+            401: errorResponse,
+            403: errorResponse,
+            500: errorResponse,
+          },
+        },
+      },
+      '/spend/me': {
+        post: {
+          tags: ['Spends'],
+          summary: 'Spend SPARKZ using the x-contract-id identity header',
+          security: apiKeySecurity,
+          parameters: [{ $ref: '#/components/parameters/ContractIdHeader' }],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/SpendMeRequest' },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: 'Spend completed',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/SpendResponse' },
+                },
+              },
+            },
+            400: errorResponse,
+            401: errorResponse,
+            403: errorResponse,
+            500: errorResponse,
+          },
+        },
+      },
+      '/spend/custodial-record': {
+        post: {
+          tags: ['Spends'],
+          summary: 'Record a spend made from a linked external wallet',
+          security: apiKeySecurity,
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/CustodialSpendRecordRequest' },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: 'Custodial spend recorded',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/MessageResponse' },
+                },
+              },
+            },
+            400: errorResponse,
+            401: errorResponse,
+            403: errorResponse,
+            500: errorResponse,
+          },
+        },
+      },
+      '/wallet/{uid}': {
+        get: {
+          tags: ['Wallets'],
+          summary: 'Get wallet state by contract ID',
+          security: apiKeySecurity,
+          parameters: [
+            { $ref: '#/components/parameters/UidPath' },
+            { $ref: '#/components/parameters/WalletAddressQuery' },
+          ],
+          responses: {
+            200: {
+              description: 'Wallet details',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/WalletResponse' },
+                },
+              },
+            },
+            401: errorResponse,
+            403: errorResponse,
+            500: errorResponse,
+          },
+        },
+      },
+      '/wallet/me': {
+        get: {
+          tags: ['Wallets'],
+          summary: 'Get wallet state using the x-contract-id identity header',
+          security: apiKeySecurity,
+          parameters: [
+            { $ref: '#/components/parameters/ContractIdHeader' },
+            { $ref: '#/components/parameters/WalletAddressQuery' },
+          ],
+          responses: {
+            200: {
+              description: 'Wallet details',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/WalletResponse' },
+                },
+              },
+            },
+            401: errorResponse,
+            403: errorResponse,
+            500: errorResponse,
+          },
+        },
+      },
+      '/wallet/{uid}/mode': {
+        post: {
+          tags: ['Wallets'],
+          summary: 'Switch active wallet mode',
+          security: apiKeySecurity,
+          parameters: [{ $ref: '#/components/parameters/UidPath' }],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/WalletModeRequest' },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: 'Wallet mode updated',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/WalletModeResponse' },
+                },
+              },
+            },
+            400: errorResponse,
+            409: {
+              description: 'Source wallet still has SPARKZ balance',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/SourceWalletBalanceResponse' },
+                },
+              },
+            },
+          },
+        },
+      },
+      '/wallet/{uid}/profile': {
+        patch: {
+          tags: ['Wallets'],
+          summary: 'Set wallet display name',
+          security: apiKeySecurity,
+          parameters: [{ $ref: '#/components/parameters/UidPath' }],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/WalletProfileRequest' },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: 'Wallet profile updated',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/WalletResponse' },
+                },
+              },
+            },
+            400: errorResponse,
+          },
+        },
+      },
+      '/wallet/{uid}/contract-ids': {
+        post: {
+          tags: ['Wallets'],
+          summary: 'Link another contract ID to the active wallet',
+          security: apiKeySecurity,
+          parameters: [{ $ref: '#/components/parameters/UidPath' }],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ContractIdLinkRequest' },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: 'Contract ID linked',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/WalletResponse' },
+                },
+              },
+            },
+            400: errorResponse,
+          },
+        },
+      },
+      '/wallet/{uid}/linked-wallets': {
+        post: {
+          tags: ['Wallets'],
+          summary: 'Link an external blockchain wallet to a contract ID',
+          security: apiKeySecurity,
+          parameters: [{ $ref: '#/components/parameters/UidPath' }],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/LinkedWalletRequest' },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: 'Wallet address linked',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/WalletResponse' },
+                },
+              },
+            },
+            400: errorResponse,
+          },
+        },
+      },
+      '/wallet/{uid}/linked-wallets/{walletAddress}/profile': {
+        patch: {
+          tags: ['Wallets'],
+          summary: 'Name a linked external wallet',
+          security: apiKeySecurity,
+          parameters: [
+            { $ref: '#/components/parameters/UidPath' },
+            { $ref: '#/components/parameters/WalletAddressPath' },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/WalletNameRequest' },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: 'Linked wallet profile updated',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/WalletResponse' },
+                },
+              },
+            },
+            400: errorResponse,
+            404: errorResponse,
+          },
+        },
+      },
+      '/wallet/{uid}/linked-wallets/{walletAddress}': {
+        delete: {
+          tags: ['Wallets'],
+          summary: 'Unlink an external blockchain wallet',
+          security: apiKeySecurity,
+          parameters: [
+            { $ref: '#/components/parameters/UidPath' },
+            { $ref: '#/components/parameters/WalletAddressPath' },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/SignatureRequest' },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: 'Wallet address unlinked',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/WalletResponse' },
+                },
+              },
+            },
+            400: errorResponse,
+          },
+        },
+      },
+      '/wallet/{uid}/move-funds': {
+        post: {
+          tags: ['Wallets'],
+          summary: 'Move all SPARKZ from managed wallet to target address',
+          security: apiKeySecurity,
+          parameters: [{ $ref: '#/components/parameters/UidPath' }],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/MoveFundsRequest' },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: 'Funds moved',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/MoveFundsResponse' },
+                },
+              },
+            },
+            400: errorResponse,
+          },
+        },
+      },
+      '/transactions': {
+        get: {
+          tags: ['Transactions'],
+          summary: 'List recent awards and spends',
+          security: apiKeySecurity,
+          parameters: [
+            {
+              name: 'limit',
+              in: 'query',
+              schema: { type: 'integer', default: 50, maximum: 500 },
+            },
+          ],
+          responses: {
+            200: {
+              description: 'Recent transactions',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/TransactionsResponse' },
+                },
+              },
+            },
+            401: errorResponse,
+            403: errorResponse,
+            500: errorResponse,
+          },
+        },
+      },
+      '/admin/login': {
+        post: {
+          tags: ['Admin'],
+          summary: 'Create an admin session token',
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/AdminLoginRequest' },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: 'Admin token created',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      status: { type: 'string', example: 'ok' },
+                      token: { type: 'string' },
+                    },
+                  },
+                },
+              },
+            },
+            401: errorResponse,
+          },
+        },
+      },
+      '/admin/logout': {
+        post: {
+          tags: ['Admin'],
+          summary: 'Destroy an admin session token',
+          security: adminSecurity,
+          responses: {
+            200: {
+              description: 'Logged out',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/OkResponse' },
+                },
+              },
+            },
+            401: errorResponse,
+          },
+        },
+      },
+      '/admin/rules': {
+        get: {
+          tags: ['Admin'],
+          summary: 'Get award rules',
+          security: adminSecurity,
+          responses: {
+            200: {
+              description: 'Current rules',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/AdminRulesResponse' },
+                },
+              },
+            },
+            401: errorResponse,
+          },
+        },
+        put: {
+          tags: ['Admin'],
+          summary: 'Update award rules',
+          security: adminSecurity,
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/AdminRulesUpdateRequest' },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: 'Rules updated',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/AdminRulesResponse' },
+                },
+              },
+            },
+            400: errorResponse,
+            401: errorResponse,
+          },
+        },
+      },
+      '/admin/off-peak': {
+        get: {
+          tags: ['Admin'],
+          summary: 'Get off-peak charging windows',
+          security: adminSecurity,
+          responses: {
+            200: {
+              description: 'Current off-peak windows',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/OffPeakResponse' },
+                },
+              },
+            },
+            401: errorResponse,
+          },
+        },
+        put: {
+          tags: ['Admin'],
+          summary: 'Replace off-peak charging windows',
+          security: adminSecurity,
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/OffPeakUpdateRequest' },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: 'Off-peak windows updated',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/OffPeakResponse' },
+                },
+              },
+            },
+            400: errorResponse,
+            401: errorResponse,
+          },
+        },
+      },
+      '/admin/off-peak/{countryCode}': {
+        delete: {
+          tags: ['Admin'],
+          summary: 'Remove one country from off-peak charging windows',
+          security: adminSecurity,
+          parameters: [
+            {
+              name: 'countryCode',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', example: 'GB' },
+            },
+          ],
+          responses: {
+            200: {
+              description: 'Country removed',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/OffPeakResponse' },
+                },
+              },
+            },
+            400: errorResponse,
+            401: errorResponse,
+            404: errorResponse,
+          },
+        },
+      },
+    },
+    components: {
+      securitySchemes: {
+        ApiKeyAuth: {
+          type: 'apiKey',
+          in: 'header',
+          name: 'X-API-Key',
+        },
+        AdminBearerAuth: {
+          type: 'http',
+          scheme: 'bearer',
+        },
+      },
+      parameters: {
+        UidPath: {
+          name: 'uid',
+          in: 'path',
+          required: true,
+          description: 'EMP contract ID. Route keeps uid naming for backward compatibility.',
+          schema: { type: 'string', example: '000' },
+        },
+        ContractIdHeader: {
+          name: 'x-contract-id',
+          in: 'header',
+          required: true,
+          schema: { type: 'string', example: '000' },
+        },
+        WalletAddressPath: {
+          name: 'walletAddress',
+          in: 'path',
+          required: true,
+          schema: { type: 'string', example: '0x281cdB9F9407Ad029a6d7d5d9989a8362CDb7A59' },
+        },
+        WalletAddressQuery: {
+          name: 'walletAddress',
+          in: 'query',
+          required: false,
+          schema: { type: 'string', example: '0x281cdB9F9407Ad029a6d7d5d9989a8362CDb7A59' },
+        },
+      },
+      schemas: {
+        ErrorResponse: {
+          type: 'object',
+          properties: {
+            status: { type: 'string', example: 'error' },
+            message: { type: 'string' },
+            error: { type: 'string' },
+          },
+        },
+        OkResponse: {
+          type: 'object',
+          properties: {
+            status: { type: 'string', example: 'ok' },
+          },
+        },
+        MessageResponse: {
+          type: 'object',
+          properties: {
+            status: { type: 'string', example: 'success' },
+            uid: { type: 'string', example: '000' },
+            txHash: { type: 'string', example: '0xabc...' },
+            message: { type: 'string' },
+          },
+        },
+        CdrRequest: {
+          type: 'object',
+          required: ['id', 'party_id', 'cdr_token'],
+          properties: {
+            id: { type: 'string', example: 'cdr-session-001' },
+            party_id: { type: 'string', example: 'NF' },
+            custom_data: {
+              type: 'object',
+              properties: {
+                provider_id: { type: 'string', example: 'NF' },
+              },
+            },
+            cdr_token: {
+              type: 'object',
+              required: ['contract_id'],
+              properties: {
+                contract_id: { type: 'string', example: '000' },
+              },
+            },
+            start_date_time: { type: 'string', format: 'date-time' },
+            end_date_time: { type: 'string', format: 'date-time' },
+            total_energy: { type: 'number', example: 40 },
+            country_code: { type: 'string', example: 'GB' },
+            SessionID: { type: 'string', example: 'legacy-session-001' },
+            ProviderID: { type: 'string', example: 'NF' },
+            'Session Start': { type: 'string', format: 'date-time' },
+            'Session End': { type: 'string', format: 'date-time' },
+            'Consumed Energy': { type: 'string', example: '40' },
+          },
+        },
+        CdrResponse: {
+          type: 'object',
+          properties: {
+            status: { type: 'string', example: 'accepted' },
+            sessionId: { type: 'string', example: 'cdr-session-001' },
+            providerId: { type: 'string', example: 'NF' },
+            uid: { type: 'string', example: '000' },
+            eligible: { type: 'boolean', example: true },
+            tokensAwarded: { type: 'number', example: 10 },
+            txHash: { type: 'string', example: '0xabc...' },
+            message: { type: 'string', example: '10 SPARKZ awarded' },
+          },
+        },
+        SpendRequest: {
+          type: 'object',
+          required: ['uid', 'amount'],
+          properties: {
+            uid: { type: 'string', example: '000' },
+            amount: { type: 'number', example: 5 },
+            sessionId: { type: 'string', example: 'spend-001' },
+            providerId: { type: 'string', example: 'NF' },
+            label: { type: 'string', example: 'Charging discount' },
+          },
+        },
+        SpendMeRequest: {
+          type: 'object',
+          required: ['amount'],
+          properties: {
+            amount: { type: 'number', example: 5 },
+            sessionId: { type: 'string', example: 'spend-001' },
+            providerId: { type: 'string', example: 'NF' },
+            label: { type: 'string', example: 'Charging discount' },
+          },
+        },
+        SpendResponse: {
+          type: 'object',
+          properties: {
+            status: { type: 'string', example: 'success' },
+            uid: { type: 'string', example: '000' },
+            sessionId: { type: 'string', example: 'spend-001' },
+            providerId: { type: 'string', example: 'NF' },
+            tokensSpent: { type: 'number', example: 5 },
+            txHash: { type: 'string', example: '0xabc...' },
+            timestamp: { type: 'string', format: 'date-time' },
+            label: { type: 'string', example: 'Charging discount' },
+          },
+        },
+        CustodialSpendRecordRequest: {
+          type: 'object',
+          required: ['uid', 'walletAddress', 'amount', 'txHash'],
+          properties: {
+            uid: { type: 'string', example: '000' },
+            walletAddress: { type: 'string', example: '0x281cdB9F9407Ad029a6d7d5d9989a8362CDb7A59' },
+            amount: { type: 'number', example: 5 },
+            txHash: { type: 'string', example: '0xabc...' },
+            sessionId: { type: 'string', example: 'spend-001' },
+          },
+        },
+        WalletResponse: {
+          type: 'object',
+          properties: {
+            status: { type: 'string', example: 'success' },
+            uid: { type: 'string', example: '000' },
+            contractIds: { type: 'array', items: { type: 'string' }, example: ['000'] },
+            linkedWalletAddresses: { type: 'array', items: { type: 'string' } },
+            linkedWallets: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  walletAddress: { type: 'string' },
+                  walletName: { type: 'string', nullable: true },
+                },
+              },
+            },
+            walletName: { type: 'string', nullable: true },
+            walletAddress: { type: 'string' },
+            managedWalletAddress: { type: 'string' },
+            walletMode: { type: 'string', enum: ['managed', 'custodial'] },
+            isRegistered: { type: 'boolean' },
+            balance: { type: 'string', example: '33.00' },
+            totalAwarded: { type: 'string', example: '40.00' },
+            totalSpent: { type: 'string', example: '7.00' },
+            treasuryAddress: { type: 'string', nullable: true },
+            tokenContractAddress: { type: 'string' },
+            history: {
+              type: 'array',
+              items: { $ref: '#/components/schemas/Transaction' },
+            },
+            message: { type: 'string' },
+          },
+        },
+        WalletModeRequest: {
+          type: 'object',
+          required: ['mode'],
+          properties: {
+            mode: { type: 'string', enum: ['managed', 'custodial'] },
+            walletAddress: { type: 'string', example: '0x281cdB9F9407Ad029a6d7d5d9989a8362CDb7A59' },
+            allowSplit: { type: 'boolean', example: false },
+          },
+        },
+        WalletModeResponse: {
+          type: 'object',
+          properties: {
+            status: { type: 'string', example: 'success' },
+            uid: { type: 'string', example: '000' },
+            walletAddress: { type: 'string' },
+            managedWalletAddress: { type: 'string' },
+            walletMode: { type: 'string', enum: ['managed', 'custodial'] },
+            treasuryAddress: { type: 'string', nullable: true },
+            tokenContractAddress: { type: 'string' },
+          },
+        },
+        SourceWalletBalanceResponse: {
+          type: 'object',
+          properties: {
+            status: { type: 'string', example: 'error' },
+            uid: { type: 'string', example: '000' },
+            code: { type: 'string', example: 'SOURCE_WALLET_HAS_BALANCE' },
+            message: { type: 'string' },
+            sourceWalletAddress: { type: 'string' },
+            sourceBalance: { type: 'string', example: '15.0' },
+            targetWalletAddress: { type: 'string' },
+          },
+        },
+        WalletProfileRequest: {
+          type: 'object',
+          properties: {
+            walletName: { type: 'string', nullable: true, example: 'My Main wallet' },
+            walletAddress: { type: 'string', example: '0x281cdB9F9407Ad029a6d7d5d9989a8362CDb7A59' },
+          },
+        },
+        ContractIdLinkRequest: {
+          type: 'object',
+          required: ['contractId'],
+          properties: {
+            contractId: { type: 'string', example: '001' },
+            uid: { type: 'string', example: '001' },
+            walletAddress: { type: 'string', example: '0x281cdB9F9407Ad029a6d7d5d9989a8362CDb7A59' },
+          },
+        },
+        LinkedWalletRequest: {
+          type: 'object',
+          required: ['walletAddress', 'signature'],
+          properties: {
+            walletAddress: { type: 'string', example: '0x281cdB9F9407Ad029a6d7d5d9989a8362CDb7A59' },
+            signature: { type: 'string', example: '0x...' },
+          },
+        },
+        WalletNameRequest: {
+          type: 'object',
+          properties: {
+            walletName: { type: 'string', nullable: true, example: 'My External wallet' },
+          },
+        },
+        SignatureRequest: {
+          type: 'object',
+          required: ['signature'],
+          properties: {
+            signature: { type: 'string', example: '0x...' },
+          },
+        },
+        MoveFundsRequest: {
+          type: 'object',
+          required: ['targetAddress'],
+          properties: {
+            targetAddress: { type: 'string', example: '0x281cdB9F9407Ad029a6d7d5d9989a8362CDb7A59' },
+          },
+        },
+        MoveFundsResponse: {
+          type: 'object',
+          properties: {
+            status: { type: 'string', example: 'success' },
+            txHash: { type: 'string', example: '0xabc...' },
+            amount: { type: 'string', example: '15.0' },
+            targetAddress: { type: 'string' },
+          },
+        },
+        Transaction: {
+          type: 'object',
+          properties: {
+            type: { type: 'string', enum: ['award', 'spend'] },
+            uid: { type: 'string', nullable: true },
+            walletAddress: { type: 'string', nullable: true },
+            walletName: { type: 'string', nullable: true },
+            amount: { type: 'string' },
+            label: { type: 'string' },
+            txHash: { type: 'string' },
+            sessionId: { type: 'string', nullable: true },
+            timestamp: { type: 'string', format: 'date-time' },
+            isOffPeak: { type: 'boolean' },
+            countryCode: { type: 'string' },
+            localTime: { type: 'string' },
+            awardType: { type: 'string' },
+          },
+        },
+        TransactionsResponse: {
+          type: 'object',
+          properties: {
+            status: { type: 'string', example: 'ok' },
+            transactionCount: { type: 'integer', example: 1 },
+            transactions: {
+              type: 'array',
+              items: { $ref: '#/components/schemas/Transaction' },
+            },
+          },
+        },
+        AdminLoginRequest: {
+          type: 'object',
+          required: ['username', 'password'],
+          properties: {
+            username: { type: 'string', example: 'admin' },
+            password: { type: 'string', format: 'password' },
+          },
+        },
+        AdminRulesResponse: {
+          type: 'object',
+          properties: {
+            status: { type: 'string', example: 'ok' },
+            rules: { type: 'object' },
+          },
+        },
+        AdminRulesUpdateRequest: {
+          type: 'object',
+          properties: {
+            offPeakChargingTokensPerKWh: { type: 'number', example: 0.25 },
+            v2gDischargeTokensPerKWh: { type: 'number', example: 1 },
+            offPeakChargingEnabled: { type: 'boolean', example: true },
+            v2gDischargeEnabled: { type: 'boolean', example: true },
+          },
+        },
+        OffPeakResponse: {
+          type: 'object',
+          properties: {
+            status: { type: 'string', example: 'ok' },
+            windows: {
+              type: 'object',
+              additionalProperties: {
+                type: 'array',
+                items: { $ref: '#/components/schemas/TimeRange' },
+              },
+              example: {
+                GB: [{ start: '22:00', end: '06:00' }],
+              },
+            },
+          },
+        },
+        OffPeakUpdateRequest: {
+          type: 'object',
+          required: ['windows'],
+          properties: {
+            windows: {
+              type: 'object',
+              additionalProperties: {
+                type: 'array',
+                items: { $ref: '#/components/schemas/TimeRange' },
+              },
+              example: {
+                GB: [{ start: '22:00', end: '06:00' }],
+              },
+            },
+          },
+        },
+        TimeRange: {
+          type: 'object',
+          required: ['start', 'end'],
+          properties: {
+            start: { type: 'string', example: '22:00' },
+            end: { type: 'string', example: '06:00' },
+          },
+        },
+      },
+    },
+  };
+}
+
+/**
+ * OpenAPI specification (no authentication required)
+ */
+app.get('/openapi.json', (req: Request, res: Response) => {
+  res.json(buildOpenApiSpec(req));
+});
+
+/**
+ * Swagger UI documentation page (no authentication required)
+ */
+app.get(['/api-docs', '/docs'], (_req: Request, res: Response) => {
+  res.type('html').send(`<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NEVERFLAT SPARKZ API Docs</title>
+    <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css" />
+    <style>
+      body { margin: 0; background: #f7f8fb; }
+      .topbar { display: none; }
+      .swagger-ui .info { margin: 28px 0; }
+    </style>
+  </head>
+  <body>
+    <div id="swagger-ui"></div>
+    <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+    <script>
+      window.ui = SwaggerUIBundle({
+        url: '/openapi.json',
+        dom_id: '#swagger-ui',
+        deepLinking: true,
+        persistAuthorization: true,
+        displayRequestDuration: true
+      });
+    </script>
+  </body>
+</html>`);
+});
+
 /**
  * Health check endpoint (no authentication required)
  */
