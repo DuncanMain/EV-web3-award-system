@@ -27,7 +27,7 @@ jobs:
 
       - name: Add EDENTIFY remote
         run: |
-          git remote add edentify https://x-access-token:${{ secrets.EDEN_GITHUB_PAT }}@github.com/edentifyorg/EV-web3-award-system.git
+          git remote add edentify https://x-access-token:${{ secrets.EDEN_NVF_PAT }}@github.com/edentifyorg/EV-web3-award-system.git
 
       - name: Push main to EDENTIFY
         run: |
