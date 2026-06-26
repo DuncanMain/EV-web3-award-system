@@ -1,6 +1,6 @@
 name: Mirror Repositories
 
-# Mirrors Zentrix main to the EDENTIFY and personal code-only repositories.
+# Mirrors Zentrix main to code-only repositories.
 on:
   push:
     branches:
@@ -8,8 +8,10 @@ on:
 
 jobs:
   mirror:
-    name: Mirror main to EDENTIFY and personal repositories
+    name: Mirror main to code-only repositories
     runs-on: ubuntu-latest
+    env:
+      PERSONAL_MIRROR_PAT: ${{ secrets.DUNCS_GITHUB_PAT }}
 
     steps:
       - name: Checkout Zentrix repository
@@ -32,9 +34,11 @@ jobs:
           git push --force edentify HEAD:main
 
       - name: Add personal remote
+        if: env.PERSONAL_MIRROR_PAT != ''
         run: |
-          git remote add personal https://x-access-token:${{ secrets.DUNCS_GITHUB_PAT }}@github.com/DuncanMain/EV-web3-award-system.git
+          git remote add personal https://x-access-token:${PERSONAL_MIRROR_PAT}@github.com/DuncanMain/EV-web3-award-system.git
 
       - name: Push main to personal repository
+        if: env.PERSONAL_MIRROR_PAT != ''
         run: |
           git push --force personal HEAD:main
