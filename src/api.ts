@@ -1359,7 +1359,7 @@ app.post('/ingest/cdr', validateApiKey, async (req: Request, res: Response) => {
     // Validate required fields — supports both legacy flat format and OCPI 2.2 format
     const sessionId = cdr.SessionID || cdr.id;
     const providerId = cdr.ProviderID || cdr.custom_data?.provider_id || cdr.party_id;
-    const contractId = cdr.cdr_token?.contract_id;
+    const contractId = cdr.cdr_token?.contract_id || cdr.cdr_token_contract_id;
 
     if (!sessionId || !providerId || !contractId) {
       return res.status(400).json({

@@ -26,6 +26,7 @@ export interface OCPICDRFormat {
   start_date_time?: string;
   end_date_time?: string;
   session_id?: string;
+  cdr_token_contract_id?: string;
   cdr_token?: {
     uid?: string;
     type?: string;

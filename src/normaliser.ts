@@ -54,10 +54,10 @@ export function normaliseSession(raw: RawSession | OCPICDRFormat): NormalisedSes
     raw.custom_data?.provider_id || raw.party_id;
   if (!providerId) throw new Error('providerId is required');
 
-  const uid = raw.cdr_token?.contract_id;
+  const uid = raw.cdr_token?.contract_id || raw.cdr_token_contract_id;
   if (!uid) throw new Error('cdr_token.contract_id is required');
 
-  const evseId = raw.EVSEID || raw.evseId || raw.evse || raw.cdr_location?.evse_id;
+  const evseId = raw.EVSEID || raw.evseId || raw.evse || raw.cdr_location?.evse_id || raw.evse_id;
   if (!evseId) throw new Error('evseId is required');
 
   // Parse start time (supports API payload StartTime as well)

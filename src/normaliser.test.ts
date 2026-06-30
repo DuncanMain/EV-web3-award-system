@@ -61,6 +61,35 @@ describe('normaliseSession', () => {
     expect(result.energyDirection).toBe('CHARGE');
   });
 
+  it('should normalise flattened OCPI CDR exports', () => {
+    const flattenedCdr = {
+      country_code: 'BE',
+      party_id: 'BEC',
+      id: '12345',
+      start_date_time: '2015-06-29T21:39:09Z',
+      end_date_time: '2015-06-29T23:37:32Z',
+      session_id: null,
+      cdr_token_country_code: 'DE',
+      cdr_token_party_id: 'TNM',
+      cdr_token_uid: '12345678',
+      cdr_token_type: 'RFID',
+      cdr_token_contract_id: 'DE8ACC12E46L89',
+      evse_id: 'BEBECE041503003',
+      total_energy: 15342,
+    };
+
+    const result = normaliseSession(flattenedCdr);
+
+    expect(result.sessionId).toBe('12345');
+    expect(result.providerId).toBe('BEC');
+    expect(result.uid).toBe('DE8ACC12E46L89');
+    expect(result.evseId).toBe('BEBECE041503003');
+    expect(result.startTime).toEqual(new Date('2015-06-29T21:39:09Z'));
+    expect(result.endTime).toEqual(new Date('2015-06-29T23:37:32Z'));
+    expect(result.energyKWh).toBe(15342);
+    expect(result.energyDirection).toBe('CHARGE');
+  });
+
   it('should prefer Session Start over Charging Start for timestamp', () => {
     const ocpiCdr = {
       SessionID: 'sess123',
