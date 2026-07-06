@@ -985,6 +985,41 @@ button:disabled {
   gap: 1.2rem;
 }
 
+.admin-tab-nav {
+  display: inline-flex;
+  width: fit-content;
+  max-width: 100%;
+  gap: 0.25rem;
+  padding: 0.25rem;
+  margin-bottom: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f8fbff;
+  flex-wrap: wrap;
+}
+
+.admin-tab-button {
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-subtle);
+  padding: 0.48rem 0.8rem;
+  font-size: 0.88rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.admin-tab-button:hover {
+  color: var(--brand-primary);
+  background: rgba(20, 69, 210, 0.08);
+}
+
+.admin-tab-button--active {
+  color: var(--brand-dark);
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
+}
+
 .admin-rule-group {
   display: flex;
   flex-direction: column;
@@ -1103,6 +1138,10 @@ button:disabled {
   flex-direction: column;
   gap: 0.8rem;
   min-width: 0;
+}
+
+.admin-api-health-panel {
+  background: #f8fbff;
 }
 
 .admin-metric-grid {

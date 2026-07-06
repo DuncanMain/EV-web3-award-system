@@ -98,12 +98,12 @@ type PilotMetrics = {
 
 interface AdminDashboardProps {
   baseUrl: string;
-  apiKey: string;
   externalToken?: string;
 }
 
-export default function AdminDashboard({ baseUrl, apiKey, externalToken }: AdminDashboardProps) {
+export default function AdminDashboard({ baseUrl, externalToken }: AdminDashboardProps) {
   const [token, setToken] = useState<string | null>(externalToken ?? null);
+  const [activeTab, setActiveTab] = useState<'rules' | 'monitoring'>('rules');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [loginError, setLoginError] = useState('');
@@ -136,12 +136,12 @@ export default function AdminDashboard({ baseUrl, apiKey, externalToken }: Admin
   const [exportingEvidence, setExportingEvidence] = useState(false);
   const [pilotMetrics, setPilotMetrics] = useState<PilotMetrics | null>(null);
   const [pilotMetricsFeedback, setPilotMetricsFeedback] = useState('');
+  const [healthStatus, setHealthStatus] = useState('Unknown');
 
   async function adminRequest(path: string, options?: RequestInit) {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
     };
-    if (apiKey.trim()) headers['X-API-Key'] = apiKey.trim();
     if (token) headers['Authorization'] = `Bearer ${token}`;
     return fetch(`${baseUrl}${path}`, { ...options, headers: { ...headers, ...(options?.headers || {}) } });
   }
@@ -320,6 +320,21 @@ export default function AdminDashboard({ baseUrl, apiKey, externalToken }: Admin
     }
   }
 
+  async function checkHealth() {
+    setHealthStatus('Checking...');
+    try {
+      const res = await adminRequest('/ingest/health', { method: 'GET' });
+      if (!res.ok) {
+        setHealthStatus(`Unhealthy (${res.status})`);
+        return;
+      }
+      const data = await res.json();
+      setHealthStatus(`Online (${data.status})`);
+    } catch (err) {
+      setHealthStatus(`Offline (${err instanceof Error ? err.message : String(err)})`);
+    }
+  }
+
   async function sendTestAlert() {
     setTestingAlert(true);
     setAlertTestFeedback('');
@@ -494,18 +509,44 @@ export default function AdminDashboard({ baseUrl, apiKey, externalToken }: Admin
   const showNewCountryPreview = newCountryPreviewCode.length === 2;
   const latestReport = reconciliationReports[0];
   const readinessStatus = readiness?.status || 'not_ready';
+  const isRulesTab = activeTab === 'rules';
 
   return (
     <div className="admin-wrap">
       <div className="admin-header">
         <div>
-          <h2>Reward Rules</h2>
-          <p className="subtle">Changes apply immediately to all new CDRs. No restart required.</p>
+          <h2>{isRulesTab ? 'Reward Rules' : 'Operational Monitoring'}</h2>
+          <p className="subtle">
+            {isRulesTab
+              ? 'Changes apply immediately to all new CDRs. No restart required.'
+              : 'Track readiness, alerts, audit events, and reconciliation checks.'}
+          </p>
         </div>
         <button className="btn-ghost" onClick={logout}>Sign Out</button>
       </div>
 
-      {rules && (
+      <div className="admin-tab-nav" role="tablist" aria-label="Reward logic sections">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab === 'rules'}
+          className={`admin-tab-button${activeTab === 'rules' ? ' admin-tab-button--active' : ''}`}
+          onClick={() => setActiveTab('rules')}
+        >
+          Reward Rules
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab === 'monitoring'}
+          className={`admin-tab-button${activeTab === 'monitoring' ? ' admin-tab-button--active' : ''}`}
+          onClick={() => setActiveTab('monitoring')}
+        >
+          Operational Monitoring
+        </button>
+      </div>
+
+      {activeTab === 'rules' && rules && (
         <form className="action-card admin-rules-card" onSubmit={saveRules}>
           <div className="admin-rule-group">
             <div className="admin-rule-header">
@@ -588,6 +629,9 @@ export default function AdminDashboard({ baseUrl, apiKey, externalToken }: Admin
           </button>
         </form>
       )}
+
+      {activeTab === 'rules' && (
+        <>
 
       {/* ── Off-Peak Time Windows ─────────────────────────────────────────── */}
       <div className="admin-section-spacer" />
@@ -709,7 +753,11 @@ export default function AdminDashboard({ baseUrl, apiKey, externalToken }: Admin
           {savingWindows ? 'Saving...' : 'Save Off-Peak Config'}
         </button>
       </div>
+        </>
+      )}
 
+      {activeTab === 'monitoring' && (
+        <>
       <div className="admin-section-spacer" />
 
       <div className="action-card admin-rules-card">
@@ -718,6 +766,20 @@ export default function AdminDashboard({ baseUrl, apiKey, externalToken }: Admin
           <button type="button" className="btn-ghost" onClick={() => { loadAuditEvents(); loadReconciliationReports(); loadReadiness(); loadPilotMetrics(); }}>
             Refresh
           </button>
+        </div>
+
+        <div className="admin-monitor-panel admin-api-health-panel">
+          <div className="admin-rule-header">
+            <h5 className="country-code-label">API Status</h5>
+            <button type="button" className="btn-ghost" onClick={checkHealth}>
+              Check Backend
+            </button>
+          </div>
+          <label>
+            API URL
+            <input value={baseUrl} readOnly />
+          </label>
+          <p className="health">{healthStatus}</p>
         </div>
 
         <div className="admin-monitor-panel admin-readiness-panel">
@@ -895,6 +957,8 @@ export default function AdminDashboard({ baseUrl, apiKey, externalToken }: Admin
           </div>
         </div>
       </div>
+        </>
+      )}
     </div>
   );
 }

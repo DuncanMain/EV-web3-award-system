@@ -127,10 +127,8 @@ interface AdminShellProps {
 }
 
 function AdminShell({ baseUrl, adminToken, onLogout, onBack }: AdminShellProps) {
-  const [apiKey, setApiKey] = useState('');
   const [uid, setUid] = useState('demo-user-001');
   const [walletData, setWalletData] = useState<WalletResponse | null>(null);
-  const [healthStatus, setHealthStatus] = useState('Unknown');
   const [loadingWallet, setLoadingWallet] = useState(false);
   const [feedback, setFeedback] = useState<ApiFeedback>({ kind: 'idle', message: '' });
 
@@ -175,22 +173,11 @@ function AdminShell({ baseUrl, adminToken, onLogout, onBack }: AdminShellProps) 
 
   async function apiRequest(path: string, options?: RequestInit) {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (apiKey.trim()) headers['X-API-Key'] = apiKey.trim();
+    if (adminToken) headers['Authorization'] = `Bearer ${adminToken}`;
     return fetch(`${baseUrl}${path}`, {
       ...options,
       headers: { ...headers, ...(options?.headers || {}) },
     });
-  }
-
-  async function checkHealth() {
-    try {
-      const res = await apiRequest('/ingest/health', { method: 'GET' });
-      if (!res.ok) { setHealthStatus(`Unhealthy (${res.status})`); return; }
-      const data = await res.json();
-      setHealthStatus(`Online (${data.status})`);
-    } catch (err) {
-      setHealthStatus(`Offline (${err instanceof Error ? err.message : String(err)})`);
-    }
   }
 
   async function loadWallet(options?: { suppressFeedback?: boolean }) {
@@ -589,15 +576,6 @@ function AdminShell({ baseUrl, adminToken, onLogout, onBack }: AdminShellProps) 
           )}
         </div>
 
-        <div className="rail-card">
-          <span className="label">API URL</span>
-          <input value={baseUrl} readOnly style={{ opacity: 0.6 }} />
-          <span className="label">API Key</span>
-          <input value={apiKey} onChange={(e) => setApiKey(e.target.value)} type="password" placeholder="X-API-Key" />
-          <button onClick={checkHealth}>Check Backend</button>
-          <p className="health">{healthStatus}</p>
-        </div>
-
         <nav className="rail-tab-nav">
           <button className={`rail-tab${activeTab === 'transactions' ? ' rail-tab--active' : ''}`} onClick={() => setActiveTab('transactions')}>
             Test Transactions
@@ -622,7 +600,7 @@ function AdminShell({ baseUrl, adminToken, onLogout, onBack }: AdminShellProps) 
 
       <main className="main-view">
         {activeTab === 'rewardlogic' ? (
-          <AdminDashboard baseUrl={baseUrl} apiKey={apiKey} externalToken={adminToken} />
+          <AdminDashboard baseUrl={baseUrl} externalToken={adminToken} />
         ) : (
           <>
             <section className="hero-card">

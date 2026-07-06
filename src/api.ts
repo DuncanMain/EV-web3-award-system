@@ -889,6 +889,12 @@ function validateApiKey(req: Request, res: Response, next: NextFunction): void {
     return next();
   }
 
+  const auth = req.header('Authorization');
+  const adminToken = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (adminToken && adminSessions.has(adminToken)) {
+    return next();
+  }
+
   const apiKey = req.header('X-API-Key');
   if (!apiKey) {
     res.status(401).json({
