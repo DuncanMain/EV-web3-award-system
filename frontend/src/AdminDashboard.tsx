@@ -99,11 +99,11 @@ type PilotMetrics = {
 interface AdminDashboardProps {
   baseUrl: string;
   externalToken?: string;
+  section: 'rules' | 'monitoring';
 }
 
-export default function AdminDashboard({ baseUrl, externalToken }: AdminDashboardProps) {
+export default function AdminDashboard({ baseUrl, externalToken, section }: AdminDashboardProps) {
   const [token, setToken] = useState<string | null>(externalToken ?? null);
-  const [activeTab, setActiveTab] = useState<'rules' | 'monitoring'>('rules');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [loginError, setLoginError] = useState('');
@@ -509,7 +509,7 @@ export default function AdminDashboard({ baseUrl, externalToken }: AdminDashboar
   const showNewCountryPreview = newCountryPreviewCode.length === 2;
   const latestReport = reconciliationReports[0];
   const readinessStatus = readiness?.status || 'not_ready';
-  const isRulesTab = activeTab === 'rules';
+  const isRulesTab = section === 'rules';
 
   return (
     <div className="admin-wrap">
@@ -525,28 +525,7 @@ export default function AdminDashboard({ baseUrl, externalToken }: AdminDashboar
         <button className="btn-ghost" onClick={logout}>Sign Out</button>
       </div>
 
-      <div className="admin-tab-nav" role="tablist" aria-label="Reward logic sections">
-        <button
-          type="button"
-          role="tab"
-          aria-selected={activeTab === 'rules'}
-          className={`admin-tab-button${activeTab === 'rules' ? ' admin-tab-button--active' : ''}`}
-          onClick={() => setActiveTab('rules')}
-        >
-          Reward Rules
-        </button>
-        <button
-          type="button"
-          role="tab"
-          aria-selected={activeTab === 'monitoring'}
-          className={`admin-tab-button${activeTab === 'monitoring' ? ' admin-tab-button--active' : ''}`}
-          onClick={() => setActiveTab('monitoring')}
-        >
-          Operational Monitoring
-        </button>
-      </div>
-
-      {activeTab === 'rules' && rules && (
+      {section === 'rules' && rules && (
         <form className="action-card admin-rules-card" onSubmit={saveRules}>
           <div className="admin-rule-group">
             <div className="admin-rule-header">
@@ -630,7 +609,7 @@ export default function AdminDashboard({ baseUrl, externalToken }: AdminDashboar
         </form>
       )}
 
-      {activeTab === 'rules' && (
+      {section === 'rules' && (
         <>
 
       {/* ── Off-Peak Time Windows ─────────────────────────────────────────── */}
@@ -756,7 +735,7 @@ export default function AdminDashboard({ baseUrl, externalToken }: AdminDashboar
         </>
       )}
 
-      {activeTab === 'monitoring' && (
+      {section === 'monitoring' && (
         <>
       <div className="admin-section-spacer" />
 

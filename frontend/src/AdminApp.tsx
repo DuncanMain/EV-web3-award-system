@@ -163,7 +163,7 @@ function AdminShell({ baseUrl, adminToken, onLogout, onBack }: AdminShellProps) 
   const [switchingMode, setSwitchingMode] = useState(false);
   const [processingWalletTx, setProcessingWalletTx] = useState(false);
 
-  const [activeTab, setActiveTab] = useState<'transactions' | 'rewardlogic'>('transactions');
+  const [activeTab, setActiveTab] = useState<'transactions' | 'rewardlogic' | 'monitoring'>('transactions');
 
   const maskedWallet = useMemo(() => {
     if (!walletData?.walletAddress) return 'No wallet loaded';
@@ -583,6 +583,9 @@ function AdminShell({ baseUrl, adminToken, onLogout, onBack }: AdminShellProps) 
           <button className={`rail-tab${activeTab === 'rewardlogic' ? ' rail-tab--active' : ''}`} onClick={() => setActiveTab('rewardlogic')}>
             Reward Logic
           </button>
+          <button className={`rail-tab${activeTab === 'monitoring' ? ' rail-tab--active' : ''}`} onClick={() => setActiveTab('monitoring')}>
+            Operational Monitoring
+          </button>
         </nav>
 
         <button className="btn-ghost" style={{ marginTop: '0.75rem' }} onClick={onLogout}>Sign Out</button>
@@ -599,8 +602,12 @@ function AdminShell({ baseUrl, adminToken, onLogout, onBack }: AdminShellProps) 
       )}
 
       <main className="main-view">
-        {activeTab === 'rewardlogic' ? (
-          <AdminDashboard baseUrl={baseUrl} externalToken={adminToken} />
+        {activeTab === 'rewardlogic' || activeTab === 'monitoring' ? (
+          <AdminDashboard
+            baseUrl={baseUrl}
+            externalToken={adminToken}
+            section={activeTab === 'monitoring' ? 'monitoring' : 'rules'}
+          />
         ) : (
           <>
             <section className="hero-card">
