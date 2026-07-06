@@ -9,6 +9,8 @@
     "api": "tsc && node dist/api.js",
     "db:migrate": "tsc && node dist/database/migrate.js",
     "db:reset": "tsc && npm run db:migrate",
+    "evidence:pilot": "node scripts/capture-pilot-evidence.js",
+    "evidence:load-preview": "node scripts/load-test-ingest-preview.js",
     "ci:check": "npm audit --audit-level=moderate && npm run build && npm test && npm --prefix frontend audit --audit-level=moderate && npm --prefix frontend run build"
   },
   "dependencies": {

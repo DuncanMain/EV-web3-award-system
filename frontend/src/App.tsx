@@ -14,12 +14,9 @@ function App() {
   return (
     <div className="mode-picker-shell">
       <div className="mode-picker-card">
-        <div className="brand-lockup brand-lockup--centered">
-          <div className="brand-glyph brand-glyph--lg">N</div>
-          <div>
-            <h1>NEVERFLAT</h1>
-            <p>Token Platform</p>
-          </div>
+        <div className="mode-picker-logos" aria-label="SPARKZ by NEVERFLAT">
+          <img className="mode-picker-logo mode-picker-logo--neverflat" src="/neverflat-brand-logo.png" alt="NEVERFLAT logo" />
+          <img className="mode-picker-logo mode-picker-logo--sparkz" src="/sparkz-brand-logo.png" alt="SPARKZ logo" />
         </div>
 
         <div className="mode-options">
@@ -38,4 +35,3 @@ function App() {
 }
 
 export default App;
-

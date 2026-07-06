@@ -3,6 +3,8 @@ export * from './normaliser';
 export * from './rewardLogic';
 export * from './awardExecutor';
 export * from './spendExecutor';
+export * from './receipt';
+export * from './reconciliation';
 export * from './contract';
 export * from './config/awardRules';
 export * from './user/userService';

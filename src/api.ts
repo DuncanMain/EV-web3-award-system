@@ -15,11 +15,17 @@ import { ethers } from 'ethers';
 import { processAwardFromCDR, processSpend } from './index';
 import { approveUserForSpendingViaFunding, moveFundsFromManagedWallet, recordSpend, revokeAllowanceOnManagedWallet } from './database/integration';
 import { getManagedWalletAddress, getUserWalletConfig, resolveActiveUidAddress, setUserWalletMode, WalletMode } from './user/userService';
-import { Awards, Spends, Users, Balances, LinkedWallets } from './database/service';
+import { Awards, Spends, Users, Balances, LinkedWallets, SpendReceipts, AuditLogs, ReconciliationReports } from './database/service';
+import type { AuditLogRecord } from './database/service';
 import { RawSession, OCPICDRFormat } from './types';
 import { getRules, setRules, AwardRuleConfig } from './config/awardRules';
 import { getOffPeakWindows, setOffPeakWindows } from './config/offPeakWindows';
 import { TimeRange, OffPeakConfig } from './types';
+import { createSpendReceiptPayload, signSpendReceipt, SignedSpendReceipt, verifySpendReceipt } from './receipt';
+import { reconcileBalance, summarizeReconciliation } from './reconciliation';
+import { getDatabase } from './database/connection';
+import { normaliseSession } from './normaliser';
+import { prepareAward } from './awardExecutor';
 
 const app = express();
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
@@ -30,15 +36,18 @@ app.use(express.json());
 // Configuration
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY;
+const INGEST_API_KEY = process.env.INGEST_API_KEY;
 const USER_IDENTITY_HEADER = (process.env.USER_IDENTITY_HEADER || 'x-contract-id').toLowerCase();
 const ENABLE_TEST_UID_LOOKUP = process.env.ENABLE_TEST_UID_LOOKUP !== 'false';
 const POLYGON_RPC_URL = process.env.POLYGON_RPC_URL || 'https://rpc-amoy.polygon.technology/';
 const TOKEN_CONTRACT_ADDRESS = process.env.TOKEN_CONTRACT_ADDRESS || '0x605871D30DC278a036F09e2ace771df8a224624B';
 const TREASURY_ADDRESS = process.env.TREASURY_ADDRESS;
+const TREASURY_GAS_WARNING_THRESHOLD_MATIC = process.env.TREASURY_GAS_WARNING_THRESHOLD_MATIC || '0.05';
+const ADMIN_ALERT_WEBHOOK_URL = process.env.ADMIN_ALERT_WEBHOOK_URL;
 
-// Admin credentials (override via env vars)
-const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'NVF@dm1n2026';
+// Admin credentials must be configured for admin login.
+const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || '').trim().toLowerCase();
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 
 // In-memory admin session tokens
 const adminSessions = new Set<string>();
@@ -75,6 +84,91 @@ function normalizeUid(value: string): string {
     return trimmed.slice(4).trim();
   }
   return trimmed;
+}
+
+function isEmailAddress(value?: string | null): boolean {
+  return Boolean(value && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value));
+}
+
+function getRegisteredAdminEmail(): string | null {
+  return isEmailAddress(ADMIN_EMAIL) ? ADMIN_EMAIL : null;
+}
+
+async function getReadinessChecks(): Promise<Array<{
+  key: string;
+  label: string;
+  status: 'pass' | 'fail' | 'warn';
+  message: string;
+}>> {
+  const checks: Array<{
+    key: string;
+    label: string;
+    status: 'pass' | 'fail' | 'warn';
+    message: string;
+  }> = [];
+
+  const addCheck = (key: string, label: string, passed: boolean, passMessage: string, failMessage: string, failStatus: 'fail' | 'warn' = 'fail') => {
+    checks.push({
+      key,
+      label,
+      status: passed ? 'pass' : failStatus,
+      message: passed ? passMessage : failMessage,
+    });
+  };
+
+  addCheck('api_key', 'General API key', Boolean(API_KEY), 'API_KEY configured', 'API_KEY is not configured', 'warn');
+  addCheck('ingest_api_key', 'Ingest API key', Boolean(INGEST_API_KEY), 'INGEST_API_KEY configured', 'INGEST_API_KEY is not configured');
+  addCheck('admin_email', 'Admin email login', Boolean(getRegisteredAdminEmail()), 'Admin email configured', 'Set ADMIN_EMAIL to the registered admin email address');
+  addCheck('admin_password', 'Admin password', Boolean(ADMIN_PASSWORD), 'ADMIN_PASSWORD configured', 'ADMIN_PASSWORD is not configured');
+  addCheck('manual_uid_lookup', 'Manual contract lookup', !ENABLE_TEST_UID_LOOKUP, 'Manual /wallet/:uid lookup disabled', 'ENABLE_TEST_UID_LOOKUP should be false in pilot/production', 'warn');
+  addCheck('token_contract', 'Token contract address', ethers.isAddress(TOKEN_CONTRACT_ADDRESS), 'Token contract address is valid', 'TOKEN_CONTRACT_ADDRESS is missing or invalid');
+  addCheck('treasury_address', 'Treasury address', !TREASURY_ADDRESS || ethers.isAddress(TREASURY_ADDRESS), 'Treasury address is valid or derived from signer', 'TREASURY_ADDRESS is invalid');
+  addCheck('admin_alerts', 'Admin alert delivery', Boolean(ADMIN_ALERT_WEBHOOK_URL), 'ADMIN_ALERT_WEBHOOK_URL configured', 'ADMIN_ALERT_WEBHOOK_URL is not configured; alerts will be audited but not sent', 'warn');
+
+  try {
+    await treasurySigner.getAddress();
+    checks.push({
+      key: 'treasury_signer',
+      label: 'Treasury signer',
+      status: 'pass',
+      message: 'Treasury signer key loaded',
+    });
+  } catch (err) {
+    checks.push({
+      key: 'treasury_signer',
+      label: 'Treasury signer',
+      status: 'fail',
+      message: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  if (!process.env.DATABASE_URL) {
+    checks.push({
+      key: 'database',
+      label: 'Database',
+      status: 'fail',
+      message: 'DATABASE_URL is not configured',
+    });
+  } else {
+    try {
+      await getDatabase().raw('select 1');
+      checks.push({
+        key: 'database',
+        label: 'Database',
+        status: 'pass',
+        message: 'Database connection is healthy',
+      });
+    } catch (err) {
+      checks.push({
+        key: 'database',
+        label: 'Database',
+        status: 'fail',
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  return checks;
 }
 
 function getRequestContractId(req: Request): string | null {
@@ -215,6 +309,7 @@ async function getWalletPayload(normalizedUid: string, walletAddressOverride?: s
     countryCode?: string;
     localTime?: string;
     awardType?: string;
+    status?: string;
   }> = [
     ...awards.slice(0, 20).map(a => ({
       type: 'award' as const,
@@ -229,6 +324,7 @@ async function getWalletPayload(normalizedUid: string, walletAddressOverride?: s
       countryCode: a.country_code,
       localTime: a.local_time,
       awardType: a.award_type,
+      status: a.status || 'confirmed',
     })),
     ...spends.slice(0, 20).map(s => ({
       type: 'spend' as const,
@@ -239,6 +335,7 @@ async function getWalletPayload(normalizedUid: string, walletAddressOverride?: s
       timestamp: s.created_at,
       walletAddress: s.wallet_address,
       walletName: linkedWalletNamesByAddress.get(s.wallet_address.toLowerCase()) || usersById.get(s.user_id)?.wallet_name || null,
+      status: s.status || 'confirmed',
     })),
   ]
     .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
@@ -277,6 +374,501 @@ async function getOnChainTokenBalance(address: string): Promise<bigint> {
   );
 
   return token.balanceOf(address) as Promise<bigint>;
+}
+
+function isTreasuryGasIssue(error?: unknown): boolean {
+  const text = error instanceof Error ? error.message : String(error || '');
+  const normalized = text.toLowerCase();
+  return normalized.includes('insufficient funds')
+    || normalized.includes('insufficient matic')
+    || normalized.includes('intrinsic gas')
+    || normalized.includes('gas required exceeds')
+    || normalized.includes('replacement fee too low')
+    || normalized.includes('underpriced');
+}
+
+function isNetworkIssue(error?: unknown): boolean {
+  const text = error instanceof Error ? error.message : String(error || '');
+  const normalized = text.toLowerCase();
+  return normalized.includes('network')
+    || normalized.includes('timeout')
+    || normalized.includes('rpc')
+    || normalized.includes('server error')
+    || normalized.includes('connection')
+    || normalized.includes('temporarily unavailable');
+}
+
+function toUserFacingAwardError(error?: unknown, stage?: string): string {
+  if (stage === 'normalisation' || stage === 'validation') {
+    return 'The charging session could not be processed because required charging data was invalid or incomplete.';
+  }
+  if (isTreasuryGasIssue(error)) {
+    return 'The reward could not be settled right now. The operations team has been notified.';
+  }
+  if (isNetworkIssue(error)) {
+    return 'The reward network is temporarily unavailable. Please retry the request shortly.';
+  }
+  return 'The reward could not be processed. Please retry the request or contact support.';
+}
+
+function toUserFacingSpendError(error?: unknown): string {
+  const text = error instanceof Error ? error.message : String(error || '');
+  const normalized = text.toLowerCase();
+  if (normalized.includes('insufficient balance') || normalized.includes('exceeds balance')) {
+    return 'There are not enough SPARKZ available for this spend.';
+  }
+  if (normalized.includes('allowance') || normalized.includes('approve')) {
+    return 'Your wallet is not ready to spend yet. Please try again shortly or contact support.';
+  }
+  if (isTreasuryGasIssue(error)) {
+    return 'The spend could not be completed right now. The operations team has been notified.';
+  }
+  if (isNetworkIssue(error)) {
+    return 'The spend network is temporarily unavailable. Please try again shortly.';
+  }
+  return 'The spend could not be completed. Please try again or contact support.';
+}
+
+async function getTreasuryWalletAddress(): Promise<string | null> {
+  if (TREASURY_ADDRESS && ethers.isAddress(TREASURY_ADDRESS)) {
+    return ethers.getAddress(TREASURY_ADDRESS);
+  }
+
+  try {
+    return await treasurySigner.getAddress();
+  } catch {
+    return null;
+  }
+}
+
+async function createCustodialSpendIntent(input: {
+  uid: string;
+  walletAddress: string;
+  amount: number;
+  sessionId?: string;
+  providerId?: string;
+}) {
+  const treasuryAddress = await getTreasuryWalletAddress();
+  if (!treasuryAddress) {
+    throw new Error('Treasury address is not configured');
+  }
+
+  const provider = treasurySigner.provider;
+  const network = provider ? await provider.getNetwork() : { chainId: 80002n };
+  const checksumWalletAddress = ethers.getAddress(input.walletAddress);
+  const tokenInterface = new ethers.Interface(['function transfer(address to, uint256 amount) returns (bool)']);
+  const amountWei = ethers.parseEther(input.amount.toString());
+  const data = tokenInterface.encodeFunctionData('transfer', [treasuryAddress, amountWei]);
+  const intentMaterial = [
+    input.uid,
+    checksumWalletAddress,
+    input.amount.toString(),
+    input.sessionId || '',
+    input.providerId || '',
+    TOKEN_CONTRACT_ADDRESS,
+    treasuryAddress,
+    network.chainId.toString(),
+    data,
+  ].join('|');
+
+  return {
+    intentId: `csi_${crypto.createHash('sha256').update(intentMaterial).digest('hex').slice(0, 24)}`,
+    contractId: input.uid,
+    walletAddress: checksumWalletAddress,
+    amount: input.amount.toString(),
+    sessionId: input.sessionId || null,
+    providerId: input.providerId || null,
+    chainId: Number(network.chainId),
+    tokenContractAddress: TOKEN_CONTRACT_ADDRESS,
+    treasuryAddress,
+    retryable: true,
+    transaction: {
+      from: checksumWalletAddress,
+      to: TOKEN_CONTRACT_ADDRESS,
+      value: '0',
+      data,
+    },
+  };
+}
+
+async function validateCustodialSpendIntentInput(input: {
+  uid: string;
+  walletAddress: string;
+  amount: number;
+}): Promise<string> {
+  if (!input.uid || !input.walletAddress || !input.amount || input.amount <= 0) {
+    throw new Error('Missing or invalid fields: uid, walletAddress, amount (must be > 0)');
+  }
+  if (!ethers.isAddress(input.walletAddress)) {
+    throw new Error('Invalid wallet address');
+  }
+
+  const checksumWalletAddress = ethers.getAddress(input.walletAddress);
+  const linkedWalletAddresses = (await LinkedWallets.findByUid(input.uid)).map(w => w.wallet_address.toLowerCase());
+  if (!linkedWalletAddresses.includes(checksumWalletAddress.toLowerCase())) {
+    throw new Error('Wallet address is not linked to this EMP contract');
+  }
+
+  return checksumWalletAddress;
+}
+
+async function auditTreasuryGasWarning(context: string, trigger?: unknown): Promise<void> {
+  const provider = treasurySigner.provider;
+  const treasuryAddress = await getTreasuryWalletAddress();
+  if (!provider || !treasuryAddress) {
+    return;
+  }
+
+  try {
+    const threshold = ethers.parseEther(TREASURY_GAS_WARNING_THRESHOLD_MATIC);
+    const balance = await provider.getBalance(treasuryAddress);
+    if (balance >= threshold && !isTreasuryGasIssue(trigger)) {
+      return;
+    }
+
+    await safeAuditLog({
+      eventType: 'treasury.gas_low',
+      actorType: 'system',
+      actorId: 'api',
+      targetType: 'treasury_wallet',
+      targetId: treasuryAddress,
+      status: 'warning',
+      metadata: {
+        context,
+        balanceMatic: ethers.formatEther(balance),
+        thresholdMatic: TREASURY_GAS_WARNING_THRESHOLD_MATIC,
+        trigger: trigger instanceof Error ? trigger.message : trigger ? String(trigger) : null,
+      },
+    });
+  } catch (err) {
+    await safeAuditLog({
+      eventType: 'treasury.gas_check_failed',
+      actorType: 'system',
+      actorId: 'api',
+      targetType: 'treasury_wallet',
+      targetId: treasuryAddress,
+      status: 'warning',
+      metadata: {
+        context,
+        thresholdMatic: TREASURY_GAS_WARNING_THRESHOLD_MATIC,
+        error: err instanceof Error ? err.message : String(err),
+      },
+    });
+  }
+}
+
+async function runBalanceReconciliation(limit = 500) {
+  const users = (await Users.getAll()).slice(0, limit);
+  const items = await Promise.all(users.map(async (user) => {
+    const balance = await Balances.findByUser(user.id);
+    try {
+      const chainBalance = Number(ethers.formatEther(await getOnChainTokenBalance(user.wallet_address))).toFixed(6);
+      return reconcileBalance({
+        uid: user.uid,
+        walletAddress: user.wallet_address,
+        dbBalance: balance?.balance ?? null,
+        chainBalance,
+      });
+    } catch (err) {
+      return reconcileBalance({
+        uid: user.uid,
+        walletAddress: user.wallet_address,
+        dbBalance: balance?.balance ?? null,
+        chainError: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }));
+  const summary = summarizeReconciliation(items);
+  const report = await ReconciliationReports.create({
+    status: summary.status,
+    checkedCount: summary.checkedCount,
+    matchedCount: summary.matchedCount,
+    mismatchCount: summary.mismatchCount,
+    items: items as unknown as Record<string, unknown>[],
+    metadata: {
+      tokenContractAddress: TOKEN_CONTRACT_ADDRESS,
+      limit,
+      generatedBy: 'admin_api',
+    },
+  });
+
+  await safeAuditLog({
+    eventType: 'reconciliation.balance_run',
+    actorType: 'admin_session',
+    actorId: 'admin_api',
+    targetType: 'reconciliation_report',
+    targetId: report.id,
+    status: report.status,
+    metadata: {
+      checkedCount: report.checked_count,
+      matchedCount: report.matched_count,
+      mismatchCount: report.mismatch_count,
+    },
+  });
+
+  return report;
+}
+
+async function createAndStoreSpendReceipt(input: {
+  uid: string;
+  walletAddress: string;
+  amount: number;
+  sessionId?: string;
+  providerId?: string;
+  txHash: string;
+}): Promise<SignedSpendReceipt & { dbStored: boolean; dbError?: string }> {
+  const provider = treasurySigner.provider;
+  const network = provider ? await provider.getNetwork() : { chainId: 80002n };
+  const payload = createSpendReceiptPayload({
+    contractId: input.uid,
+    walletAddress: input.walletAddress,
+    amount: input.amount,
+    sessionId: input.sessionId || null,
+    providerId: input.providerId || null,
+    tokenTxHash: input.txHash,
+    tokenContractAddress: TOKEN_CONTRACT_ADDRESS,
+    chainId: Number(network.chainId),
+    status: 'settled',
+  });
+  const signed = await signSpendReceipt(payload, treasurySigner);
+
+  let dbStored = false;
+  let dbError: string | undefined;
+  try {
+    await SpendReceipts.create({
+      receiptId: payload.receiptId,
+      uid: payload.contractId,
+      walletAddress: payload.walletAddress,
+      amount: payload.amount,
+      sessionId: payload.sessionId,
+      providerId: payload.providerId,
+      status: payload.status,
+      tokenTxHash: payload.tokenTxHash,
+      tokenContractAddress: payload.tokenContractAddress,
+      chainId: payload.chainId,
+      signerAddress: signed.signerAddress,
+      canonicalPayload: signed.canonicalPayload,
+      signature: signed.signature,
+      issuedAt: new Date(payload.issuedAt),
+    });
+    dbStored = true;
+    await safeAuditLog({
+      eventType: 'spend_receipt.created',
+      actorType: 'system',
+      actorId: 'api',
+      targetType: 'spend_receipt',
+      targetId: payload.receiptId,
+      status: 'success',
+      metadata: {
+        uid: payload.contractId,
+        walletAddress: payload.walletAddress,
+        amount: payload.amount,
+        sessionId: payload.sessionId,
+        providerId: payload.providerId,
+        tokenTxHash: payload.tokenTxHash,
+        chainId: payload.chainId,
+      },
+    });
+  } catch (err) {
+    dbError = err instanceof Error ? err.message : String(err);
+    console.error('Spend receipt persistence error:', dbError);
+    await safeAuditLog({
+      eventType: 'spend_receipt.persistence_failed',
+      actorType: 'system',
+      actorId: 'api',
+      targetType: 'token_tx',
+      targetId: payload.tokenTxHash,
+      status: 'error',
+      metadata: {
+        uid: payload.contractId,
+        walletAddress: payload.walletAddress,
+        amount: payload.amount,
+        sessionId: payload.sessionId,
+        providerId: payload.providerId,
+        receiptId: payload.receiptId,
+        error: dbError,
+      },
+    });
+  }
+
+  return {
+    ...signed,
+    dbStored,
+    dbError,
+  };
+}
+
+async function safeAuditLog(data: {
+  eventType: string;
+  actorType: string;
+  actorId?: string | null;
+  targetType?: string | null;
+  targetId?: string | null;
+  status: string;
+  metadata?: Record<string, unknown>;
+}): Promise<void> {
+  try {
+    await AuditLogs.create(data);
+    if (shouldAlertAdmin(data)) {
+      void sendAdminAlert(data);
+    }
+  } catch (err) {
+    console.warn('Audit log write failed:', err instanceof Error ? err.message : String(err));
+  }
+}
+
+function shouldAlertAdmin(data: {
+  eventType: string;
+  status: string;
+}): boolean {
+  if (data.eventType.startsWith('admin_alert.')) {
+    return false;
+  }
+  if (data.status === 'warning' || data.status === 'retry_required') {
+    return true;
+  }
+  return data.status === 'error' && (
+    data.eventType.includes('failed')
+    || data.eventType.includes('unhandled_error')
+    || data.eventType === 'reconciliation.balance_run'
+  );
+}
+
+function countMatching(events: AuditLogRecord[], predicate: (event: AuditLogRecord) => boolean): number {
+  return events.filter(predicate).length;
+}
+
+async function getPilotMetrics(hours = 24) {
+  const boundedHours = Math.min(Math.max(Number.isFinite(hours) ? hours : 24, 1), 168);
+  const since = new Date(Date.now() - boundedHours * 60 * 60 * 1000);
+  const events = await AuditLogs.getSince(since, 5000);
+  const eventTypes = events.reduce<Record<string, number>>((counts, event) => {
+    counts[event.event_type] = (counts[event.event_type] || 0) + 1;
+    return counts;
+  }, {});
+  const lastEventAt = events[0]?.created_at
+    ? new Date(events[0].created_at).toISOString()
+    : null;
+
+  return {
+    windowHours: boundedHours,
+    since: since.toISOString(),
+    generatedAt: new Date().toISOString(),
+    totalEvents: events.length,
+    lastEventAt,
+    awards: {
+      completed: eventTypes['award.completed'] || 0,
+      notEligible: eventTypes['award.not_eligible'] || 0,
+      duplicates: eventTypes['award.duplicate'] || 0,
+      failures: countMatching(events, event => event.event_type.startsWith('award.') && event.status === 'error'),
+    },
+    spends: {
+      completed: eventTypes['spend.completed'] || 0,
+      custodialRecorded: eventTypes['spend.custodial_recorded'] || 0,
+      custodialIntentsCreated: eventTypes['spend.custodial_intent_created'] || 0,
+      retryRequired: countMatching(events, event => event.event_type.startsWith('spend.') && event.status === 'retry_required'),
+      failures: countMatching(events, event => event.event_type.startsWith('spend.') && event.status === 'error'),
+    },
+    operations: {
+      warnings: countMatching(events, event => event.status === 'warning'),
+      errors: countMatching(events, event => event.status === 'error'),
+      retryRequired: countMatching(events, event => event.status === 'retry_required'),
+      deliveredAlerts: eventTypes['admin_alert.delivered'] || 0,
+      skippedAlerts: eventTypes['admin_alert.delivery_skipped'] || 0,
+      reconciliationRuns: eventTypes['reconciliation.balance_run'] || 0,
+    },
+    eventTypes,
+  };
+}
+
+async function sendAdminAlert(data: {
+  eventType: string;
+  actorType: string;
+  actorId?: string | null;
+  targetType?: string | null;
+  targetId?: string | null;
+  status: string;
+  metadata?: Record<string, unknown>;
+}): Promise<void> {
+  const adminEmail = getRegisteredAdminEmail();
+  if (!adminEmail || !ADMIN_ALERT_WEBHOOK_URL) {
+    try {
+      await AuditLogs.create({
+        eventType: 'admin_alert.delivery_skipped',
+        actorType: 'system',
+        actorId: 'api',
+        targetType: data.targetType || null,
+        targetId: data.targetId || null,
+        status: 'warning',
+        metadata: {
+          reason: !adminEmail ? 'admin_email_not_configured' : 'admin_alert_webhook_not_configured',
+          sourceEventType: data.eventType,
+          sourceStatus: data.status,
+        },
+      });
+    } catch {
+      // Alert audit evidence must never break the user/API path.
+    }
+    return;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+  try {
+    const response = await fetch(ADMIN_ALERT_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        to: adminEmail,
+        subject: `NEVERFLAT ${data.status}: ${data.eventType}`,
+        eventType: data.eventType,
+        status: data.status,
+        actorType: data.actorType,
+        actorId: data.actorId || null,
+        targetType: data.targetType || null,
+        targetId: data.targetId || null,
+        metadata: data.metadata || {},
+        createdAt: new Date().toISOString(),
+      }),
+      signal: controller.signal,
+    });
+
+    await AuditLogs.create({
+      eventType: response.ok ? 'admin_alert.delivered' : 'admin_alert.delivery_failed',
+      actorType: 'system',
+      actorId: 'api',
+      targetType: data.targetType || null,
+      targetId: data.targetId || null,
+      status: response.ok ? 'success' : 'error',
+      metadata: {
+        adminEmail,
+        webhookStatus: response.status,
+        sourceEventType: data.eventType,
+        sourceStatus: data.status,
+      },
+    });
+  } catch (err) {
+    try {
+      await AuditLogs.create({
+        eventType: 'admin_alert.delivery_failed',
+        actorType: 'system',
+        actorId: 'api',
+        targetType: data.targetType || null,
+        targetId: data.targetId || null,
+        status: 'error',
+        metadata: {
+          adminEmail,
+          sourceEventType: data.eventType,
+          sourceStatus: data.status,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      });
+    } catch {
+      // Alert audit evidence must never break the user/API path.
+    }
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 /**
@@ -1338,11 +1930,134 @@ app.get(['/api-docs', '/docs'], (_req: Request, res: Response) => {
 </html>`);
 });
 
+function validateIngestApiKey(req: Request, res: Response, next: NextFunction): void {
+  if (!INGEST_API_KEY) {
+    return validateApiKey(req, res, next);
+  }
+
+  const apiKey = req.header('X-Ingest-API-Key') || req.header('X-API-Key');
+  if (!apiKey) {
+    res.status(401).json({
+      status: 'error',
+      message: 'Missing ingest API key: X-Ingest-API-Key header required',
+    });
+    return;
+  }
+
+  if (apiKey !== INGEST_API_KEY) {
+    void safeAuditLog({
+      eventType: 'auth.ingest_key_rejected',
+      actorType: 'api_client',
+      actorId: 'ingest',
+      targetType: 'endpoint',
+      targetId: '/ingest/cdr',
+      status: 'error',
+      metadata: {},
+    });
+    res.status(403).json({
+      status: 'error',
+      message: 'Invalid ingest API key',
+    });
+    return;
+  }
+
+  next();
+}
+
 /**
  * Health check endpoint (no authentication required)
  */
 app.get('/ingest/health', (req: Request, res: Response) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+/**
+ * Verify a signed spend receipt for FE/EMP integration checks.
+ * POST /spend-receipts/verify
+ */
+app.post('/spend-receipts/verify', validateApiKey, (req: Request, res: Response) => {
+  try {
+    const { payload, signature, signerAddress } = req.body;
+    if (!payload || typeof payload !== 'object' || !signature) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Missing required fields: payload and signature',
+      });
+    }
+
+    const expectedSignerAddress = signerAddress || TREASURY_ADDRESS;
+    if (!expectedSignerAddress || !ethers.isAddress(expectedSignerAddress)) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Missing or invalid signerAddress. Provide signerAddress or configure TREASURY_ADDRESS.',
+      });
+    }
+
+    const valid = verifySpendReceipt(payload, signature, expectedSignerAddress);
+    return res.status(200).json({
+      status: valid ? 'valid' : 'invalid',
+      valid,
+      signerAddress: ethers.getAddress(expectedSignerAddress),
+      receiptId: payload.receiptId || null,
+    });
+  } catch (err) {
+    return res.status(400).json({
+      status: 'error',
+      valid: false,
+      message: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
+/**
+ * CDR preview endpoint for AU/pilot payload validation and performance evidence.
+ * POST /ingest/cdr/preview
+ *
+ * Normalises the payload and applies reward rules without writing to the DB or
+ * submitting an on-chain transaction.
+ */
+app.post('/ingest/cdr/preview', validateIngestApiKey, async (req: Request, res: Response) => {
+  try {
+    const cdr: RawSession | OCPICDRFormat = req.body;
+    const normalised = normaliseSession(cdr);
+    const award = prepareAward(normalised);
+
+    return res.status(200).json({
+      status: 'preview',
+      sideEffects: false,
+      eligible: award.eligible,
+      tokensAwarded: award.amount,
+      uid: award.uid,
+      dedupKey: award.dedupKey,
+      normalised: {
+        sessionId: normalised.sessionId,
+        providerId: normalised.providerId,
+        uid: normalised.uid,
+        evseId: normalised.evseId,
+        startTime: normalised.startTime.toISOString(),
+        endTime: normalised.endTime.toISOString(),
+        energyKWh: normalised.energyKWh,
+        energyDirection: normalised.energyDirection,
+      },
+      metadata: award.metadata || {},
+    });
+  } catch (err) {
+    await safeAuditLog({
+      eventType: 'award.preview_failed',
+      actorType: 'ingest_client',
+      actorId: null,
+      targetType: 'cdr_preview',
+      targetId: null,
+      status: 'error',
+      metadata: {
+        error: err instanceof Error ? err.message : String(err),
+      },
+    });
+    return res.status(400).json({
+      status: 'error',
+      message: err instanceof Error ? err.message : String(err),
+    });
+  }
 });
 
 /**
@@ -1352,7 +2067,7 @@ app.get('/ingest/health', (req: Request, res: Response) => {
  * Accepts raw CDR data, processes award if eligible, returns status
  * Requires X-API-Key header for authentication
  */
-app.post('/ingest/cdr', validateApiKey, async (req: Request, res: Response) => {
+app.post('/ingest/cdr', validateIngestApiKey, async (req: Request, res: Response) => {
   try {
     const cdr: RawSession | OCPICDRFormat = req.body;
 
@@ -1362,6 +2077,19 @@ app.post('/ingest/cdr', validateApiKey, async (req: Request, res: Response) => {
     const contractId = cdr.cdr_token?.contract_id || cdr.cdr_token_contract_id;
 
     if (!sessionId || !providerId || !contractId) {
+      await safeAuditLog({
+        eventType: 'award.validation_failed',
+        actorType: 'ingest_client',
+        actorId: providerId ? String(providerId) : null,
+        targetType: 'cdr',
+        targetId: sessionId ? String(sessionId) : null,
+        status: 'error',
+        metadata: {
+          sessionId,
+          providerId,
+          reason: 'missing_required_fields',
+        },
+      });
       return res.status(400).json({
         status: 'error',
         message: 'Missing required fields: session id (SessionID or id), provider id (ProviderID, party_id, or custom_data.provider_id), and cdr_token.contract_id',
@@ -1373,6 +2101,18 @@ app.post('/ingest/cdr', validateApiKey, async (req: Request, res: Response) => {
     const exists = await Awards.exists(dedupKey);
 
     if (exists) {
+      await safeAuditLog({
+        eventType: 'award.duplicate',
+        actorType: 'ingest_client',
+        actorId: String(providerId),
+        targetType: 'award_dedup_key',
+        targetId: dedupKey,
+        status: 'duplicate',
+        metadata: {
+          sessionId,
+          providerId,
+        },
+      });
       return res.status(200).json({
         status: 'duplicate',
         sessionId,
@@ -1381,17 +2121,54 @@ app.post('/ingest/cdr', validateApiKey, async (req: Request, res: Response) => {
       });
     }
 
+    await auditTreasuryGasWarning('award.ingest.before_execution');
+
     // Process award
     const result = await processAwardFromCDR(cdr, treasurySigner);
 
     if (!result.success) {
+      if (isTreasuryGasIssue(result.error)) {
+        await auditTreasuryGasWarning('award.ingest.failure', result.error);
+      }
+      await safeAuditLog({
+        eventType: 'award.failed',
+        actorType: 'ingest_client',
+        actorId: String(providerId),
+        targetType: 'award_dedup_key',
+        targetId: result.dedupKey || dedupKey,
+        status: result.stage === 'execution' ? 'retry_required' : 'error',
+        metadata: {
+          sessionId,
+          providerId,
+          uid: result.uid || contractId,
+          stage: result.stage,
+          error: result.error,
+        },
+      });
       return res.status(400).json({
         status: 'error',
         sessionId,
         providerId,
-        error: result.error,
+        error: toUserFacingAwardError(result.error, result.stage),
       });
     }
+
+    await safeAuditLog({
+      eventType: result.eligible ? 'award.completed' : 'award.not_eligible',
+      actorType: 'ingest_client',
+      actorId: String(providerId),
+      targetType: 'award_dedup_key',
+      targetId: result.dedupKey || dedupKey,
+      status: 'success',
+      metadata: {
+        sessionId,
+        providerId,
+        uid: result.uid,
+        amount: result.amount,
+        txHash: result.txHash || null,
+        eligible: result.eligible,
+      },
+    });
 
     return res.status(200).json({
       status: 'accepted',
@@ -1405,9 +2182,23 @@ app.post('/ingest/cdr', validateApiKey, async (req: Request, res: Response) => {
     });
   } catch (err) {
     console.error('CDR ingestion error:', err);
+    if (isTreasuryGasIssue(err)) {
+      await auditTreasuryGasWarning('award.ingest.unhandled_error', err);
+    }
+    await safeAuditLog({
+      eventType: 'award.unhandled_error',
+      actorType: 'ingest_client',
+      actorId: null,
+      targetType: 'endpoint',
+      targetId: '/ingest/cdr',
+      status: 'error',
+      metadata: {
+        error: err instanceof Error ? err.message : String(err),
+      },
+    });
     res.status(500).json({
       status: 'error',
-      error: err instanceof Error ? err.message : String(err),
+      error: toUserFacingAwardError(err),
     });
   }
 });
@@ -1427,6 +2218,21 @@ app.post('/spend', validateApiKey, async (req: Request, res: Response) => {
 
     // Validate
     if (!normalizedUid || !amount || amount <= 0) {
+      await safeAuditLog({
+        eventType: 'spend.validation_failed',
+        actorType: 'api_client',
+        actorId: normalizedUid || null,
+        targetType: 'spend_request',
+        targetId: sessionId || null,
+        status: 'error',
+        metadata: {
+          uid: normalizedUid,
+          amount,
+          sessionId,
+          providerId,
+          reason: 'missing_or_invalid_uid_or_amount',
+        },
+      });
       return res.status(400).json({
         status: 'error',
         message: 'Missing or invalid fields: uid, amount (must be > 0)',
@@ -1436,6 +2242,8 @@ app.post('/spend', validateApiKey, async (req: Request, res: Response) => {
     // Resolve uid to wallet address
     const walletConfig = await getUserWalletConfig(normalizedUid);
     const userAddress = walletConfig.managedWalletAddress;
+
+    await auditTreasuryGasWarning('spend.legacy.before_execution');
 
     // Execute spend (first attempt)
     let spendResult = await processSpend(
@@ -1465,16 +2273,77 @@ app.post('/spend', validateApiKey, async (req: Request, res: Response) => {
         }
       } catch (approvalErr) {
         console.error('Spend auto-approval failed:', approvalErr);
+        if (isTreasuryGasIssue(approvalErr)) {
+          await auditTreasuryGasWarning('spend.legacy.auto_approval_failure', approvalErr);
+        }
+        await safeAuditLog({
+          eventType: 'spend.auto_approval_failed',
+          actorType: 'api_client',
+          actorId: normalizedUid,
+          targetType: 'wallet',
+          targetId: userAddress,
+          status: 'retry_required',
+          metadata: {
+            uid: normalizedUid,
+            amount,
+            sessionId,
+            providerId,
+            error: approvalErr instanceof Error ? approvalErr.message : String(approvalErr),
+          },
+        });
       }
     }
 
     if (!spendResult.success) {
+      if (isTreasuryGasIssue(spendResult.error)) {
+        await auditTreasuryGasWarning('spend.legacy.failure', spendResult.error);
+      }
+      await safeAuditLog({
+        eventType: 'spend.failed',
+        actorType: 'api_client',
+        actorId: normalizedUid,
+        targetType: 'wallet',
+        targetId: userAddress,
+        status: 'retry_required',
+        metadata: {
+          uid: normalizedUid,
+          amount,
+          sessionId,
+          providerId,
+          error: spendResult.error,
+        },
+      });
       return res.status(400).json({
         status: 'error',
         uid: normalizedUid,
-        error: spendResult.error,
+        error: toUserFacingSpendError(spendResult.error),
       });
     }
+
+    const spendReceipt = await createAndStoreSpendReceipt({
+      uid: normalizedUid,
+      walletAddress: userAddress,
+      amount: spendResult.amount,
+      sessionId,
+      providerId,
+      txHash: spendResult.txHash!,
+    });
+    await safeAuditLog({
+      eventType: 'spend.completed',
+      actorType: 'api_client',
+      actorId: 'manual_spend',
+      targetType: 'token_tx',
+      targetId: spendResult.txHash,
+      status: 'success',
+      metadata: {
+        uid: normalizedUid,
+        walletAddress: userAddress,
+        amount: spendResult.amount,
+        sessionId,
+        providerId,
+        receiptId: spendReceipt.payload.receiptId,
+      },
+    });
 
     return res.status(200).json({
       status: 'success',
@@ -1485,12 +2354,27 @@ app.post('/spend', validateApiKey, async (req: Request, res: Response) => {
       txHash: spendResult.txHash,
       timestamp: new Date().toISOString(),
       label,
+      spendReceipt,
     });
   } catch (err) {
     console.error('Spend error:', err);
+    if (isTreasuryGasIssue(err)) {
+      await auditTreasuryGasWarning('spend.legacy.unhandled_error', err);
+    }
+    await safeAuditLog({
+      eventType: 'spend.unhandled_error',
+      actorType: 'api_client',
+      actorId: null,
+      targetType: 'endpoint',
+      targetId: '/spend',
+      status: 'error',
+      metadata: {
+        error: err instanceof Error ? err.message : String(err),
+      },
+    });
     res.status(500).json({
       status: 'error',
-      error: err instanceof Error ? err.message : String(err),
+      error: toUserFacingSpendError(err),
     });
   }
 });
@@ -1505,6 +2389,17 @@ app.post('/spend/me', validateApiKey, async (req: Request, res: Response) => {
   try {
     const contractId = getRequestContractId(req);
     if (!contractId) {
+      await safeAuditLog({
+        eventType: 'spend.identity_missing',
+        actorType: 'api_client',
+        actorId: null,
+        targetType: 'endpoint',
+        targetId: '/spend/me',
+        status: 'error',
+        metadata: {
+          requiredHeader: USER_IDENTITY_HEADER,
+        },
+      });
       return res.status(401).json({
         status: 'error',
         message: `Missing identity header: ${USER_IDENTITY_HEADER}`,
@@ -1515,6 +2410,21 @@ app.post('/spend/me', validateApiKey, async (req: Request, res: Response) => {
     const normalizedUid = normalizeUid(contractId);
 
     if (!normalizedUid || !amount || amount <= 0) {
+      await safeAuditLog({
+        eventType: 'spend.validation_failed',
+        actorType: 'contract_identity',
+        actorId: normalizedUid || null,
+        targetType: 'spend_request',
+        targetId: sessionId || null,
+        status: 'error',
+        metadata: {
+          uid: normalizedUid,
+          amount,
+          sessionId,
+          providerId,
+          reason: 'missing_or_invalid_amount',
+        },
+      });
       return res.status(400).json({
         status: 'error',
         message: 'Missing or invalid fields: amount (must be > 0)',
@@ -1523,6 +2433,8 @@ app.post('/spend/me', validateApiKey, async (req: Request, res: Response) => {
 
     const walletConfig = await getUserWalletConfig(normalizedUid);
     const userAddress = walletConfig.managedWalletAddress;
+
+    await auditTreasuryGasWarning('spend.identity.before_execution');
 
     let spendResult = await processSpend(
       {
@@ -1550,16 +2462,77 @@ app.post('/spend/me', validateApiKey, async (req: Request, res: Response) => {
         }
       } catch (approvalErr) {
         console.error('Spend auto-approval failed:', approvalErr);
+        if (isTreasuryGasIssue(approvalErr)) {
+          await auditTreasuryGasWarning('spend.identity.auto_approval_failure', approvalErr);
+        }
+        await safeAuditLog({
+          eventType: 'spend.auto_approval_failed',
+          actorType: 'contract_identity',
+          actorId: normalizedUid,
+          targetType: 'wallet',
+          targetId: userAddress,
+          status: 'retry_required',
+          metadata: {
+            uid: normalizedUid,
+            amount,
+            sessionId,
+            providerId,
+            error: approvalErr instanceof Error ? approvalErr.message : String(approvalErr),
+          },
+        });
       }
     }
 
     if (!spendResult.success) {
+      if (isTreasuryGasIssue(spendResult.error)) {
+        await auditTreasuryGasWarning('spend.identity.failure', spendResult.error);
+      }
+      await safeAuditLog({
+        eventType: 'spend.failed',
+        actorType: 'contract_identity',
+        actorId: normalizedUid,
+        targetType: 'wallet',
+        targetId: userAddress,
+        status: 'retry_required',
+        metadata: {
+          uid: normalizedUid,
+          amount,
+          sessionId,
+          providerId,
+          error: spendResult.error,
+        },
+      });
       return res.status(400).json({
         status: 'error',
         uid: normalizedUid,
-        error: spendResult.error,
+        error: toUserFacingSpendError(spendResult.error),
       });
     }
+
+    const spendReceipt = await createAndStoreSpendReceipt({
+      uid: normalizedUid,
+      walletAddress: userAddress,
+      amount: spendResult.amount,
+      sessionId,
+      providerId,
+      txHash: spendResult.txHash!,
+    });
+    await safeAuditLog({
+      eventType: 'spend.completed',
+      actorType: 'contract_identity',
+      actorId: normalizedUid,
+      targetType: 'token_tx',
+      targetId: spendResult.txHash,
+      status: 'success',
+      metadata: {
+        uid: normalizedUid,
+        walletAddress: userAddress,
+        amount: spendResult.amount,
+        sessionId,
+        providerId,
+        receiptId: spendReceipt.payload.receiptId,
+      },
+    });
 
     return res.status(200).json({
       status: 'success',
@@ -1570,12 +2543,27 @@ app.post('/spend/me', validateApiKey, async (req: Request, res: Response) => {
       txHash: spendResult.txHash,
       timestamp: new Date().toISOString(),
       label,
+      spendReceipt,
     });
   } catch (err) {
     console.error('Spend (me) error:', err);
+    if (isTreasuryGasIssue(err)) {
+      await auditTreasuryGasWarning('spend.identity.unhandled_error', err);
+    }
+    await safeAuditLog({
+      eventType: 'spend.unhandled_error',
+      actorType: 'contract_identity',
+      actorId: null,
+      targetType: 'endpoint',
+      targetId: '/spend/me',
+      status: 'error',
+      metadata: {
+        error: err instanceof Error ? err.message : String(err),
+      },
+    });
     res.status(500).json({
       status: 'error',
-      error: err instanceof Error ? err.message : String(err),
+      error: toUserFacingSpendError(err),
     });
   }
 });
@@ -1624,6 +2612,20 @@ app.post('/wallet/:uid/mode', validateApiKey, async (req: Request, res: Response
     }
 
     const result = await setUserWalletMode(normalizedUid, mode, walletAddress);
+    await safeAuditLog({
+      eventType: 'wallet.mode_changed',
+      actorType: 'api_client',
+      actorId: normalizedUid,
+      targetType: 'wallet',
+      targetId: result.walletAddress,
+      status: 'success',
+      metadata: {
+        uid: normalizedUid,
+        mode,
+        managedWalletAddress: result.managedWalletAddress,
+        allowSplit: Boolean(allowSplit),
+      },
+    });
 
     // When switching to custodial, revoke the treasury's on-chain allowance on the
     // derived managed wallet so it cannot call transferFrom even if the API is bypassed.
@@ -1877,15 +2879,173 @@ app.post('/wallet/:uid/move-funds', validateApiKey, async (req: Request, res: Re
 });
 
 /**
+ * Build a custodial spend transaction for a user-managed wallet to sign.
+ * POST /spend/custodial-intent
+ */
+app.post('/spend/custodial-intent', validateApiKey, async (req: Request, res: Response) => {
+  const { uid, walletAddress, amount, sessionId, providerId } = req.body;
+  const normalizedUid = normalizeUid(String(uid || ''));
+
+  try {
+    const numericAmount = Number(amount);
+    const checksumWalletAddress = await validateCustodialSpendIntentInput({
+      uid: normalizedUid,
+      walletAddress,
+      amount: numericAmount,
+    });
+    const spendIntent = await createCustodialSpendIntent({
+      uid: normalizedUid,
+      walletAddress: checksumWalletAddress,
+      amount: numericAmount,
+      sessionId,
+      providerId,
+    });
+
+    await safeAuditLog({
+      eventType: 'spend.custodial_intent_created',
+      actorType: 'api_client',
+      actorId: normalizedUid,
+      targetType: 'wallet',
+      targetId: checksumWalletAddress,
+      status: 'requires_signature',
+      metadata: {
+        uid: normalizedUid,
+        amount: numericAmount,
+        sessionId,
+        providerId,
+        intentId: spendIntent.intentId,
+      },
+    });
+
+    return res.status(200).json({
+      status: 'requires_signature',
+      uid: normalizedUid,
+      message: 'Confirm this SPARKZ spend in your wallet.',
+      spendIntent,
+    });
+  } catch (err) {
+    await safeAuditLog({
+      eventType: 'spend.custodial_intent_failed',
+      actorType: 'api_client',
+      actorId: normalizedUid || null,
+      targetType: 'wallet',
+      targetId: typeof walletAddress === 'string' ? walletAddress : null,
+      status: 'error',
+      metadata: {
+        uid: normalizedUid,
+        walletAddress,
+        amount,
+        sessionId,
+        providerId,
+        error: err instanceof Error ? err.message : String(err),
+      },
+    });
+    return res.status(400).json({
+      status: 'error',
+      message: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
+/**
+ * Record that a custodial spend signing/submission attempt failed.
+ * Returns the same deterministic spend intent so the frontend can prompt retry.
+ * POST /spend/custodial-failure
+ */
+app.post('/spend/custodial-failure', validateApiKey, async (req: Request, res: Response) => {
+  const { uid, walletAddress, amount, sessionId, providerId, intentId, reason } = req.body;
+  const normalizedUid = normalizeUid(String(uid || ''));
+
+  try {
+    const numericAmount = Number(amount);
+    const checksumWalletAddress = await validateCustodialSpendIntentInput({
+      uid: normalizedUid,
+      walletAddress,
+      amount: numericAmount,
+    });
+    const spendIntent = await createCustodialSpendIntent({
+      uid: normalizedUid,
+      walletAddress: checksumWalletAddress,
+      amount: numericAmount,
+      sessionId,
+      providerId,
+    });
+
+    await safeAuditLog({
+      eventType: 'spend.custodial_failed',
+      actorType: 'api_client',
+      actorId: normalizedUid,
+      targetType: 'custodial_spend_intent',
+      targetId: intentId || spendIntent.intentId,
+      status: 'retry_required',
+      metadata: {
+        uid: normalizedUid,
+        walletAddress: checksumWalletAddress,
+        amount: numericAmount,
+        sessionId,
+        providerId,
+        intentId: spendIntent.intentId,
+        reason: typeof reason === 'string' ? reason.slice(0, 500) : null,
+      },
+    });
+
+    return res.status(200).json({
+      status: 'retry_required',
+      uid: normalizedUid,
+      message: 'The wallet spend was not completed. Please retry and sign the same spend transaction.',
+      spendIntent,
+    });
+  } catch (err) {
+    await safeAuditLog({
+      eventType: 'spend.custodial_failure_report_failed',
+      actorType: 'api_client',
+      actorId: normalizedUid || null,
+      targetType: 'custodial_spend_intent',
+      targetId: intentId || null,
+      status: 'error',
+      metadata: {
+        uid: normalizedUid,
+        walletAddress,
+        amount,
+        sessionId,
+        providerId,
+        reason,
+        error: err instanceof Error ? err.message : String(err),
+      },
+    });
+    return res.status(400).json({
+      status: 'error',
+      message: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
+/**
  * Record a custodial spend after the user confirms it in their own wallet.
  * POST /spend/custodial-record
  */
 app.post('/spend/custodial-record', validateApiKey, async (req: Request, res: Response) => {
   try {
-    const { uid, walletAddress, amount, txHash, sessionId } = req.body;
+    const { uid, walletAddress, amount, txHash, sessionId, providerId } = req.body;
     const normalizedUid = normalizeUid(String(uid || ''));
 
     if (!normalizedUid || !walletAddress || !txHash || !amount || amount <= 0) {
+      await safeAuditLog({
+        eventType: 'spend.custodial_validation_failed',
+        actorType: 'api_client',
+        actorId: normalizedUid || null,
+        targetType: 'token_tx',
+        targetId: txHash || null,
+        status: 'error',
+        metadata: {
+          uid: normalizedUid,
+          walletAddress,
+          amount,
+          sessionId,
+          providerId,
+          reason: 'missing_or_invalid_required_fields',
+        },
+      });
       return res.status(400).json({
         status: 'error',
         message: 'Missing or invalid fields: uid, walletAddress, txHash, amount (must be > 0)',
@@ -1893,6 +3053,18 @@ app.post('/spend/custodial-record', validateApiKey, async (req: Request, res: Re
     }
 
     if (!ethers.isAddress(walletAddress)) {
+      await safeAuditLog({
+        eventType: 'spend.custodial_validation_failed',
+        actorType: 'api_client',
+        actorId: normalizedUid,
+        targetType: 'wallet',
+        targetId: walletAddress,
+        status: 'error',
+        metadata: {
+          uid: normalizedUid,
+          reason: 'invalid_wallet_address',
+        },
+      });
       return res.status(400).json({
         status: 'error',
         message: 'Invalid wallet address',
@@ -1900,6 +3072,19 @@ app.post('/spend/custodial-record', validateApiKey, async (req: Request, res: Re
     }
 
     if (!/^0x[a-fA-F0-9]{64}$/.test(txHash)) {
+      await safeAuditLog({
+        eventType: 'spend.custodial_validation_failed',
+        actorType: 'api_client',
+        actorId: normalizedUid,
+        targetType: 'token_tx',
+        targetId: txHash,
+        status: 'error',
+        metadata: {
+          uid: normalizedUid,
+          walletAddress,
+          reason: 'invalid_transaction_hash',
+        },
+      });
       return res.status(400).json({
         status: 'error',
         message: 'Invalid transaction hash',
@@ -1909,6 +3094,19 @@ app.post('/spend/custodial-record', validateApiKey, async (req: Request, res: Re
     const checksumWalletAddress = ethers.getAddress(walletAddress);
     const linkedWalletAddresses = (await LinkedWallets.findByUid(normalizedUid)).map(w => w.wallet_address.toLowerCase());
     if (!linkedWalletAddresses.includes(checksumWalletAddress.toLowerCase())) {
+      await safeAuditLog({
+        eventType: 'spend.custodial_validation_failed',
+        actorType: 'api_client',
+        actorId: normalizedUid,
+        targetType: 'wallet',
+        targetId: checksumWalletAddress,
+        status: 'error',
+        metadata: {
+          uid: normalizedUid,
+          txHash,
+          reason: 'wallet_not_linked',
+        },
+      });
       return res.status(400).json({
         status: 'error',
         message: 'Wallet address is not linked to this EMP contract',
@@ -1926,14 +3124,51 @@ app.post('/spend/custodial-record', validateApiKey, async (req: Request, res: Re
     }
 
     await recordSpend(checksumWalletAddress, Number(amount), txHash, sessionId, normalizedUid);
+    const spendReceipt = await createAndStoreSpendReceipt({
+      uid: normalizedUid,
+      walletAddress: checksumWalletAddress,
+      amount: Number(amount),
+      sessionId,
+      providerId,
+      txHash,
+    });
+    await safeAuditLog({
+      eventType: 'spend.custodial_recorded',
+      actorType: 'api_client',
+      actorId: normalizedUid,
+      targetType: 'token_tx',
+      targetId: txHash,
+      status: 'success',
+      metadata: {
+        uid: normalizedUid,
+        walletAddress: checksumWalletAddress,
+        amount: Number(amount),
+        sessionId,
+        providerId,
+        receiptId: spendReceipt.payload.receiptId,
+      },
+    });
+
     return res.status(200).json({
       status: 'success',
       uid: normalizedUid,
       txHash,
       message: 'Custodial spend recorded',
+      spendReceipt,
     });
   } catch (err) {
     console.error('Custodial spend record error:', err);
+    await safeAuditLog({
+      eventType: 'spend.custodial_unhandled_error',
+      actorType: 'api_client',
+      actorId: null,
+      targetType: 'endpoint',
+      targetId: '/spend/custodial-record',
+      status: 'error',
+      metadata: {
+        error: err instanceof Error ? err.message : String(err),
+      },
+    });
     res.status(500).json({
       status: 'error',
       error: err instanceof Error ? err.message : String(err),
@@ -2012,6 +3247,7 @@ app.get('/transactions', validateApiKey, async (req: Request, res: Response) => 
         amount: a.amount,
         txHash: a.tx_hash,
         timestamp: a.awarded_at,
+        status: a.status || 'confirmed',
         };
       }),
       ...spends.map(s => {
@@ -2025,6 +3261,7 @@ app.get('/transactions', validateApiKey, async (req: Request, res: Response) => 
         txHash: s.tx_hash,
         sessionId: s.session_id || null,
         timestamp: s.created_at,
+        status: s.status || 'confirmed',
         };
       }),
     ]
@@ -2063,14 +3300,54 @@ function validateAdmin(req: Request, res: Response, next: NextFunction): void {
  * POST /admin/login
  */
 app.post('/admin/login', (req: Request, res: Response) => {
-  const { username, password } = req.body;
-  if (username !== ADMIN_USERNAME || password !== ADMIN_PASSWORD) {
+  const { username, email, password } = req.body;
+  const submittedEmail = String(email || username || '').trim().toLowerCase();
+  const registeredAdminEmail = getRegisteredAdminEmail();
+  if (!registeredAdminEmail || !ADMIN_PASSWORD) {
+    void safeAuditLog({
+      eventType: 'admin.login_unconfigured',
+      actorType: 'admin',
+      actorId: submittedEmail || null,
+      targetType: 'admin_session',
+      targetId: null,
+      status: 'error',
+      metadata: {
+        adminEmailConfigured: Boolean(registeredAdminEmail),
+        adminPasswordConfigured: Boolean(ADMIN_PASSWORD),
+      },
+    });
+    res.status(503).json({
+      status: 'error',
+      message: 'Admin login is not configured. Set ADMIN_EMAIL and ADMIN_PASSWORD.',
+    });
+    return;
+  }
+
+  if (submittedEmail !== registeredAdminEmail || password !== ADMIN_PASSWORD) {
+    void safeAuditLog({
+      eventType: 'admin.login_failed',
+      actorType: 'admin',
+      actorId: submittedEmail || null,
+      targetType: 'admin_session',
+      targetId: null,
+      status: 'error',
+      metadata: {},
+    });
     res.status(401).json({ status: 'error', message: 'Invalid credentials' });
     return;
   }
   const token = crypto.randomBytes(32).toString('hex');
   adminSessions.add(token);
-  res.json({ status: 'ok', token });
+  void safeAuditLog({
+    eventType: 'admin.login_succeeded',
+    actorType: 'admin',
+    actorId: registeredAdminEmail,
+    targetType: 'admin_session',
+    targetId: token.slice(0, 8),
+    status: 'success',
+    metadata: {},
+  });
+  res.json({ status: 'ok', token, adminEmail: registeredAdminEmail });
 });
 
 /**
@@ -2080,6 +3357,15 @@ app.post('/admin/login', (req: Request, res: Response) => {
 app.post('/admin/logout', validateAdmin, (req: Request, res: Response) => {
   const token = req.header('Authorization')!.slice(7);
   adminSessions.delete(token);
+  void safeAuditLog({
+    eventType: 'admin.logout',
+    actorType: 'admin_session',
+    actorId: token.slice(0, 8),
+    targetType: 'admin_session',
+    targetId: token.slice(0, 8),
+    status: 'success',
+    metadata: {},
+  });
   res.json({ status: 'ok' });
 });
 
@@ -2125,6 +3411,18 @@ app.put('/admin/rules', validateAdmin, (req: Request, res: Response) => {
   };
 
   setRules(updated);
+  void safeAuditLog({
+    eventType: 'admin.rules_updated',
+    actorType: 'admin_session',
+    actorId: req.header('Authorization')?.slice(7, 15) || null,
+    targetType: 'award_rules',
+    targetId: updated.version,
+    status: 'success',
+    metadata: {
+      previous: current,
+      updated,
+    },
+  });
   res.json({ status: 'ok', rules: updated });
 });
 
@@ -2161,6 +3459,194 @@ app.get('/admin/off-peak', validateAdmin, (_req: Request, res: Response) => {
 });
 
 /**
+ * Get recent audit events
+ * GET /admin/audit?limit=100
+ */
+app.get('/admin/audit', validateAdmin, async (req: Request, res: Response) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit as string) || 100, 500);
+    const status = typeof req.query.status === 'string' ? req.query.status : undefined;
+    const eventType = typeof req.query.eventType === 'string' ? req.query.eventType : undefined;
+    const events = await AuditLogs.getRecent(limit, { status, eventType });
+    res.json({ status: 'ok', count: events.length, events });
+  } catch (err) {
+    res.status(500).json({
+      status: 'error',
+      error: toUserFacingAwardError(err),
+    });
+  }
+});
+
+/**
+ * Pilot operational metrics derived from audit events.
+ * GET /admin/pilot-metrics?hours=24
+ */
+app.get('/admin/pilot-metrics', validateAdmin, async (req: Request, res: Response) => {
+  try {
+    const requestedHours = Number(req.query.hours || 24);
+    const metrics = await getPilotMetrics(requestedHours);
+    res.json({ status: 'ok', metrics });
+  } catch (err) {
+    res.status(500).json({
+      status: 'error',
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
+/**
+ * Pilot readiness checks for deployment evidence.
+ * GET /admin/readiness
+ */
+app.get('/admin/readiness', validateAdmin, async (_req: Request, res: Response) => {
+  const checks = await getReadinessChecks();
+  const failed = checks.filter(check => check.status === 'fail');
+  const warnings = checks.filter(check => check.status === 'warn');
+  res.status(failed.length ? 503 : 200).json({
+    status: failed.length ? 'not_ready' : warnings.length ? 'ready_with_warnings' : 'ready',
+    failedCount: failed.length,
+    warningCount: warnings.length,
+    checks,
+  });
+});
+
+/**
+ * Send a test alert to the registered admin alert target.
+ * POST /admin/alerts/test
+ */
+app.post('/admin/alerts/test', validateAdmin, async (req: Request, res: Response) => {
+  const adminEmail = getRegisteredAdminEmail();
+  const actorId = req.header('Authorization')?.slice(7, 15) || null;
+
+  await safeAuditLog({
+    eventType: 'admin_alert.test_requested',
+    actorType: 'admin_session',
+    actorId,
+    targetType: 'admin_email',
+    targetId: adminEmail,
+    status: 'success',
+    metadata: {
+      webhookConfigured: Boolean(ADMIN_ALERT_WEBHOOK_URL),
+    },
+  });
+
+  await sendAdminAlert({
+    eventType: 'admin_alert.test',
+    actorType: 'admin_session',
+    actorId,
+    targetType: 'admin_email',
+    targetId: adminEmail,
+    status: 'warning',
+    metadata: {
+      message: 'Manual NEVERFLAT admin alert test',
+      requestedAt: new Date().toISOString(),
+    },
+  });
+
+  res.status(202).json({
+    status: ADMIN_ALERT_WEBHOOK_URL && adminEmail ? 'sent_or_queued' : 'delivery_skipped',
+    message: ADMIN_ALERT_WEBHOOK_URL && adminEmail
+      ? 'Test alert sent to configured admin alert webhook.'
+      : 'Test alert recorded, but delivery was skipped because admin email or alert webhook is not configured.',
+    adminEmailConfigured: Boolean(adminEmail),
+    webhookConfigured: Boolean(ADMIN_ALERT_WEBHOOK_URL),
+  });
+});
+
+/**
+ * Export a point-in-time TRL7 evidence snapshot for reviewers/operators.
+ * GET /admin/evidence-pack
+ */
+app.get('/admin/evidence-pack', validateAdmin, async (_req: Request, res: Response) => {
+  try {
+    const readinessChecks = await getReadinessChecks();
+    const failed = readinessChecks.filter(check => check.status === 'fail');
+    const warnings = readinessChecks.filter(check => check.status === 'warn');
+    const latestReconciliation = await ReconciliationReports.latest();
+    const recentRetryEvents = await AuditLogs.getRecent(25, { status: 'retry_required' });
+    const recentWarningEvents = await AuditLogs.getRecent(25, { status: 'warning' });
+    const recentErrorEvents = await AuditLogs.getRecent(25, { status: 'error' });
+    const recentAlertEvents = await AuditLogs.getRecent(25, { eventType: 'admin_alert.delivered' });
+    const pilotMetrics = await getPilotMetrics(24);
+
+    res.status(200).json({
+      status: 'ok',
+      generatedAt: new Date().toISOString(),
+      readiness: {
+        status: failed.length ? 'not_ready' : warnings.length ? 'ready_with_warnings' : 'ready',
+        failedCount: failed.length,
+        warningCount: warnings.length,
+        checks: readinessChecks,
+      },
+      configuration: {
+        apiKeyConfigured: Boolean(API_KEY),
+        ingestApiKeyConfigured: Boolean(INGEST_API_KEY),
+        adminEmailConfigured: Boolean(getRegisteredAdminEmail()),
+        adminAlertWebhookConfigured: Boolean(ADMIN_ALERT_WEBHOOK_URL),
+        manualUidLookupEnabled: ENABLE_TEST_UID_LOOKUP,
+        tokenContractAddress: TOKEN_CONTRACT_ADDRESS,
+        treasuryAddress: await getTreasuryWalletAddress(),
+        polygonRpcConfigured: Boolean(POLYGON_RPC_URL),
+      },
+      reconciliation: {
+        latest: latestReconciliation || null,
+      },
+      pilotMetrics,
+      audit: {
+        retryRequired: recentRetryEvents,
+        warnings: recentWarningEvents,
+        errors: recentErrorEvents,
+        deliveredAlerts: recentAlertEvents,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({
+      status: 'error',
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
+/**
+ * Run DB-vs-chain wallet balance reconciliation
+ * POST /admin/reconciliation/run
+ */
+app.post('/admin/reconciliation/run', validateAdmin, async (req: Request, res: Response) => {
+  try {
+    const limit = Math.min(Number(req.body?.limit || 500), 1000);
+    const report = await runBalanceReconciliation(limit);
+    res.json({ status: 'ok', report });
+  } catch (err) {
+    res.status(500).json({
+      status: 'error',
+      error: toUserFacingSpendError(err),
+    });
+  }
+});
+
+/**
+ * Get latest or recent reconciliation reports
+ * GET /admin/reconciliation?limit=20
+ */
+app.get('/admin/reconciliation', validateAdmin, async (req: Request, res: Response) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
+    const reports = await ReconciliationReports.getRecent(limit);
+    res.json({
+      status: 'ok',
+      count: reports.length,
+      latest: reports[0] || null,
+      reports,
+    });
+  } catch (err) {
+    res.status(500).json({
+      status: 'error',
+      error: toUserFacingSpendError(err),
+    });
+  }
+});
+
+/**
  * Replace entire off-peak window config
  * PUT /admin/off-peak
  * Body: { windows: OffPeakConfig }
@@ -2194,7 +3680,20 @@ app.put('/admin/off-peak', validateAdmin, (req: Request, res: Response) => {
     }
   }
 
+  const previous = getOffPeakWindows();
   setOffPeakWindows(windows as OffPeakConfig);
+  void safeAuditLog({
+    eventType: 'admin.off_peak_updated',
+    actorType: 'admin_session',
+    actorId: req.header('Authorization')?.slice(7, 15) || null,
+    targetType: 'off_peak_windows',
+    targetId: 'all',
+    status: 'success',
+    metadata: {
+      previous,
+      updated: getOffPeakWindows(),
+    },
+  });
   res.json({ status: 'ok', windows: getOffPeakWindows() });
 });
 
@@ -2215,6 +3714,18 @@ app.delete('/admin/off-peak/:countryCode', validateAdmin, (req: Request, res: Re
   }
   const { [code]: _removed, ...rest } = current;
   setOffPeakWindows(rest as OffPeakConfig);
+  void safeAuditLog({
+    eventType: 'admin.off_peak_country_removed',
+    actorType: 'admin_session',
+    actorId: req.header('Authorization')?.slice(7, 15) || null,
+    targetType: 'off_peak_country',
+    targetId: code,
+    status: 'success',
+    metadata: {
+      removed: current[code],
+      updated: getOffPeakWindows(),
+    },
+  });
   res.json({ status: 'ok', windows: getOffPeakWindows() });
 });
 
@@ -2237,8 +3748,10 @@ if (fs.existsSync(frontendBuild)) {
   });
 }
 
-// Start server
-app.listen(PORT, () => {
+export { app };
+
+export function startServer() {
+  return app.listen(PORT, () => {
   console.log(`🚀 NVF Award System API running on port ${PORT}`);
   console.log(`📍 Health: GET http://localhost:${PORT}/ingest/health`);
   console.log(`📍 Ingest CDR: POST http://localhost:${PORT}/ingest/cdr`);
@@ -2248,3 +3761,9 @@ app.listen(PORT, () => {
   console.log(`📍 Wallet Query (identity): GET http://localhost:${PORT}/wallet/me`);
   console.log(`📍 Transactions: GET http://localhost:${PORT}/transactions`);
 });
+
+}
+
+if (require.main === module) {
+  startServer();
+}

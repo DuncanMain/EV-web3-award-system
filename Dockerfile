@@ -20,6 +20,8 @@ RUN npm ci --production
 
 COPY --from=build /usr/src/app/dist ./dist
 COPY .env.example ./
+COPY frontend/build ./frontend/build
+COPY frontend/dist ./frontend/dist
 
 EXPOSE 3000
 

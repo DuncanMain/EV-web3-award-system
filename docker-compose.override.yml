@@ -1,0 +1,7 @@
+services:
+  app:
+    environment:
+      - DATABASE_URL=postgres://postgres:postgres@postgres:5432/nvf_award
+    secrets: []
+
+secrets: {}

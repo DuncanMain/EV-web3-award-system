@@ -67,12 +67,35 @@ In production, use your secret manager or Docker secrets to provide the key at r
 
 The `scripts/` directory contains development and testing utilities:
 
+- `capture-pilot-evidence.js` - Captures a timestamped TRL7 pilot evidence JSON file from health, wallet, audit, and reconciliation endpoints
+- `load-test-ingest-preview.js` - Captures safe CDR preview throughput evidence without token settlement
 - `test-award-and-spend-debug.js` - End-to-end award and spend flow testing
 - `test-approval-debug.js` - Manual approval testing
 - `test-e2e-flow.js` - Complete end-to-end flow validation
 - `test-full-flow.js` - Full system integration test
 
 Run with: `node scripts/<script-name>.js`
+
+For TRL7 evidence capture:
+
+```bash
+npm run evidence:pilot
+```
+
+By default this is non-destructive and writes `evidence/pilot-evidence-*.json`.
+Set `EVIDENCE_RUN_CDR=true` to submit a sample CDR, and
+`EVIDENCE_RUN_RECONCILIATION=true` to trigger a reconciliation run during the
+capture.
+
+For safe ingestion/rule throughput evidence:
+
+```bash
+npm run evidence:load-preview
+```
+
+Defaults to 10 preview requests per second for 10 seconds and writes
+`evidence/load-test-ingest-preview-*.json`. Override with `LOAD_TEST_RPS`,
+`LOAD_TEST_DURATION_SECONDS`, and `LOAD_TEST_CONCURRENCY`.
 
 ## Demo UI
 
@@ -163,9 +186,18 @@ Create a `.env` file based on `.env.example`:
 ```bash
 # Treasury wallet address (holds SPARKZ tokens)
 TREASURY_ADDRESS=0x605871D30DC278a036F09e2ace771df8a224624B
+TREASURY_GAS_WARNING_THRESHOLD_MATIC=0.05
 
 # Optional API key (recommended outside local development)
 API_KEY=your_api_key_here
+
+# Dedicated CDR ingestion key for AU/provider systems
+INGEST_API_KEY=your_ingest_only_secret_here
+
+# Admin login credentials and alert target
+ADMIN_EMAIL=admin@example.com
+ADMIN_PASSWORD=your_admin_password
+ADMIN_ALERT_WEBHOOK_URL=https://alerts.example.com/neverflat
 
 # Salt for deterministic contract ID->address mapping
 USER_ADDRESS_DERIVATION_SALT=nvf-award-core-v1
@@ -174,7 +206,7 @@ USER_ADDRESS_DERIVATION_SALT=nvf-award-core-v1
 USER_IDENTITY_HEADER=x-contract-id
 
 # Keep manual /wallet/:uid lookup enabled for testing
-# Set to false when EMP identity integration is fully live
+# Set to false when EMP identity integration is fully live or in pilot mode
 ENABLE_TEST_UID_LOOKUP=true
 
 # PostgreSQL connection (database that mirrors blockchain)
@@ -217,6 +249,9 @@ The system uses PostgreSQL to mirror blockchain state for efficient API queries.
 - `dedup_key` - (sessionId, providerId) for idempotency
 - `amount` - SPARKZ tokens awarded
 - `tx_hash` - On-chain transaction hash
+- `status` - Transaction lifecycle state, currently `confirmed` for successful awards
+- `confirmed_at` - Confirmation timestamp
+- `error_message` - Failure detail for future retry/reconciliation states
 - `awarded_at` - Settlement timestamp
 
 **balances** - Current user balances
@@ -227,6 +262,42 @@ The system uses PostgreSQL to mirror blockchain state for efficient API queries.
 - `total_awarded` - Cumulative awarded
 - `total_spent` - Cumulative spent
 - `last_synced` - Last blockchain sync
+
+**spend_receipts** - Signed settlement receipts for external verification
+- `receipt_id` - Public receipt identifier
+- `uid` - Contract identifier
+- `wallet_address` - Wallet that spent tokens
+- `amount` - SPARKZ tokens spent
+- `session_id`, `provider_id` - Optional external settlement references
+- `token_tx_hash` - On-chain spend transaction hash
+- `canonical_payload`, `signature`, `signer_address` - Receipt verification material
+- `status` - Receipt lifecycle state, initially `settled`
+
+**spends** - Token spend transactions
+- `id` - UUID primary key
+- `user_id` - References users table
+- `wallet_address` - Wallet that spent tokens
+- `amount` - SPARKZ tokens spent
+- `tx_hash` - On-chain spend transaction hash
+- `session_id` - Optional external settlement reference
+- `status` - Transaction lifecycle state, currently `confirmed` for successful spends
+- `confirmed_at` - Confirmation timestamp
+- `error_message` - Failure detail for future retry/reconciliation states
+
+**audit_logs** - Append-only operational and settlement audit trail
+- `event_type` - Event name such as `spend.completed`, `admin.rules_updated`, or `treasury.gas_low`
+- `actor_type`, `actor_id` - System, API client, admin session, or user identity
+- `target_type`, `target_id` - Receipt, token transaction, wallet, rule set, or other target
+- `status` - Event result such as `success`, `error`, `retry_required`, `warning`, or `duplicate`
+- `metadata` - JSON evidence for the event
+- `created_at` - Event timestamp
+
+**reconciliation_reports** - Stored DB-vs-chain balance checks
+- `status` - Overall report status: `matched` or `mismatch`
+- `checked_count`, `matched_count`, `mismatch_count` - Summary counts
+- `items` - Per-wallet comparison records
+- `metadata` - Token contract, run limit, and run source
+- `created_at` - Report timestamp
 
 ### Real-time Sync
 

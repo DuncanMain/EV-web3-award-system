@@ -34,6 +34,68 @@ interface RuleConfig {
   v2gDischarge: { enabled: boolean; tokensPerKWh: number; description: string };
 }
 
+type AuditEvent = {
+  id?: string;
+  event_type: string;
+  actor_type: string;
+  actor_id?: string | null;
+  target_type?: string | null;
+  target_id?: string | null;
+  status: string;
+  metadata?: Record<string, unknown>;
+  created_at: string;
+};
+
+type ReconciliationReport = {
+  id?: string;
+  status: string;
+  checked_count: number;
+  matched_count: number;
+  mismatch_count: number;
+  created_at: string;
+};
+
+type ReadinessCheck = {
+  key: string;
+  label: string;
+  status: 'pass' | 'fail' | 'warn';
+  message: string;
+};
+
+type ReadinessResponse = {
+  status: 'ready' | 'ready_with_warnings' | 'not_ready';
+  failedCount: number;
+  warningCount: number;
+  checks: ReadinessCheck[];
+};
+
+type PilotMetrics = {
+  windowHours: number;
+  totalEvents: number;
+  lastEventAt: string | null;
+  awards: {
+    completed: number;
+    notEligible: number;
+    duplicates: number;
+    failures: number;
+  };
+  spends: {
+    completed: number;
+    custodialRecorded: number;
+    custodialIntentsCreated: number;
+    retryRequired: number;
+    failures: number;
+  };
+  operations: {
+    warnings: number;
+    errors: number;
+    retryRequired: number;
+    deliveredAlerts: number;
+    skippedAlerts: number;
+    reconciliationRuns: number;
+  };
+};
+
 interface AdminDashboardProps {
   baseUrl: string;
   apiKey: string;
@@ -42,7 +104,7 @@ interface AdminDashboardProps {
 
 export default function AdminDashboard({ baseUrl, apiKey, externalToken }: AdminDashboardProps) {
   const [token, setToken] = useState<string | null>(externalToken ?? null);
-  const [username, setUsername] = useState('admin');
+  const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [loginError, setLoginError] = useState('');
   const [rules, setRules] = useState<RuleConfig | null>(null);
@@ -60,6 +122,20 @@ export default function AdminDashboard({ baseUrl, apiKey, externalToken }: Admin
   const [windowsFeedback, setWindowsFeedback] = useState('');
   const [windowsFeedbackKind, setWindowsFeedbackKind] = useState<'success' | 'error' | 'idle'>('idle');
   const [savingWindows, setSavingWindows] = useState(false);
+  const [auditStatus, setAuditStatus] = useState('retry_required');
+  const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
+  const [auditFeedback, setAuditFeedback] = useState('');
+  const [loadingAudit, setLoadingAudit] = useState(false);
+  const [reconciliationReports, setReconciliationReports] = useState<ReconciliationReport[]>([]);
+  const [reconciliationFeedback, setReconciliationFeedback] = useState('');
+  const [runningReconciliation, setRunningReconciliation] = useState(false);
+  const [readiness, setReadiness] = useState<ReadinessResponse | null>(null);
+  const [readinessFeedback, setReadinessFeedback] = useState('');
+  const [testingAlert, setTestingAlert] = useState(false);
+  const [alertTestFeedback, setAlertTestFeedback] = useState('');
+  const [exportingEvidence, setExportingEvidence] = useState(false);
+  const [pilotMetrics, setPilotMetrics] = useState<PilotMetrics | null>(null);
+  const [pilotMetricsFeedback, setPilotMetricsFeedback] = useState('');
 
   async function adminRequest(path: string, options?: RequestInit) {
     const headers: Record<string, string> = {
@@ -77,7 +153,7 @@ export default function AdminDashboard({ baseUrl, apiKey, externalToken }: Admin
       const res = await fetch(`${baseUrl}/admin/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password }),
+        body: JSON.stringify({ email: username, password }),
       });
       const data = await res.json();
       if (!res.ok) {
@@ -104,11 +180,12 @@ export default function AdminDashboard({ baseUrl, apiKey, externalToken }: Admin
       const res = await adminRequest('/admin/rules');
       const data = await res.json();
       if (!res.ok) return;
-      setRules(data.rules.rules);
-      setOffPeakRate(String(data.rules.rules.offPeakCharging.tokensPerKWh));
-      setV2gRate(String(data.rules.rules.v2gDischarge.tokensPerKWh));
-      setOffPeakEnabled(data.rules.rules.offPeakCharging.enabled);
-      setV2gEnabled(data.rules.rules.v2gDischarge.enabled);
+      const nextRules = data.rules.rules;
+      setRules(nextRules);
+      setOffPeakRate(String(nextRules.offPeakCharging.tokensPerKWh));
+      setV2gRate(String(nextRules.v2gDischarge.tokensPerKWh));
+      setOffPeakEnabled(nextRules.offPeakCharging.enabled);
+      setV2gEnabled(nextRules.v2gDischarge.enabled);
     } catch (err) {
       // silently ignore
     }
@@ -139,7 +216,8 @@ export default function AdminDashboard({ baseUrl, apiKey, externalToken }: Admin
         setWindowsFeedback(data?.message || 'Failed to save off-peak config');
         return;
       }
-      setOffPeakWindowsState(data.windows ?? {});
+      const nextWindows = data.windows ?? {};
+      setOffPeakWindowsState(nextWindows);
       setWindowsFeedbackKind('success');
       setWindowsFeedback('Off-peak config saved. New CDRs will use these windows immediately.');
     } catch (err) {
@@ -177,32 +255,173 @@ export default function AdminDashboard({ baseUrl, apiKey, externalToken }: Admin
     setWindowsFeedback('');
   }
 
+  async function loadAuditEvents(status = auditStatus) {
+    setLoadingAudit(true);
+    setAuditFeedback('');
+    try {
+      const params = new URLSearchParams({ limit: '25' });
+      if (status) params.set('status', status);
+      const res = await adminRequest(`/admin/audit?${params.toString()}`);
+      const data = await res.json();
+      if (!res.ok) {
+        setAuditFeedback(data?.message || data?.error || 'Failed to load audit events');
+        return;
+      }
+      setAuditEvents(data.events ?? []);
+    } catch (err) {
+      setAuditFeedback(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoadingAudit(false);
+    }
+  }
+
+  async function loadReconciliationReports() {
+    setReconciliationFeedback('');
+    try {
+      const res = await adminRequest('/admin/reconciliation?limit=5');
+      const data = await res.json();
+      if (!res.ok) {
+        setReconciliationFeedback(data?.message || data?.error || 'Failed to load reconciliation reports');
+        return;
+      }
+      setReconciliationReports(data.reports ?? []);
+    } catch (err) {
+      setReconciliationFeedback(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function loadReadiness() {
+    setReadinessFeedback('');
+    try {
+      const res = await adminRequest('/admin/readiness');
+      const data = await res.json();
+      if (!res.ok && !data?.checks) {
+        setReadinessFeedback(data?.message || data?.error || 'Failed to load readiness checks');
+        return;
+      }
+      setReadiness(data);
+    } catch (err) {
+      setReadinessFeedback(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function loadPilotMetrics() {
+    setPilotMetricsFeedback('');
+    try {
+      const res = await adminRequest('/admin/pilot-metrics?hours=24');
+      const data = await res.json();
+      if (!res.ok) {
+        setPilotMetricsFeedback(data?.message || data?.error || 'Failed to load pilot metrics');
+        return;
+      }
+      setPilotMetrics(data.metrics ?? null);
+    } catch (err) {
+      setPilotMetricsFeedback(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function sendTestAlert() {
+    setTestingAlert(true);
+    setAlertTestFeedback('');
+    try {
+      const res = await adminRequest('/admin/alerts/test', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) {
+        setAlertTestFeedback(data?.message || data?.error || 'Failed to send test alert');
+        return;
+      }
+      setAlertTestFeedback(data?.message || 'Test alert request recorded.');
+      await loadAuditEvents();
+      await loadReadiness();
+      await loadPilotMetrics();
+    } catch (err) {
+      setAlertTestFeedback(err instanceof Error ? err.message : String(err));
+    } finally {
+      setTestingAlert(false);
+    }
+  }
+
+  async function downloadEvidencePack() {
+    setExportingEvidence(true);
+    setReadinessFeedback('');
+    try {
+      const res = await adminRequest('/admin/evidence-pack');
+      const data = await res.json();
+      if (!res.ok) {
+        setReadinessFeedback(data?.message || data?.error || 'Failed to export evidence pack');
+        return;
+      }
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `neverflat-trl7-evidence-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setReadinessFeedback(err instanceof Error ? err.message : String(err));
+    } finally {
+      setExportingEvidence(false);
+    }
+  }
+
+  async function runReconciliation() {
+    setRunningReconciliation(true);
+    setReconciliationFeedback('');
+    try {
+      const res = await adminRequest('/admin/reconciliation/run', {
+        method: 'POST',
+        body: JSON.stringify({ limit: 500 }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setReconciliationFeedback(data?.message || data?.error || 'Failed to run reconciliation');
+        return;
+      }
+      setReconciliationFeedback(`Reconciliation complete: ${data.report?.status || 'unknown'}`);
+      await loadReconciliationReports();
+      await loadAuditEvents();
+      await loadReadiness();
+      await loadPilotMetrics();
+    } catch (err) {
+      setReconciliationFeedback(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRunningReconciliation(false);
+    }
+  }
+
+  function updateCountrySlots(code: string, getNextSlots: (slots: TimeRange[]) => TimeRange[]) {
+    setOffPeakWindowsState(prev => ({
+      ...prev,
+      [code]: getNextSlots(prev[code] ?? []),
+    }));
+  }
+
   function addSlot(code: string) {
-    setOffPeakWindowsState(prev => {
-      const slots = prev[code] ?? [];
-      if (slots.length >= MAX_SLOTS) return prev;
-      return { ...prev, [code]: [...slots, { start: '00:00', end: '06:00' }] };
+    updateCountrySlots(code, slots => {
+      if (slots.length >= MAX_SLOTS) return slots;
+      return [...slots, { start: '00:00', end: '06:00' }];
     });
   }
 
   function removeSlot(code: string, idx: number) {
-    setOffPeakWindowsState(prev => {
-      const slots = (prev[code] ?? []).filter((_, i) => i !== idx);
-      return { ...prev, [code]: slots };
-    });
+    updateCountrySlots(code, slots => slots.filter((_, i) => i !== idx));
   }
 
   function updateSlot(code: string, idx: number, field: 'start' | 'end', value: string) {
-    setOffPeakWindowsState(prev => {
-      const slots = (prev[code] ?? []).map((s, i) => i === idx ? { ...s, [field]: value } : s);
-      return { ...prev, [code]: slots };
-    });
+    updateCountrySlots(code, slots => slots.map((slot, i) => i === idx ? { ...slot, [field]: value } : slot));
   }
 
   useEffect(() => {
     if (token) {
       loadRules();
       loadOffPeakWindows();
+      loadAuditEvents();
+      loadReconciliationReports();
+      loadReadiness();
+      loadPilotMetrics();
     }
   }, [token]);
 
@@ -226,7 +445,8 @@ export default function AdminDashboard({ baseUrl, apiKey, externalToken }: Admin
         setFeedback(data?.message || 'Failed to save rules');
         return;
       }
-      setRules(data.rules.rules);
+      const nextRules = data.rules.rules;
+      setRules(nextRules);
       setFeedbackKind('success');
       setFeedback('Rules updated successfully. New CDRs will use these rates immediately.');
     } catch (err) {
@@ -244,8 +464,8 @@ export default function AdminDashboard({ baseUrl, apiKey, externalToken }: Admin
           <h3>Admin Login</h3>
           <p className="subtle">Access is restricted to authorised users.</p>
           <label>
-            Username
-            <input value={username} onChange={e => setUsername(e.target.value)} autoComplete="username" required />
+            Admin email
+            <input type="email" value={username} onChange={e => setUsername(e.target.value)} autoComplete="username" required />
           </label>
           <label>
             Password
@@ -263,6 +483,17 @@ export default function AdminDashboard({ baseUrl, apiKey, externalToken }: Admin
       </div>
     );
   }
+
+  const offPeakRateValue = parseFloat(offPeakRate);
+  const v2gRateValue = parseFloat(v2gRate);
+  const showOffPeakPreview = offPeakEnabled && offPeakRate && !Number.isNaN(offPeakRateValue) && offPeakRateValue > 0;
+  const showV2gPreview = v2gEnabled && v2gRate && !Number.isNaN(v2gRateValue) && v2gRateValue > 0;
+  const offPeakCountryEntries = Object.entries(offPeakWindows).sort(([a], [b]) => a.localeCompare(b));
+  const hasOffPeakCountries = offPeakCountryEntries.length > 0;
+  const newCountryPreviewCode = newCountryCode.trim();
+  const showNewCountryPreview = newCountryPreviewCode.length === 2;
+  const latestReport = reconciliationReports[0];
+  const readinessStatus = readiness?.status || 'not_ready';
 
   return (
     <div className="admin-wrap">
@@ -304,9 +535,9 @@ export default function AdminDashboard({ baseUrl, apiKey, externalToken }: Admin
                 <span className="input-suffix">SPARKZ / kWh</span>
               </div>
             </label>
-            {offPeakEnabled && offPeakRate && !isNaN(parseFloat(offPeakRate)) && parseFloat(offPeakRate) > 0 && (
+            {showOffPeakPreview && (
               <p className="subtle rule-preview">
-                Preview: 10 kWh session → <strong>{Math.floor(10 * parseFloat(offPeakRate))} SPARKZ</strong>
+                Preview: 10 kWh session → <strong>{Math.floor(10 * offPeakRateValue)} SPARKZ</strong>
               </p>
             )}
           </div>
@@ -341,9 +572,9 @@ export default function AdminDashboard({ baseUrl, apiKey, externalToken }: Admin
                 <span className="input-suffix">SPARKZ / kWh</span>
               </div>
             </label>
-            {v2gEnabled && v2gRate && !isNaN(parseFloat(v2gRate)) && parseFloat(v2gRate) > 0 && (
+            {showV2gPreview && (
               <p className="subtle rule-preview">
-                Preview: 20 kWh session → <strong>{Math.floor(20 * parseFloat(v2gRate))} SPARKZ</strong>
+                Preview: 20 kWh session → <strong>{Math.floor(20 * v2gRateValue)} SPARKZ</strong>
               </p>
             )}
           </div>
@@ -371,11 +602,11 @@ export default function AdminDashboard({ baseUrl, apiKey, externalToken }: Admin
         </p>
         <p className="subtle">Country codes must match CDR ISO alpha-2 country codes.</p>
 
-        {Object.keys(offPeakWindows).length === 0 && (
+        {!hasOffPeakCountries && (
           <p className="subtle" style={{ fontStyle: 'italic' }}>No countries configured yet.</p>
         )}
 
-        {Object.entries(offPeakWindows).sort(([a], [b]) => a.localeCompare(b)).map(([code, slots]) => (
+        {offPeakCountryEntries.map(([code, slots]) => (
           <div key={code} className="admin-rule-group off-peak-country-group">
             <div className="admin-rule-header">
               <h5 className="country-code-label">{getCountryLabel(code)}</h5>
@@ -453,8 +684,8 @@ export default function AdminDashboard({ baseUrl, apiKey, externalToken }: Admin
               style={{ width: '5rem', textTransform: 'uppercase' }}
             />
           </label>
-          {newCountryCode.trim().length === 2 && (
-            <p className="subtle" style={{ margin: 0 }}>Will add: {getCountryLabel(newCountryCode.trim())}</p>
+          {showNewCountryPreview && (
+            <p className="subtle" style={{ margin: 0 }}>Will add: {getCountryLabel(newCountryPreviewCode)}</p>
           )}
           <button
             type="button"
@@ -477,6 +708,192 @@ export default function AdminDashboard({ baseUrl, apiKey, externalToken }: Admin
         >
           {savingWindows ? 'Saving...' : 'Save Off-Peak Config'}
         </button>
+      </div>
+
+      <div className="admin-section-spacer" />
+
+      <div className="action-card admin-rules-card">
+        <div className="admin-rule-header">
+          <h4>Operational Monitoring</h4>
+          <button type="button" className="btn-ghost" onClick={() => { loadAuditEvents(); loadReconciliationReports(); loadReadiness(); loadPilotMetrics(); }}>
+            Refresh
+          </button>
+        </div>
+
+        <div className="admin-monitor-panel admin-readiness-panel">
+          <div className="admin-rule-header">
+            <h5 className="country-code-label">Pilot Readiness</h5>
+            <div className="admin-inline-actions">
+              <span className={`admin-status-pill admin-status-pill--${readinessStatus}`}>{readinessStatus.replace(/_/g, ' ')}</span>
+              <button type="button" className="btn-ghost" onClick={sendTestAlert} disabled={testingAlert}>
+                {testingAlert ? 'Sending...' : 'Test Alert'}
+              </button>
+              <button type="button" className="btn-ghost" onClick={downloadEvidencePack} disabled={exportingEvidence}>
+                {exportingEvidence ? 'Exporting...' : 'Export Evidence'}
+              </button>
+            </div>
+          </div>
+          {readiness ? (
+            <>
+              <div className="admin-metric-grid admin-metric-grid--readiness">
+                <div>
+                  <strong>{readiness.checks.length}</strong>
+                  <p className="subtle">Checks</p>
+                </div>
+                <div>
+                  <strong>{readiness.failedCount}</strong>
+                  <p className="subtle">Failures</p>
+                </div>
+                <div>
+                  <strong>{readiness.warningCount}</strong>
+                  <p className="subtle">Warnings</p>
+                </div>
+              </div>
+              <div className="admin-readiness-list">
+                {readiness.checks.map(check => (
+                  <div className="admin-readiness-row" key={check.key}>
+                    <span className={`admin-status-dot admin-status-dot--${check.status}`} aria-hidden="true" />
+                    <div>
+                      <strong>{check.label}</strong>
+                      <p className="subtle">{check.message}</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </>
+          ) : (
+            <p className="subtle">Readiness checks have not loaded yet.</p>
+          )}
+          {readinessFeedback && <p className="admin-error">{readinessFeedback}</p>}
+          {alertTestFeedback && (
+            <p className={alertTestFeedback.toLowerCase().includes('failed') ? 'admin-error' : 'admin-success'}>
+              {alertTestFeedback}
+            </p>
+          )}
+        </div>
+
+        <div className="admin-monitor-panel admin-pilot-metrics-panel">
+          <div className="admin-rule-header">
+            <h5 className="country-code-label">Pilot Activity</h5>
+            <span className="admin-status-pill">Last {pilotMetrics?.windowHours || 24}h</span>
+          </div>
+          {pilotMetrics ? (
+            <>
+              <div className="admin-metric-grid admin-metric-grid--pilot">
+                <div>
+                  <strong>{pilotMetrics.totalEvents}</strong>
+                  <p className="subtle">Audit events</p>
+                </div>
+                <div>
+                  <strong>{pilotMetrics.awards.completed}</strong>
+                  <p className="subtle">Awards</p>
+                </div>
+                <div>
+                  <strong>{pilotMetrics.spends.completed + pilotMetrics.spends.custodialRecorded}</strong>
+                  <p className="subtle">Spends</p>
+                </div>
+                <div>
+                  <strong>{pilotMetrics.operations.retryRequired}</strong>
+                  <p className="subtle">Retries</p>
+                </div>
+              </div>
+              <div className="admin-metric-grid admin-metric-grid--pilot-detail">
+                <div>
+                  <strong>{pilotMetrics.operations.errors}</strong>
+                  <p className="subtle">Errors</p>
+                </div>
+                <div>
+                  <strong>{pilotMetrics.operations.warnings}</strong>
+                  <p className="subtle">Warnings</p>
+                </div>
+                <div>
+                  <strong>{pilotMetrics.operations.deliveredAlerts}</strong>
+                  <p className="subtle">Alerts sent</p>
+                </div>
+                <div>
+                  <strong>{pilotMetrics.operations.reconciliationRuns}</strong>
+                  <p className="subtle">Reconciliations</p>
+                </div>
+              </div>
+              <p className="subtle">
+                Last event: {pilotMetrics.lastEventAt ? new Date(pilotMetrics.lastEventAt).toLocaleString() : 'None recorded'}
+              </p>
+            </>
+          ) : (
+            <p className="subtle">Pilot metrics have not loaded yet.</p>
+          )}
+          {pilotMetricsFeedback && <p className="admin-error">{pilotMetricsFeedback}</p>}
+        </div>
+
+        <div className="admin-monitor-grid">
+          <div className="admin-monitor-panel">
+            <div className="admin-rule-header">
+              <h5 className="country-code-label">Reconciliation</h5>
+              <button type="button" className="btn-ghost" onClick={runReconciliation} disabled={runningReconciliation}>
+                {runningReconciliation ? 'Running...' : 'Run Check'}
+              </button>
+            </div>
+            {latestReport ? (
+              <div className="admin-metric-grid">
+                <div>
+                  <span className={`admin-status-pill admin-status-pill--${latestReport.status}`}>{latestReport.status}</span>
+                  <p className="subtle">{new Date(latestReport.created_at).toLocaleString()}</p>
+                </div>
+                <div>
+                  <strong>{latestReport.checked_count}</strong>
+                  <p className="subtle">Checked</p>
+                </div>
+                <div>
+                  <strong>{latestReport.mismatch_count}</strong>
+                  <p className="subtle">Mismatches</p>
+                </div>
+              </div>
+            ) : (
+              <p className="subtle">No reconciliation report has been stored yet.</p>
+            )}
+            {reconciliationFeedback && (
+              <p className={reconciliationFeedback.toLowerCase().includes('failed') ? 'admin-error' : 'admin-success'}>
+                {reconciliationFeedback}
+              </p>
+            )}
+          </div>
+
+          <div className="admin-monitor-panel">
+            <div className="admin-rule-header">
+              <h5 className="country-code-label">Audit Feed</h5>
+              <select
+                value={auditStatus}
+                onChange={e => {
+                  setAuditStatus(e.target.value);
+                  loadAuditEvents(e.target.value);
+                }}
+              >
+                <option value="retry_required">Retry required</option>
+                <option value="warning">Warnings</option>
+                <option value="error">Errors</option>
+                <option value="">All statuses</option>
+              </select>
+            </div>
+            {loadingAudit && <p className="subtle">Loading events...</p>}
+            {auditFeedback && <p className="admin-error">{auditFeedback}</p>}
+            {!loadingAudit && !auditEvents.length && !auditFeedback && (
+              <p className="subtle">No matching audit events.</p>
+            )}
+            <div className="admin-audit-list">
+              {auditEvents.slice(0, 8).map((event, idx) => (
+                <div className="admin-audit-row" key={event.id || `${event.event_type}-${event.created_at}-${idx}`}>
+                  <div>
+                    <strong>{event.event_type}</strong>
+                    <p className="subtle">
+                      {new Date(event.created_at).toLocaleString()} | {event.actor_type}{event.actor_id ? `:${event.actor_id}` : ''}
+                    </p>
+                  </div>
+                  <span className={`admin-status-pill admin-status-pill--${event.status}`}>{event.status}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   );

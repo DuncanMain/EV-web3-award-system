@@ -1,9 +1,12 @@
-import React, { FormEvent, useMemo, useState } from 'react';
+﻿import React, { FormEvent, useEffect, useMemo, useState } from 'react';
 import { ethers } from 'ethers';
 import AdminDashboard from './AdminDashboard';
 
 type WalletHistoryItem = {
   type: 'award' | 'spend';
+  uid?: string | null;
+  walletAddress?: string | null;
+  walletName?: string | null;
   amount: string;
   txHash?: string;
   timestamp?: string;
@@ -33,13 +36,19 @@ interface AdminAppProps {
   onBack: () => void;
 }
 
+function getDefaultBaseUrl(): string {
+  if (typeof window === 'undefined') return 'http://localhost:3000';
+  if (window.location.port === '3001') return `${window.location.protocol}//${window.location.hostname}:3000`;
+  return window.location.origin;
+}
+
 export default function AdminApp({ onBack }: AdminAppProps) {
-  // ── Admin login gate ──────────────────────────────
+  // â”€â”€ Admin login gate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const [adminToken, setAdminToken] = useState<string | null>(null);
-  const [loginUsername, setLoginUsername] = useState('admin');
+  const [loginUsername, setLoginUsername] = useState('');
   const [loginPassword, setLoginPassword] = useState('');
   const [loginError, setLoginError] = useState('');
-  const [baseUrl, setBaseUrl] = useState(typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000');
+  const [baseUrl, setBaseUrl] = useState(getDefaultBaseUrl());
 
   async function login(e: FormEvent) {
     e.preventDefault();
@@ -48,7 +57,7 @@ export default function AdminApp({ onBack }: AdminAppProps) {
       const res = await fetch(`${baseUrl}/admin/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: loginUsername, password: loginPassword }),
+        body: JSON.stringify({ email: loginUsername, password: loginPassword }),
       });
       const data = await res.json();
       if (!res.ok) {
@@ -75,10 +84,10 @@ export default function AdminApp({ onBack }: AdminAppProps) {
   if (!adminToken) {
     return (
       <div className="wallet-shell login-shell">
+        <button className="back-btn back-btn--bottom-left" onClick={onBack}>Back</button>
         <div className="login-panel">
-          <button className="back-btn" onClick={onBack}>← Back</button>
           <div className="brand-lockup" style={{ marginBottom: '1.5rem' }}>
-            <div className="brand-glyph">N</div>
+            <div className="brand-glyph"><img src="/logo-blue.svg" alt="NEVERFLAT logo" /></div>
             <div>
               <h1>Admin Dashboard</h1>
               <p>Authorised access only</p>
@@ -90,8 +99,8 @@ export default function AdminApp({ onBack }: AdminAppProps) {
               <input value={baseUrl} onChange={e => setBaseUrl(e.target.value)} />
             </label>
             <label>
-              Username
-              <input value={loginUsername} onChange={e => setLoginUsername(e.target.value)} autoComplete="username" required />
+              Admin email
+              <input type="email" value={loginUsername} onChange={e => setLoginUsername(e.target.value)} autoComplete="username" required />
             </label>
             <label>
               Password
@@ -105,11 +114,11 @@ export default function AdminApp({ onBack }: AdminAppProps) {
     );
   }
 
-  // ── Authenticated admin shell ─────────────────────
+  // â”€â”€ Authenticated admin shell â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   return <AdminShell baseUrl={baseUrl} adminToken={adminToken} onLogout={logout} onBack={onBack} />;
 }
 
-// ── Inner shell (rendered once authenticated) ────────────────────────────────
+// â”€â”€ Inner shell (rendered once authenticated) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 interface AdminShellProps {
   baseUrl: string;
   adminToken: string;
@@ -123,7 +132,15 @@ function AdminShell({ baseUrl, adminToken, onLogout, onBack }: AdminShellProps) 
   const [walletData, setWalletData] = useState<WalletResponse | null>(null);
   const [healthStatus, setHealthStatus] = useState('Unknown');
   const [loadingWallet, setLoadingWallet] = useState(false);
-  const [feedback, setFeedback] = useState<ApiFeedback>({ kind: 'idle', message: 'Ready' });
+  const [feedback, setFeedback] = useState<ApiFeedback>({ kind: 'idle', message: '' });
+
+  useEffect(() => {
+    if (!feedback.message) return;
+    const timer = window.setTimeout(() => setFeedback(current =>
+      current.message === feedback.message ? { ...current, message: '' } : current
+    ), 7000);
+    return () => window.clearTimeout(timer);
+  }, [feedback.message]);
 
   const [awardSessionId, setAwardSessionId] = useState(`session-${Date.now()}`);
   const [awardProviderId, setAwardProviderId] = useState('nvf-demo');
@@ -229,7 +246,7 @@ function AdminShell({ baseUrl, adminToken, onLogout, onBack }: AdminShellProps) 
       const { nextMode, sourceBalance, targetWalletAddress } = modeSwitchWarning;
 
       if (nextMode === 'custodial') {
-        // Source = managed wallet → treasury transfers to the linked custodial wallet
+        // Source = managed wallet to treasury transfers to the linked custodial wallet
         const moveRes = await apiRequest(`/wallet/${encodeURIComponent(uid)}/move-funds`, {
           method: 'POST',
           body: JSON.stringify({ targetAddress: connectedWallet }),
@@ -241,7 +258,7 @@ function AdminShell({ baseUrl, adminToken, onLogout, onBack }: AdminShellProps) 
         }
         setFeedback({ kind: 'idle', message: `Moved ${moveData.amount} SPARKZ. Switching mode...` });
       } else {
-        // Source = external custodial wallet → connected wallet signs transfer to managed wallet
+        // Source = external custodial wallet to connected wallet signs transfer to managed wallet
         const managedTarget = targetWalletAddress || walletData?.managedWalletAddress;
         if (!managedTarget) { setFeedback({ kind: 'error', message: 'Managed wallet address not available.' }); return; }
         const win = window as Window & { ethereum?: unknown };
@@ -369,7 +386,7 @@ function AdminShell({ baseUrl, adminToken, onLogout, onBack }: AdminShellProps) 
       await provider.send('wallet_switchEthereumChain', [{ chainId: '0x13882' }]).catch((err: unknown) => {
         throw new Error(`Switch to Polygon Amoy first. ${err instanceof Error ? err.message : String(err)}`);
       });
-      // Re-create provider after network switch — ethers v6 throws NETWORK_ERROR on the old instance
+      // Re-create provider after network switch - ethers v6 throws NETWORK_ERROR on the old instance
       provider = new ethers.BrowserProvider(win.ethereum);
     }
 
@@ -380,21 +397,51 @@ function AdminShell({ baseUrl, adminToken, onLogout, onBack }: AdminShellProps) 
       throw new Error(`Connected wallet (${signerAddress}) does not match linked wallet (${linkedAddress}).`);
     }
 
-    const token = new ethers.Contract(
-      walletData.tokenContractAddress,
-      ['function transfer(address to, uint256 amount) returns (bool)'],
-      signer
-    );
-
     setProcessingWalletTx(true);
-    setFeedback({ kind: 'idle', message: 'Confirm spend in your wallet...' });
-    const tx = await token.transfer(walletData.treasuryAddress, ethers.parseEther(spendAmount.toString()));
-    setFeedback({ kind: 'idle', message: `Submitted — waiting for confirmation...` });
+    setFeedback({ kind: 'idle', message: 'Preparing spend for your wallet...' });
+
+    const intentRes = await apiRequest('/spend/custodial-intent', {
+      method: 'POST',
+      body: JSON.stringify({
+        uid,
+        walletAddress: signerAddress,
+        amount: spendAmount,
+        sessionId: spendSessionId,
+        providerId: spendProviderId,
+      }),
+    });
+    const intentData = await intentRes.json();
+    if (!intentRes.ok || !intentData?.spendIntent?.transaction) {
+      throw new Error(intentData?.message || intentData?.error || 'Could not prepare wallet spend.');
+    }
+
+    let tx: ethers.TransactionResponse;
+    try {
+      setFeedback({ kind: 'idle', message: 'Confirm spend in your wallet...' });
+      tx = await signer.sendTransaction(intentData.spendIntent.transaction);
+    } catch (err) {
+      const failureRes = await apiRequest('/spend/custodial-failure', {
+        method: 'POST',
+        body: JSON.stringify({
+          uid,
+          walletAddress: signerAddress,
+          amount: spendAmount,
+          sessionId: spendSessionId,
+          providerId: spendProviderId,
+          intentId: intentData.spendIntent.intentId,
+          reason: err instanceof Error ? err.message : String(err),
+        }),
+      });
+      const failureData = await failureRes.json().catch(() => null);
+      throw new Error(failureData?.message || 'The wallet spend was not completed. Please retry and sign the same spend transaction.');
+    }
+
+    setFeedback({ kind: 'idle', message: `Submitted - waiting for confirmation...` });
     await tx.wait();
 
     const recordRes = await apiRequest('/spend/custodial-record', {
       method: 'POST',
-      body: JSON.stringify({ uid, walletAddress: signerAddress, amount: spendAmount, txHash: tx.hash, sessionId: spendSessionId }),
+      body: JSON.stringify({ uid, walletAddress: signerAddress, amount: spendAmount, txHash: tx.hash, sessionId: spendSessionId, providerId: spendProviderId }),
     });
     const recordData = await recordRes.json();
     if (!recordRes.ok) throw new Error(recordData?.message || recordData?.error || `On-chain confirmed but sync failed: ${tx.hash}`);
@@ -467,10 +514,9 @@ function AdminShell({ baseUrl, adminToken, onLogout, onBack }: AdminShellProps) 
     <div className="wallet-shell">
       <aside className="left-rail">
         <div className="brand-lockup">
-          <button className="back-btn" onClick={onBack}>←</button>
-          <div className="brand-glyph">N</div>
+          <div className="brand-glyph"><img src="/logo-blue.svg" alt="NEVERFLAT logo" /></div>
           <div>
-            <h1>Admin</h1>
+            <h1>Admin <img src="/car-icon.svg" className="brand-car" alt=""/></h1>
             <p>NEVERFLAT Platform</p>
           </div>
         </div>
@@ -483,7 +529,7 @@ function AdminShell({ baseUrl, adminToken, onLogout, onBack }: AdminShellProps) 
           </button>
         </div>
 
-        {/* Wallet mode — for partner demos */}
+        {/* Wallet mode - for partner demos */}
         <div className="rail-card">
           <span className="label">Wallet Mode</span>
           <div className="mode-toggle">
@@ -505,7 +551,7 @@ function AdminShell({ baseUrl, adminToken, onLogout, onBack }: AdminShellProps) 
             </button>
           </div>
           <button type="button" className="btn-ghost" onClick={connectWallet} style={{ marginTop: '0.5rem' }}>
-            {connectedWallet ? 'Reconnect Wallet' : 'Connect MetaMask / Rabby / Phantom'}
+            {connectedWallet ? 'Reconnect Wallet' : 'Connect a 3rd party EVM wallet'}
           </button>
           <button
             type="button"
@@ -523,7 +569,7 @@ function AdminShell({ baseUrl, adminToken, onLogout, onBack }: AdminShellProps) 
                 <p className="subtle" style={{ margin: '0.35rem 0 0.75rem' }}>{modeSwitchWarning.message}</p>
                 <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
                   <button type="button" onClick={moveFundsAndSwitch} disabled={switchingMode || movingFunds}>
-                    {movingFunds ? 'Moving…' : 'Move Funds & Switch'}
+                    {movingFunds ? 'Moving...' : 'Move Funds & Switch'}
                   </button>
                   <button type="button" className="btn-ghost" onClick={confirmModeSwitchWithSplit} disabled={switchingMode || movingFunds}>
                     Continue Anyway
@@ -552,8 +598,6 @@ function AdminShell({ baseUrl, adminToken, onLogout, onBack }: AdminShellProps) 
           <p className="health">{healthStatus}</p>
         </div>
 
-        <div className="status-strip status-strip--neutral">{feedback.message}</div>
-
         <nav className="rail-tab-nav">
           <button className={`rail-tab${activeTab === 'transactions' ? ' rail-tab--active' : ''}`} onClick={() => setActiveTab('transactions')}>
             Test Transactions
@@ -564,7 +608,17 @@ function AdminShell({ baseUrl, adminToken, onLogout, onBack }: AdminShellProps) 
         </nav>
 
         <button className="btn-ghost" style={{ marginTop: '0.75rem' }} onClick={onLogout}>Sign Out</button>
+        <button className="back-btn back-btn--admin-sidebar" onClick={onBack}>Back</button>
       </aside>
+
+      {feedback.message && (
+        <div
+          className={`status-strip status-toast ${feedback.kind === 'success' ? 'status-strip--success' : feedback.kind === 'error' ? 'status-strip--error' : 'status-strip--neutral'}`}
+          role="status"
+        >
+          {feedback.message}
+        </div>
+      )}
 
       <main className="main-view">
         {activeTab === 'rewardlogic' ? (
@@ -615,7 +669,7 @@ function AdminShell({ baseUrl, adminToken, onLogout, onBack }: AdminShellProps) 
                 </p>
                 {walletMode === 'custodial' && (
                   <div className="wallet-summary">
-                    <div><span className="label">Spending from</span><strong>{walletData?.walletAddress || '—'}</strong></div>
+                    <div><span className="label">Spending from</span><strong>{walletData?.walletAddress || 'Not loaded'}</strong></div>
                   </div>
                 )}
                 <label>Session ID<input value={spendSessionId} onChange={(e) => setSpendSessionId(e.target.value)} required /></label>
@@ -645,7 +699,16 @@ function AdminShell({ baseUrl, adminToken, onLogout, onBack }: AdminShellProps) 
 export function ActivityList({ history }: { history: WalletHistoryItem[] }) {
   return (
     <section className="activity-card">
-      <h3>Recent Activity</h3>
+      <h3 className="heading-with-icon">
+        <svg className="ui-icon" viewBox="0 0 24 24" aria-hidden="true">
+          <circle cx="12" cy="12" r="9" />
+          <path d="M12 7v5l3 2" />
+        </svg>
+        Recent Activity
+      </h3>
+      <p className="subtle activity-helper">
+        Your earned and spent SPARKZ will appear here after off-peak charging, V2G activity, or charging discounts.
+      </p>
       {!history.length && <p className="subtle">No activity yet.</p>}
       {!!history.length && (
         <ul>
@@ -654,7 +717,13 @@ export function ActivityList({ history }: { history: WalletHistoryItem[] }) {
               <>
                 <div>
                   <strong>{item.type.toUpperCase()}</strong>
-                  <p>{item.amount} SPARKZ{item.awardType ? ` • ${item.awardType}` : ''}</p>
+                  {item.uid && <p className="activity-contract-id">Contract ID: {item.uid}</p>}
+                  {item.walletAddress && (
+                    <p className="activity-contract-id">
+                      {item.walletName ? `${item.walletName} - ` : ''}{item.walletAddress}
+                    </p>
+                  )}
+                  <p>{item.amount} SPARKZ{item.awardType ? ` - ${item.awardType}` : ''}</p>
                 </div>
                 <div className="subtle">
                   <p>{item.timestamp ? new Date(item.timestamp).toLocaleString() : 'Pending'}</p>

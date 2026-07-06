@@ -1,0 +1,47 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-nvf_award}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    ports:
+      - '5432:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    image: nvf-award-core-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - PORT=3000
+      - DATABASE_URL=postgres://postgres:postgres@postgres:5432/nvf_award
+      - API_KEY=${API_KEY}
+      - POLYGON_RPC_URL=${POLYGON_RPC_URL}
+      - TREASURY_ADDRESS=${TREASURY_ADDRESS}
+      - USER_ADDRESS_DERIVATION_SALT=${USER_ADDRESS_DERIVATION_SALT}
+      - TREASURY_SIGNER_KEY_FILE=/run/secrets/treasury_signer_key
+    ports:
+      - '3000:3000'
+    secrets:
+      - treasury_signer_key
+
+volumes:
+  pgdata:
+    name: nvf-award-db-data
+
+secrets:
+  treasury_signer_key:
+    external: true

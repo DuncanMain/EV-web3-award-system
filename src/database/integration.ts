@@ -190,6 +190,7 @@ export async function recordAward(
   }
 
   // Record the award
+  const awardedAt = new Date();
   const award = await Awards.create({
     userId: user.id,
     sessionId: normalised.sessionId,
@@ -198,11 +199,13 @@ export async function recordAward(
     amount: amount.toString(),
     cdrData,
     txHash,
-    awardedAt: new Date(),
+    awardedAt,
     awardType: metadata?.awardType,
     isOffPeak: metadata?.isOffPeak ?? false,
     countryCode: metadata?.countryCode,
     localTime: metadata?.localTime,
+    status: 'confirmed',
+    confirmedAt: awardedAt,
   });
 
   // Update balance for the user
@@ -243,12 +246,15 @@ export async function recordSpend(
   }
 
   const amountString = amount.toString();
+  const confirmedAt = new Date();
   await Spends.create({
     userId: user.id,
     walletAddress: userWallet,
     amount: amountString,
     txHash,
     sessionId,
+    status: 'confirmed',
+    confirmedAt,
   });
 
   const existingBalance = await Balances.findByUser(user.id);

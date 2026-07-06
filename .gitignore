@@ -36,6 +36,9 @@ logs/
 # Test coverage
 coverage/
 
+# Generated pilot/TRL evidence captures
+evidence/
+
 # Temporary files
 *.tmp
 *.temp

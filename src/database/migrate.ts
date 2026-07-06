@@ -123,6 +123,47 @@ async function runMigrations() {
       console.log('[Migration] 008: EMP contract plus wallet uniqueness already enforced');
     }
 
+    // Migration 009: add durable signed spend receipts.
+    const hasSpendReceipts = await db.schema.hasTable('spend_receipts');
+    if (!hasSpendReceipts) {
+      const { up } = await import('./migrations/009_add_spend_receipts');
+      await up(db);
+      console.log('[Migration] 009: Added spend receipts');
+    } else {
+      console.log('[Migration] 009: Spend receipts already exist');
+    }
+
+    // Migration 010: add append-only audit logs.
+    const hasAuditLogs = await db.schema.hasTable('audit_logs');
+    if (!hasAuditLogs) {
+      const { up } = await import('./migrations/010_add_audit_logs');
+      await up(db);
+      console.log('[Migration] 010: Added audit logs');
+    } else {
+      console.log('[Migration] 010: Audit logs already exist');
+    }
+
+    // Migration 011: add transaction lifecycle status fields.
+    const hasAwardStatus = await db.schema.hasColumn('awards', 'status');
+    const hasSpendStatus = await db.schema.hasColumn('spends', 'status');
+    if (!hasAwardStatus || !hasSpendStatus) {
+      const { up } = await import('./migrations/011_add_transaction_statuses');
+      await up(db);
+      console.log('[Migration] 011: Added transaction status fields');
+    } else {
+      console.log('[Migration] 011: Transaction status fields already exist');
+    }
+
+    // Migration 012: add persisted reconciliation reports.
+    const hasReconciliationReports = await db.schema.hasTable('reconciliation_reports');
+    if (!hasReconciliationReports) {
+      const { up } = await import('./migrations/012_add_reconciliation_reports');
+      await up(db);
+      console.log('[Migration] 012: Added reconciliation reports');
+    } else {
+      console.log('[Migration] 012: Reconciliation reports already exist');
+    }
+
     console.log('[Migration] All migrations completed successfully');
   } catch (err) {
     console.error('[Migration] Error:', err);

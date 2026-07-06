@@ -21,12 +21,21 @@ Create a `.env` file with the following required settings:
 # API Security - Set a strong API key for production
 API_KEY=your_production_secret_api_key_here
 
+# Dedicated key for AU/provider CDR ingestion
+INGEST_API_KEY=your_ingest_only_secret_here
+
+# Admin login credentials - required, no hardcoded fallback
+ADMIN_EMAIL=admin@example.com
+ADMIN_PASSWORD=your_admin_password
+ADMIN_ALERT_WEBHOOK_URL=https://alerts.example.com/neverflat
+
 # Treasury Wallet
 TREASURY_ADDRESS=0x3c67B7754EEAe43BAEc8ab82E8Dfc793B8A90C41
 # Use a secure secret for production, not a plain .env value
 # TREASURY_SIGNER_KEY=your_treasury_private_key_here
 # Or mount a secret file instead:
 # TREASURY_SIGNER_KEY_FILE=/run/secrets/treasury_signer_key
+TREASURY_GAS_WARNING_THRESHOLD_MATIC=0.05
 
 # User Address Derivation
 USER_ADDRESS_DERIVATION_SALT=nvf-award-core-v1
@@ -40,8 +49,9 @@ PORT=3000
 # Identity header forwarded by EMP gateway/app
 USER_IDENTITY_HEADER=x-contract-id
 
-# Allow manual /wallet/:uid lookups for testing only
-ENABLE_TEST_UID_LOOKUP=true
+# Allow manual /wallet/:uid lookups for testing only.
+# Set false in pilot/production so users use /wallet/me and /spend/me.
+ENABLE_TEST_UID_LOOKUP=false
 ```
 
 ### 1a. Secret file support
@@ -126,8 +136,8 @@ curl -X GET http://localhost:3000/wallet/user123 \
 **Public Endpoints** (no authentication):
 - `GET /ingest/health` - Health check
 
-**Protected Endpoints** (require X-API-Key):
-- `POST /ingest/cdr` - Award tokens from charging session
+**Protected Endpoints** (require X-API-Key unless otherwise noted):
+- `POST /ingest/cdr` - Award tokens from charging session. If `INGEST_API_KEY` is configured, this endpoint requires `X-Ingest-API-Key` or `X-API-Key` matching `INGEST_API_KEY`.
 - `POST /spend` - Request token spending
 - `POST /spend/me` - Spend for authenticated identity context (EMP integration)
 - `GET /wallet/:uid` - Get wallet balance and history (`:uid` is legacy naming for contract ID)
@@ -142,6 +152,9 @@ Leave `API_KEY` empty in .env to disable authentication (useful for development)
 # .env
 # API_KEY=     # Empty = no authentication required
 ```
+
+Do not leave `API_KEY`, `INGEST_API_KEY`, `ADMIN_EMAIL`, or
+`ADMIN_PASSWORD` unset in a pilot or production deployment.
 
 ## API Endpoints
 
@@ -301,6 +314,34 @@ psql -U postgres -d nvf_award -c \
 # Note: users.uid column stores contract ID (legacy column name)
 ```
 
+### TRL7 Evidence Capture
+
+Run a timestamped pilot evidence capture after deploying the API:
+
+```bash
+npm run evidence:pilot
+```
+
+The script writes `evidence/pilot-evidence-*.json` containing health, identity
+wallet, reconciliation, and audit snapshots. By default it does not submit a
+CDR or trigger reconciliation. For a controlled pilot evidence run:
+
+```bash
+EVIDENCE_RUN_CDR=true EVIDENCE_RUN_RECONCILIATION=true npm run evidence:pilot
+```
+
+Keep the generated JSON with the Horizon evidence pack after redacting any
+sensitive identifiers required by the pilot data policy.
+
+For safe ingestion/rule throughput evidence without token settlement:
+
+```bash
+npm run evidence:load-preview
+```
+
+The default target is 10 CDR preview requests per second for 10 seconds. The
+result is written to `evidence/load-test-ingest-preview-*.json`.
+
 ## Troubleshooting
 
 ### API Key Errors
@@ -332,18 +373,29 @@ Error: password authentication failed
 ```
 Error: insufficient funds for gas
 ```
-→ Fund treasury wallet with MATIC for gas fees
+Fund treasury wallet with MATIC for gas fees. The API writes admin audit events
+with `event_type=treasury.gas_low` when the balance is below
+`TREASURY_GAS_WARNING_THRESHOLD_MATIC` or a gas-funding error is detected.
 
 ## Security Checklist
 
 - [ ] API_KEY set to strong random value in production
+- [ ] INGEST_API_KEY set to a separate strong value for AU/provider ingestion
+- [ ] ADMIN_EMAIL and ADMIN_PASSWORD configured; no shared/default admin login
+- [ ] ADMIN_ALERT_WEBHOOK_URL configured for retry/warning/error alerts
+- [ ] Admin alert test run from the dashboard or `POST /admin/alerts/test`
+- [ ] Pilot Activity panel reviewed or `GET /admin/pilot-metrics?hours=24` captured
+- [ ] TRL7 evidence pack exported from the dashboard or `GET /admin/evidence-pack`
+- [ ] CDR preview throughput evidence captured with `npm run evidence:load-preview`
+- [ ] ENABLE_TEST_UID_LOOKUP=false in pilot/production
 - [ ] TREASURY_SIGNER_KEY stored securely (not in code)
+- [ ] TREASURY_GAS_WARNING_THRESHOLD_MATIC set and monitored via admin audit events
 - [ ] DATABASE_URL uses strong password
 - [ ] SSL/HTTPS enabled for API endpoints
 - [ ] Firewall restricts access to PostgreSQL (not public)
 - [ ] Logs do not expose sensitive data
 - [ ] Regular backups of PostgreSQL database
-- [ ] Monitor gas spend on treasury wallet
+- [ ] Monitor gas spend on treasury wallet and alert on `treasury.gas_low`
 
 ## Scaling
 
