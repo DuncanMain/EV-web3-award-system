@@ -1463,6 +1463,38 @@ function buildOpenApiSpec(req: Request) {
           },
         },
       },
+      '/spend/session': {
+        post: {
+          tags: ['Spends'],
+          summary: 'Get charging-session SPARKZ spend eligibility',
+          description: 'BEIA calls this when a user opens a charger, plugs in, or starts a session. This endpoint never spends tokens.',
+          security: apiKeySecurity,
+          parameters: [{ $ref: '#/components/parameters/ContractIdHeader' }],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/SpendSessionRequest' },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: 'Wallet and spend eligibility for the charging session',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/SpendSessionResponse' },
+                },
+              },
+            },
+            400: errorResponse,
+            401: errorResponse,
+            403: errorResponse,
+            404: errorResponse,
+            500: errorResponse,
+          },
+        },
+      },
       '/spend/me': {
         post: {
           tags: ['Spends'],
@@ -2071,6 +2103,72 @@ function buildOpenApiSpec(req: Request) {
             message: { type: 'string', example: '10 SPARKZ awarded' },
           },
         },
+        SpendSessionRequest: {
+          type: 'object',
+          required: ['sessionId', 'providerId', 'chargerId', 'status'],
+          properties: {
+            sessionId: { type: 'string', example: 'spend-001' },
+            providerId: { type: 'string', example: 'NF' },
+            chargerId: { type: 'string', example: 'charger-001' },
+            status: {
+              type: 'string',
+              enum: ['CHARGER_OPENED', 'PLUGGED_IN', 'SESSION_STARTED'],
+              example: 'PLUGGED_IN',
+            },
+            countryCode: { type: 'string', example: 'GB' },
+            estimatedKwh: { type: 'number', example: 24.5 },
+            estimatedCost: { type: 'number', example: 5 },
+          },
+        },
+        SpendSessionResponse: {
+          type: 'object',
+          properties: {
+            status: { type: 'string', example: 'success' },
+            contractId: { type: 'string', example: '000' },
+            sessionId: { type: 'string', example: 'spend-001' },
+            providerId: { type: 'string', example: 'NF' },
+            chargerId: { type: 'string', example: 'charger-001' },
+            sessionStatus: { type: 'string', example: 'PLUGGED_IN' },
+            wallet: {
+              type: 'object',
+              properties: {
+                availableBalance: { type: 'number', example: 12.4 },
+                totalEarned: { type: 'number', example: 20 },
+                totalSpent: { type: 'number', example: 7.6 },
+                mode: { type: 'string', enum: ['managed', 'custodial', 'unknown'], example: 'managed' },
+              },
+            },
+            spend: {
+              type: 'object',
+              properties: {
+                eligible: { type: 'boolean', example: true },
+                maxSpendable: { type: 'number', example: 12.4 },
+                suggestedAmount: { type: 'number', example: 5 },
+                label: { type: 'string', example: 'Charging discount' },
+                message: { type: 'string', example: 'You have 12.40 SPARKZ available' },
+              },
+            },
+            recentActivity: {
+              type: 'array',
+              items: { $ref: '#/components/schemas/Transaction' },
+            },
+            rewardRates: {
+              type: 'array',
+              items: { $ref: '#/components/schemas/RewardRate' },
+            },
+          },
+        },
+        RewardRate: {
+          type: 'object',
+          properties: {
+            key: { type: 'string', example: 'offPeakCharging' },
+            label: { type: 'string', example: 'Off-peak charging' },
+            enabled: { type: 'boolean', example: true },
+            tokensPerKWh: { type: 'number', example: 0.25 },
+            kWhPerSparkz: { type: 'number', nullable: true, example: 4 },
+            description: { type: 'string', example: '1 SPARKZ per 4 kWh' },
+          },
+        },
         SpendRequest: {
           type: 'object',
           required: ['uid', 'amount'],
@@ -2084,7 +2182,7 @@ function buildOpenApiSpec(req: Request) {
         },
         SpendMeRequest: {
           type: 'object',
-          required: ['amount'],
+          required: ['amount', 'sessionId', 'providerId'],
           properties: {
             amount: { type: 'number', example: 5 },
             sessionId: { type: 'string', example: 'spend-001' },
@@ -4352,39 +4450,6 @@ app.delete('/admin/off-peak/:countryCode', validateAdmin, (req: Request, res: Re
     },
   });
   res.json({ status: 'ok', windows: getOffPeakWindows() });
-});
-
-app.get('/openapi.json', (_req: Request, res: Response) => {
-  res.json(openApiSpec);
-});
-
-app.get(['/api-docs', '/docs'], (_req: Request, res: Response) => {
-  res.type('html').send(`<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>NEVERFLAT API Docs</title>
-    <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css" />
-    <style>
-      body { margin: 0; background: #ffffff; }
-      .swagger-ui .topbar { display: none; }
-    </style>
-  </head>
-  <body>
-    <div id="swagger-ui"></div>
-    <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
-    <script>
-      window.ui = SwaggerUIBundle({
-        url: '/openapi.json',
-        dom_id: '#swagger-ui',
-        deepLinking: true,
-        presets: [SwaggerUIBundle.presets.apis],
-        layout: 'BaseLayout'
-      });
-    </script>
-  </body>
-</html>`);
 });
 
 // Error handling middleware
