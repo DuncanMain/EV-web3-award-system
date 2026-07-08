@@ -153,6 +153,38 @@ describe('api integration contracts', () => {
     return body.token;
   }
 
+  it('documents the BEIA session spend flow in OpenAPI', async () => {
+    const res = await fetch(`${baseUrl}/openapi.json`);
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body.openapi).toBe('3.0.3');
+    expect(body.paths['/spend/session']).toBeDefined();
+    expect(body.components.schemas.SpendSessionRequest).toBeDefined();
+    expect(body.components.schemas.SpendSessionResponse.properties.rewardRates).toBeDefined();
+    expect(body.components.schemas.SpendMeRequest.required).toEqual(expect.arrayContaining([
+      'amount',
+      'sessionId',
+      'providerId',
+    ]));
+  });
+
+  it('routes /wallet/me through the contract identity endpoint', async () => {
+    const identityRes = await apiFetch('/wallet/me', {
+      headers: { 'x-contract-id': 'contract-123' },
+    });
+    const identityBody = await identityRes.json();
+
+    expect(identityRes.status).toBe(200);
+    expect(identityBody.uid).toBe('contract-123');
+
+    const manualRes = await apiFetch('/wallet/contract-123');
+    const manualBody = await manualRes.json();
+
+    expect(manualRes.status).toBe(403);
+    expect(manualBody.message).toContain('/wallet/me');
+  });
+
   it('verifies signed spend receipts over HTTP', async () => {
     const signer = ethers.Wallet.createRandom();
     const payload = createSpendReceiptPayload({

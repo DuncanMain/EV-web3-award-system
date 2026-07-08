@@ -32,6 +32,19 @@ async function readJson<T>(res: Response): Promise<T> {
   return data as T;
 }
 
+function getErrorMessage(err: unknown): string {
+  return err && typeof err === 'object' && 'message' in err
+    ? String((err as { message?: unknown }).message)
+    : String(err);
+}
+
+function contractHeaders(contractId: string): HeadersInit {
+  return {
+    'Content-Type': 'application/json',
+    'x-contract-id': contractId,
+  };
+}
+
 function money(value: number | string | undefined): string {
   const parsed = Number(value || 0);
   return Number.isFinite(parsed) ? parsed.toFixed(2) : '0.00';
@@ -138,10 +151,7 @@ export default function SparkzChargingCard({
       try {
         const res = await fetch(`${apiBaseUrl}/wallet/me`, {
           method: 'GET',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-contract-id': contractId,
-          },
+          headers: contractHeaders(contractId),
         });
         const data = await readJson<SparkzWalletResponse>(res);
         if (cancelled) return;
@@ -150,11 +160,8 @@ export default function SparkzChargingCard({
         onWalletLoaded?.(data);
       } catch (err) {
         if (cancelled) return;
-        const message = err && typeof err === 'object' && 'message' in err
-          ? String((err as { message?: unknown }).message)
-          : String(err);
         setWallet(null);
-        setWalletError(message);
+        setWalletError(getErrorMessage(err));
       } finally {
         if (!cancelled) setLoadingWallet(false);
       }
@@ -184,10 +191,7 @@ export default function SparkzChargingCard({
       try {
         const res = await fetch(`${apiBaseUrl}/spend/session`, {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-contract-id': contractId,
-          },
+          headers: contractHeaders(contractId),
           body: JSON.stringify(sessionRequest),
         });
         const data = await readJson<SparkzSessionResponse>(res);
@@ -196,11 +200,8 @@ export default function SparkzChargingCard({
         setSelectedAmount(data.spend.suggestedAmount > 0 ? data.spend.suggestedAmount.toString() : '');
       } catch (err) {
         if (cancelled) return;
-        const message = err && typeof err === 'object' && 'message' in err
-          ? String((err as { message?: unknown }).message)
-          : String(err);
         setSession(null);
-        setError(message);
+        setError(getErrorMessage(err));
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -239,10 +240,7 @@ export default function SparkzChargingCard({
     try {
       const res = await fetch(`${apiBaseUrl}/spend/me`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-contract-id': contractId,
-        },
+        headers: contractHeaders(contractId),
         body: JSON.stringify({
           amount,
           sessionId,
@@ -258,10 +256,7 @@ export default function SparkzChargingCard({
         onDismiss?.('spent');
       }
     } catch (err) {
-      const message = err && typeof err === 'object' && 'message' in err
-        ? String((err as { message?: unknown }).message)
-        : String(err);
-      setError(message);
+      setError(getErrorMessage(err));
       onSpendError?.(err);
     } finally {
       setSpending(false);
@@ -280,10 +275,7 @@ export default function SparkzChargingCard({
   async function loadWalletProfile() {
     const walletRes = await fetch(`${apiBaseUrl}/wallet/me`, {
       method: 'GET',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-contract-id': contractId,
-      },
+      headers: contractHeaders(contractId),
     });
     const walletData = await readJson<SparkzWalletResponse>(walletRes);
     setWallet(walletData);
@@ -318,10 +310,7 @@ export default function SparkzChargingCard({
 
     const linkRes = await fetch(`${apiBaseUrl}/wallet/${encodeURIComponent(contractId)}/linked-wallets`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-contract-id': contractId,
-      },
+      headers: contractHeaders(contractId),
       body: JSON.stringify({ walletAddress, signature }),
     });
     await readJson<SparkzWalletResponse>(linkRes);
@@ -343,10 +332,7 @@ export default function SparkzChargingCard({
 
       const res = await fetch(`${apiBaseUrl}/wallet/${encodeURIComponent(contractId)}/mode`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-contract-id': contractId,
-        },
+        headers: contractHeaders(contractId),
         body: JSON.stringify({
           mode,
           walletAddress,
@@ -357,10 +343,7 @@ export default function SparkzChargingCard({
       const walletData = await loadWalletProfile();
       onWalletModeChange?.(walletData);
     } catch (err) {
-      const message = err && typeof err === 'object' && 'message' in err
-        ? String((err as { message?: unknown }).message)
-        : String(err);
-      setWalletError(message);
+      setWalletError(getErrorMessage(err));
     } finally {
       setSwitchingMode(false);
       setSigningWallet(false);
