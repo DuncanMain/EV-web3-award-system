@@ -276,8 +276,8 @@ BEIA must retrieve the reservation status using the `reservation.id` returned
 by `POST /spend/me`. Once its status becomes `settled` or `released`, BEIA
 forwards the complete result to the EMP so it can apply the free-kWh discount.
 
-The required BEIA-facing reservation-status endpoint is the intended delivery
-channel, for example:
+The component uses this BEIA-facing reservation-status endpoint as the delivery
+channel:
 
 ```http
 GET /spend/reservations/:reservationId
@@ -300,10 +300,9 @@ Expected final information:
 }
 ```
 
-**Implementation status:** reservation creation and CDR settlement are
-implemented, but this BEIA-facing status endpoint and component polling are not
-yet implemented. They are required before the end-to-end EMP discount flow is
-complete.
+**Implementation status:** reservation creation, CDR settlement, contract-scoped
+status retrieval, and component polling are implemented. BEIA receives the final
+result through `onReservationSettlement` and must forward it to the EMP.
 
 ### 7. Session Closed
 
@@ -344,6 +343,8 @@ type SparkzChargingCardProps = {
   hideAfterSkip?: boolean;
   polygonExplorerBaseUrl?: string;
   onReservationSuccess?: (reservation: SparkzReservation) => void;
+  onReservationSettlement?: (settlement: SparkzReservationSettlement) => void;
+  reservationPollIntervalMs?: number; // defaults to 10000, minimum 1000
   onSpendSuccess?: (receipt: SparkzSpendReceipt) => void; // legacy immediate-spend flows
   onSpendError?: (error: unknown) => void;
   onWalletLoaded?: (wallet: SparkzWalletResponse) => void;
@@ -411,10 +412,11 @@ Purpose:
 - Reserve SPARKZ for the charging session.
 - Return the reservation ID and 1:1 maximum kWh entitlement.
 
-### Planned: `GET /spend/reservations/:reservationId`
+### `GET /spend/reservations/:reservationId`
 
-Required for BEIA to obtain the final Aarhus-CDR settlement and pass it to the
-EMP. This endpoint is documented as planned and is not currently implemented.
+Used by the component to obtain the final Aarhus-CDR settlement and pass it to
+BEIA through `onReservationSettlement`. The lookup is restricted to the
+`x-contract-id` that owns the reservation.
 
 ### `POST /spend/reservation-approval-intent`
 
@@ -470,8 +472,7 @@ Relevant spend validation codes:
 The current charging-session flow does not implement:
 
 - Manual cancellation before the final CDR.
-- BEIA reservation-status polling, settlement delivery to the EMP, and external
-  wallet residual-allowance cleanup UI.
+- External-wallet residual-allowance cleanup UI.
 - Spend caps beyond available balance.
 - Custom spend rules beyond `amount > 0` and `amount <= availableBalance`.
 

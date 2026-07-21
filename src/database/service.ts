@@ -546,6 +546,11 @@ export const SpendReceipts = {
 /** Durable session reservations. Active reservations reduce API availability but
  * do not move on-chain tokens until a matching final CDR is received. */
 export const SpendReservations = {
+  async findByIdForUid(id: string, uid: string): Promise<SpendReservationRecord | undefined> {
+    const db = getDatabase();
+    return db('spend_reservations').where({ id, uid }).first();
+  },
+
   async getActiveTotal(uid: string, walletAddress?: string): Promise<number> {
     const db = getDatabase();
     const query = db('spend_reservations')

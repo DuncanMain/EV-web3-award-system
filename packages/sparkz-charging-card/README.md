@@ -16,7 +16,7 @@ Until this package is published to a registry, install from a packed tarball or
 from this folder in a workspace.
 
 ```bash
-npm install ./sparkz-charging-card-0.1.0.tgz
+npm install ./sparkz-charging-card-0.2.0.tgz
 ```
 
 Import the component and styles:
@@ -46,8 +46,12 @@ export function SparkzPanel({ userUid }: { userUid: string }) {
       providerId={sessionId ? 'EMP-PROVIDER-ID' : undefined}
       chargerId={sessionId ? 'charger-001' : undefined}
       onReservationSuccess={(reservation) => {
-        // Store this ID; BEIA will use it to retrieve final settlement.
+        // The component starts polling this reservation automatically.
         console.log(reservation);
+      }}
+      onReservationSettlement={(settlement) => {
+        // Forward this final settled/released result to the EMP.
+        console.log(settlement);
       }}
       onSkipSession={() => {
         // User chose not to spend SPARKZ for this session.
@@ -129,10 +133,10 @@ and the "How it works" tab remain in unplugged mode only.
 the delivered energy at `1 SPARKZ = 1 kWh` and releases the unused remainder.
 
 The EMP sends its CDR through the Aarhus database, not through BEIA. NEVERFLAT
-has no direct outbound connection to the EMP, so BEIA must retrieve the final
-reservation settlement from NEVERFLAT and forward it to the EMP. The required
-reservation-status endpoint and component polling are planned but not yet
-implemented.
+has no direct outbound connection to the EMP, so the component polls
+`GET /spend/reservations/:reservationId`. It calls `onReservationSettlement`
+once the result is `settled` or `released`; BEIA must forward that result to the
+EMP.
 
 For an active external wallet, the component obtains a capped ERC-20 approval
 transaction from `POST /spend/reservation-approval-intent`, asks the wallet to
@@ -197,6 +201,8 @@ type SparkzChargingCardProps = {
   polygonExplorerBaseUrl?: string;
   onSpendSuccess?: (receipt: SparkzSpendReceipt) => void;
   onReservationSuccess?: (reservation: SparkzReservation) => void;
+  onReservationSettlement?: (settlement: SparkzReservationSettlement) => void;
+  reservationPollIntervalMs?: number; // defaults to 10000, minimum 1000
   onSpendError?: (error: unknown) => void;
   onWalletLoaded?: (wallet: SparkzWalletResponse) => void;
   onWalletModeChange?: (wallet: SparkzWalletResponse) => void;

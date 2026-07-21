@@ -1345,6 +1345,37 @@ function buildOpenApiSpec(req: Request) {
           },
         },
       },
+      '/spend/reservations/{reservationId}': {
+        get: {
+          tags: ['Spends'],
+          summary: 'Get a reservation and its final CDR settlement',
+          description: 'BEIA polls this endpoint and forwards a settled or released result to the EMP.',
+          security: apiKeySecurity,
+          parameters: [
+            { $ref: '#/components/parameters/ContractIdHeader' },
+            {
+              name: 'reservationId',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', format: 'uuid' },
+            },
+          ],
+          responses: {
+            200: {
+              description: 'Current reservation and settlement state',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/ReservationStatusResponse' },
+                },
+              },
+            },
+            401: errorResponse,
+            403: errorResponse,
+            404: errorResponse,
+            500: errorResponse,
+          },
+        },
+      },
       '/spend/custodial-record': {
         post: {
           tags: ['Spends'],
@@ -2073,6 +2104,24 @@ function buildOpenApiSpec(req: Request) {
             },
             timestamp: { type: 'string', format: 'date-time' },
             label: { type: 'string', example: 'Charging discount' },
+          },
+        },
+        ReservationStatusResponse: {
+          type: 'object',
+          required: ['status', 'reservationId', 'sessionId', 'providerId', 'reservedSparkz', 'freeKwh', 'updatedAt'],
+          properties: {
+            status: { type: 'string', enum: ['reserved', 'settling', 'settled', 'released'] },
+            reservationId: { type: 'string', format: 'uuid' },
+            sessionId: { type: 'string' },
+            providerId: { type: 'string' },
+            reservedSparkz: { type: 'string', example: '5.00' },
+            settledSparkz: { type: 'string', nullable: true, example: '3.00' },
+            releasedSparkz: { type: 'string', nullable: true, example: '2.00' },
+            deliveredKwh: { type: 'string', nullable: true, example: '3.000' },
+            freeKwh: { type: 'string', example: '3.00' },
+            txHash: { type: 'string', nullable: true },
+            spendReceipt: { type: 'object', nullable: true, additionalProperties: true },
+            updatedAt: { type: 'string', format: 'date-time' },
           },
         },
         CustodialSpendRecordRequest: {
@@ -3117,6 +3166,67 @@ app.post('/spend/me', validateApiKey, async (req: Request, res: Response) => {
       },
     });
     res.status(500).json({
+      status: 'error',
+      error: toUserFacingSpendError(err),
+    });
+  }
+});
+
+/** BEIA polls this after reserving so it can forward the final CDR settlement to the EMP. */
+app.get('/spend/reservations/:reservationId', validateApiKey, async (req: Request, res: Response) => {
+  try {
+    const contractId = getRequestContractId(req);
+    if (!contractId) {
+      return res.status(401).json({
+        status: 'error',
+        message: `Missing identity header: ${USER_IDENTITY_HEADER}`,
+      });
+    }
+
+    const normalizedUid = normalizeUid(contractId);
+    const reservationId = String(req.params.reservationId || '').trim();
+    const reservation = await SpendReservations.findByIdForUid(reservationId, normalizedUid);
+    if (!reservation) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'Reservation not found for this contract ID',
+      });
+    }
+
+    const receiptRecord = reservation.tx_hash
+      ? await SpendReceipts.findByTxHash(reservation.tx_hash)
+      : undefined;
+    let spendReceipt: Record<string, unknown> | null = null;
+    if (receiptRecord) {
+      try {
+        spendReceipt = {
+          payload: JSON.parse(receiptRecord.canonical_payload),
+          signature: receiptRecord.signature,
+          signerAddress: receiptRecord.signer_address,
+          canonicalPayload: receiptRecord.canonical_payload,
+        };
+      } catch {
+        spendReceipt = null;
+      }
+    }
+
+    return res.status(200).json({
+      status: reservation.status,
+      reservationId: reservation.id,
+      sessionId: reservation.session_id,
+      providerId: reservation.provider_id,
+      reservedSparkz: reservation.reserved_amount,
+      settledSparkz: reservation.settled_amount || null,
+      releasedSparkz: reservation.released_amount || null,
+      deliveredKwh: reservation.delivered_kwh || null,
+      freeKwh: reservation.settled_amount || '0.00',
+      txHash: reservation.tx_hash || null,
+      spendReceipt,
+      updatedAt: reservation.updated_at,
+    });
+  } catch (err) {
+    console.error('Reservation status error:', err);
+    return res.status(500).json({
       status: 'error',
       error: toUserFacingSpendError(err),
     });

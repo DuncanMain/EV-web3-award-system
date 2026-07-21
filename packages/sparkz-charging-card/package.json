@@ -1,6 +1,6 @@
 {
   "name": "@neverflat/sparkz-charging-card",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": false,
   "description": "Embeddable SPARKZ charging-session and wallet account React component for BEIA integration.",
   "type": "module",
@@ -20,7 +20,7 @@
   ],
   "scripts": {
     "dev": "vite --host 127.0.0.1",
-    "build": "tsc && vite build"
+    "build": "vite build && tsc"
   },
   "dependencies": {
     "ethers": "^6.16.0"

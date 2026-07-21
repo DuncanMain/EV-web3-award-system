@@ -80,8 +80,10 @@ jest.mock('./database/service', () => ({
   },
   SpendReceipts: {
     create: jest.fn(),
+    findByTxHash: jest.fn(),
   },
   SpendReservations: {
+    findByIdForUid: jest.fn(),
     getActiveTotal: jest.fn().mockResolvedValue(0),
     reserve: jest.fn(),
     claimForSettlement: jest.fn().mockResolvedValue(undefined),
@@ -167,6 +169,8 @@ describe('api integration contracts', () => {
     expect(res.status).toBe(200);
     expect(body.openapi).toBe('3.0.3');
     expect(body.paths['/spend/session']).toBeDefined();
+    expect(body.paths['/spend/reservations/{reservationId}']).toBeDefined();
+    expect(body.components.schemas.ReservationStatusResponse).toBeDefined();
     expect(body.components.schemas.SpendSessionRequest).toBeDefined();
     expect(body.components.schemas.SpendSessionResponse.properties.rewardRates).toBeDefined();
     const documentedError = body.paths['/spend/session'].post.responses['400'];
@@ -184,6 +188,41 @@ describe('api integration contracts', () => {
       'sessionId',
       'providerId',
     ]));
+  });
+
+  it('returns a final reservation settlement only to its contract identity', async () => {
+    const { SpendReservations, SpendReceipts } = await import('./database/service');
+    (SpendReservations.findByIdForUid as jest.Mock).mockResolvedValueOnce({
+      id: 'reservation-1',
+      uid: 'contract-1',
+      wallet_address: linkedWallet.address,
+      session_id: 'session-1',
+      provider_id: 'provider-1',
+      reserved_amount: '5.00',
+      settled_amount: '3.00',
+      released_amount: '2.00',
+      delivered_kwh: '3.000',
+      status: 'settled',
+      tx_hash: `0x${'2'.repeat(64)}`,
+      updated_at: new Date('2026-07-21T12:00:00Z'),
+    });
+    (SpendReceipts.findByTxHash as jest.Mock).mockResolvedValueOnce(undefined);
+
+    const res = await apiFetch('/spend/reservations/reservation-1', {
+      headers: { 'x-contract-id': 'contract-1' },
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body).toMatchObject({
+      status: 'settled',
+      reservationId: 'reservation-1',
+      reservedSparkz: '5.00',
+      settledSparkz: '3.00',
+      releasedSparkz: '2.00',
+      freeKwh: '3.00',
+    });
+    expect(SpendReservations.findByIdForUid).toHaveBeenCalledWith('reservation-1', 'contract-1');
   });
 
   it('routes /wallet/me through the contract identity endpoint', async () => {

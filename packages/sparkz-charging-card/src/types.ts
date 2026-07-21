@@ -75,6 +75,21 @@ export type SparkzReservation = {
   availableBalance: number;
 };
 
+export type SparkzReservationSettlement = {
+  status: 'reserved' | 'settling' | 'settled' | 'released';
+  reservationId: string;
+  sessionId: string;
+  providerId: string;
+  reservedSparkz: string;
+  settledSparkz: string | null;
+  releasedSparkz: string | null;
+  deliveredKwh: string | null;
+  freeKwh: string;
+  txHash: string | null;
+  spendReceipt: SparkzSpendReceipt | null;
+  updatedAt: string;
+};
+
 export type SparkzSessionResponse = {
   status: 'success';
   contractId: string;
@@ -120,6 +135,8 @@ export type SparkzChargingCardProps = {
   polygonExplorerBaseUrl?: string;
   onSpendSuccess?: (receipt: SparkzSpendReceipt) => void;
   onReservationSuccess?: (reservation: SparkzReservation) => void;
+  onReservationSettlement?: (settlement: SparkzReservationSettlement) => void;
+  reservationPollIntervalMs?: number;
   onSpendError?: (error: unknown) => void;
   onWalletLoaded?: (wallet: SparkzWalletResponse) => void;
   onWalletModeChange?: (wallet: SparkzWalletResponse) => void;

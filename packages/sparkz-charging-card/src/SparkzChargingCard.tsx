@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState } from 'react';
+import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { ethers } from 'ethers';
 import type {
   SparkzActiveSessionStatus,
@@ -6,6 +6,7 @@ import type {
   SparkzChargingCardProps,
   SparkzRewardRate,
   SparkzReservation,
+  SparkzReservationSettlement,
   SparkzSessionResponse,
   SparkzSpendReceipt,
   SparkzWalletResponse,
@@ -39,9 +40,13 @@ async function readJson<T>(res: Response): Promise<T> {
 }
 
 function getErrorMessage(err: unknown): string {
-  return err && typeof err === 'object' && 'message' in err
-    ? String((err as { message?: unknown }).message)
-    : String(err);
+  if (err && typeof err === 'object') {
+    const response = err as { message?: unknown; error?: unknown; code?: unknown };
+    const detail = response.message ?? response.error;
+    if (detail !== undefined && detail !== null && String(detail).trim()) return String(detail);
+    if (response.code !== undefined && response.code !== null) return String(response.code);
+  }
+  return err instanceof Error ? err.message : String(err);
 }
 
 function contractHeaders(contractId: string): HeadersInit {
@@ -110,6 +115,8 @@ export default function SparkzChargingCard({
   polygonExplorerBaseUrl = 'https://amoy.polygonscan.com',
   onSpendSuccess,
   onReservationSuccess,
+  onReservationSettlement,
+  reservationPollIntervalMs = 10000,
   onSpendError,
   onWalletLoaded,
   onWalletModeChange,
@@ -129,6 +136,8 @@ export default function SparkzChargingCard({
   const [walletError, setWalletError] = useState('');
   const [receipt, setReceipt] = useState<SparkzSpendReceipt | null>(null);
   const [reservation, setReservation] = useState<SparkzReservation | null>(null);
+  const [settlement, setSettlement] = useState<SparkzReservationSettlement | null>(null);
+  const notifiedSettlementId = useRef<string | null>(null);
   const [dismissed, setDismissed] = useState(false);
   const [activeTab, setActiveTab] = useState<'activity' | 'account' | 'about'>('activity');
 
@@ -139,6 +148,40 @@ export default function SparkzChargingCard({
   const walletBalance = session?.wallet.availableBalance ?? wallet?.balance ?? 0;
   const walletEarned = wallet?.totalAwarded || session?.wallet.totalEarned || 0;
   const walletSpent = wallet?.totalSpent || session?.wallet.totalSpent || 0;
+
+  useEffect(() => {
+    if (!reservation?.id) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    async function pollReservation() {
+      try {
+        const res = await fetch(`${apiBaseUrl}/spend/reservations/${encodeURIComponent(reservation!.id)}`, {
+          method: 'GET',
+          headers: contractHeaders(contractId),
+        });
+        const data = await readJson<SparkzReservationSettlement>(res);
+        if (cancelled) return;
+        setSettlement(data);
+        if (data.status === 'settled' || data.status === 'released') {
+          if (notifiedSettlementId.current !== data.reservationId) {
+            notifiedSettlementId.current = data.reservationId;
+            onReservationSettlement?.(data);
+          }
+          return;
+        }
+      } catch (err) {
+        if (!cancelled) setError(getErrorMessage(err));
+      }
+      if (!cancelled) timer = setTimeout(pollReservation, Math.max(1000, reservationPollIntervalMs));
+    }
+
+    void pollReservation();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [apiBaseUrl, contractId, onReservationSettlement, reservation?.id, reservationPollIntervalMs]);
 
   const sessionRequest = useMemo(() => ({
     sessionId,
@@ -280,6 +323,8 @@ export default function SparkzChargingCard({
       });
       const data = await readJson<SpendResponse>(res);
       setReservation(data.reservation);
+      setSettlement(null);
+      notifiedSettlementId.current = null;
       onReservationSuccess?.(data.reservation);
       if (hideAfterSpend) {
         setDismissed(true);
@@ -631,8 +676,14 @@ export default function SparkzChargingCard({
       )}
       {reservation && (
         <div className="sparkz-card__receipt" role="status">
-          <strong>{reservation.amount} SPARKZ reserved</strong>
-          <span>Up to {reservation.kWhEntitlement} kWh will be free. Unused SPARKZ are released after the final CDR.</span>
+          <strong>{settlement?.status === 'settled'
+            ? `${settlement.settledSparkz} SPARKZ settled`
+            : settlement?.status === 'released'
+              ? 'SPARKZ reservation released'
+              : `${reservation.amount} SPARKZ reserved`}</strong>
+          <span>{settlement?.status === 'settled' || settlement?.status === 'released'
+            ? `${settlement.freeKwh} kWh free; ${settlement.releasedSparkz || '0.00'} SPARKZ released.`
+            : `Up to ${reservation.kWhEntitlement} kWh will be free. Unused SPARKZ are released after the final CDR.`}</span>
         </div>
       )}
 
