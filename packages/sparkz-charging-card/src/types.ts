@@ -67,6 +67,14 @@ export type SparkzSpendReceipt = {
   dbStored?: boolean;
 };
 
+export type SparkzReservation = {
+  id: string;
+  status: 'reserved';
+  amount: string;
+  kWhEntitlement: string;
+  availableBalance: number;
+};
+
 export type SparkzSessionResponse = {
   status: 'success';
   contractId: string;
@@ -79,6 +87,7 @@ export type SparkzSessionResponse = {
   estimatedCost?: number;
   wallet: {
     availableBalance: number;
+    reservedBalance?: number;
     totalEarned: number;
     totalSpent: number;
     mode: SparkzWalletMode;
@@ -110,6 +119,7 @@ export type SparkzChargingCardProps = {
   hideAfterSkip?: boolean;
   polygonExplorerBaseUrl?: string;
   onSpendSuccess?: (receipt: SparkzSpendReceipt) => void;
+  onReservationSuccess?: (reservation: SparkzReservation) => void;
   onSpendError?: (error: unknown) => void;
   onWalletLoaded?: (wallet: SparkzWalletResponse) => void;
   onWalletModeChange?: (wallet: SparkzWalletResponse) => void;

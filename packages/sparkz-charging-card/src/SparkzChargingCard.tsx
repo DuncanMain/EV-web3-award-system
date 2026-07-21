@@ -5,6 +5,7 @@ import type {
   SparkzActivityItem,
   SparkzChargingCardProps,
   SparkzRewardRate,
+  SparkzReservation,
   SparkzSessionResponse,
   SparkzSpendReceipt,
   SparkzWalletResponse,
@@ -13,9 +14,7 @@ import sparkzLogo from './sparkz-logo.svg';
 
 type SpendResponse = {
   status: 'success';
-  spendReceipt: SparkzSpendReceipt;
-  txHash?: string;
-  tokensSpent?: number;
+  reservation: SparkzReservation;
 };
 
 type BrowserEthereumProvider = {
@@ -103,6 +102,7 @@ export default function SparkzChargingCard({
   hideAfterSkip = true,
   polygonExplorerBaseUrl = 'https://amoy.polygonscan.com',
   onSpendSuccess,
+  onReservationSuccess,
   onSpendError,
   onWalletLoaded,
   onWalletModeChange,
@@ -121,6 +121,7 @@ export default function SparkzChargingCard({
   const [error, setError] = useState('');
   const [walletError, setWalletError] = useState('');
   const [receipt, setReceipt] = useState<SparkzSpendReceipt | null>(null);
+  const [reservation, setReservation] = useState<SparkzReservation | null>(null);
   const [dismissed, setDismissed] = useState(false);
   const [activeTab, setActiveTab] = useState<'activity' | 'account' | 'about'>('activity');
 
@@ -249,8 +250,8 @@ export default function SparkzChargingCard({
         }),
       });
       const data = await readJson<SpendResponse>(res);
-      setReceipt(data.spendReceipt);
-      onSpendSuccess?.(data.spendReceipt);
+      setReservation(data.reservation);
+      onReservationSuccess?.(data.reservation);
       if (hideAfterSpend) {
         setDismissed(true);
         onDismiss?.('spent');
@@ -597,6 +598,12 @@ export default function SparkzChargingCard({
         <div className="sparkz-card__receipt" role="status">
           <strong>Discount applied</strong>
           <span>Receipt {receipt.payload.receiptId}</span>
+        </div>
+      )}
+      {reservation && (
+        <div className="sparkz-card__receipt" role="status">
+          <strong>{reservation.amount} SPARKZ reserved</strong>
+          <span>Up to {reservation.kWhEntitlement} kWh will be free. Unused SPARKZ are released after the final CDR.</span>
         </div>
       )}
 

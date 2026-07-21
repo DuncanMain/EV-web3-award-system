@@ -25,8 +25,27 @@ BEIA is responsible for:
 - Rendering the component in the app.
 - Passing the logged-in BEIA user UID as `contractId`.
 - Passing charging-session context when a charger/session is active.
-- Removing active-session props when the CDR/session close event is received.
-- Forwarding successful spend receipts into BEIA's charging/discount system.
+- Passing the canonical session and EMP provider identifiers that will later
+  appear in the Aarhus CDR data.
+- Forwarding the completed settlement from NEVERFLAT to the EMP.
+
+## Integration Topology
+
+NEVERFLAT has no direct outbound connection to the EMP. Information travels in
+two different directions:
+
+```text
+EMP -> Aarhus database -> NEVERFLAT final CDR processing
+NEVERFLAT -> BEIA integration -> EMP settlement/discount processing
+```
+
+The HTTP response produced while NEVERFLAT processes an Aarhus CDR is not a
+delivery channel to BEIA or the EMP. BEIA must retrieve the completed
+reservation settlement from NEVERFLAT and forward it to the EMP.
+
+The reservation is matched using the exact combination of `contractId`,
+`sessionId`, and `providerId`. BEIA must not invent its own provider or session
+identifier if it differs from the values that will appear in the final CDR.
 
 ## Identity
 
@@ -83,14 +102,14 @@ export function SparkzPanel({
       contractId={userUid}
       sessionStatus={activeSession?.status || 'UNPLUGGED'}
       sessionId={activeSession?.sessionId}
-      providerId={activeSession?.providerId}
+      providerId={activeSession?.providerId} // canonical EMP provider ID
       chargerId={activeSession?.chargerId}
       countryCode={activeSession?.countryCode}
       estimatedKwh={activeSession?.estimatedKwh}
       estimatedCost={activeSession?.estimatedCost}
-      onSpendSuccess={(receipt) => {
-        // Forward unchanged to BEIA's charging/discount system.
-        console.log(receipt);
+      onReservationSuccess={(reservation) => {
+        // The final CDR settles this at 1 SPARKZ per delivered kWh.
+        console.log(reservation);
       }}
       onSkipSession={(context) => {
         // User chose not to spend SPARKZ for this charging session.
@@ -151,7 +170,7 @@ Example:
   contractId={userUid}
   sessionStatus="PLUGGED_IN"
   sessionId="session-123"
-  providerId="BEIA"
+  providerId="EMP-PROVIDER-ID"
   chargerId="charger-001"
 />
 ```
@@ -168,12 +187,10 @@ Body:
 ```json
 {
   "sessionId": "session-123",
-  "providerId": "BEIA",
+  "providerId": "EMP-PROVIDER-ID",
   "chargerId": "charger-001",
   "status": "PLUGGED_IN",
-  "countryCode": "GB",
-  "estimatedKwh": 24.5,
-  "estimatedCost": 5
+  "countryCode": "GB"
 }
 ```
 
@@ -196,7 +213,10 @@ The active-session UI is deliberately focused. It shows:
 
 It does not show Account, How it works, Earned, or Spent in active-session mode.
 
-### 3. User Applies A Discount
+`estimatedKwh` and `estimatedCost` are optional and should be omitted when the
+final session values are not yet known.
+
+### 3. User Reserves A Discount
 
 When the user taps `Apply discount`, the component calls:
 
@@ -211,7 +231,7 @@ Body:
 {
   "amount": 5,
   "sessionId": "session-123",
-  "providerId": "BEIA",
+  "providerId": "EMP-PROVIDER-ID",
   "label": "Charging discount"
 }
 ```
@@ -223,10 +243,8 @@ The backend validates:
 - `sessionId` is present
 - `providerId` is present
 
-Successful responses include a signed `spendReceipt`. BEIA should forward this
-receipt unchanged into its charging/session/discount system.
-
-Do not reconstruct, edit, or partially copy the receipt.
+This call reserves SPARKZ; it does not transfer them. The response contains a
+reservation representing up to the same number of free kWh.
 
 ### 4. User Skips Spending
 
@@ -237,10 +255,54 @@ BEIA can then close or hide the prompt for that charging session.
 
 No backend spend is created.
 
-### 5. CDR Received Or Session Closed
+### 5. Final CDR Arrives Through Aarhus
 
-When BEIA receives the CDR or otherwise considers the charging session closed,
-return the component to unplugged mode:
+The EMP writes the final CDR to the Aarhus database. NEVERFLAT obtains and
+processes that CDR independently of BEIA. NEVERFLAT settles at `1 SPARKZ = 1
+delivered kWh`. The settled amount is `min(reserved SPARKZ, final delivered
+kWh)` and any remainder is released automatically.
+
+BEIA does not submit this CDR and cannot use the CDR-processing HTTP response.
+
+### 6. BEIA Retrieves And Forwards Settlement
+
+BEIA must retrieve the reservation status using the `reservation.id` returned
+by `POST /spend/me`. Once its status becomes `settled` or `released`, BEIA
+forwards the complete result to the EMP so it can apply the free-kWh discount.
+
+The required BEIA-facing reservation-status endpoint is the intended delivery
+channel, for example:
+
+```http
+GET /spend/reservations/:reservationId
+x-contract-id: <beia-user-uid>
+```
+
+Expected final information:
+
+```json
+{
+  "status": "settled",
+  "reservationId": "...",
+  "sessionId": "session-123",
+  "providerId": "EMP-PROVIDER-ID",
+  "reservedSparkz": "5.00",
+  "settledSparkz": "3.00",
+  "freeKwh": "3.00",
+  "releasedSparkz": "2.00",
+  "spendReceipt": {}
+}
+```
+
+**Implementation status:** reservation creation and CDR settlement are
+implemented, but this BEIA-facing status endpoint and component polling are not
+yet implemented. They are required before the end-to-end EMP discount flow is
+complete.
+
+### 7. Session Closed
+
+When BEIA considers the charging session closed, return the component to
+unplugged mode. BEIA does not need to receive the CDR itself to do this:
 
 ```tsx
 <SparkzChargingCard
@@ -275,7 +337,8 @@ type SparkzChargingCardProps = {
   hideAfterSpend?: boolean;
   hideAfterSkip?: boolean;
   polygonExplorerBaseUrl?: string;
-  onSpendSuccess?: (receipt: SparkzSpendReceipt) => void;
+  onReservationSuccess?: (reservation: SparkzReservation) => void;
+  onSpendSuccess?: (receipt: SparkzSpendReceipt) => void; // legacy immediate-spend flows
   onSpendError?: (error: unknown) => void;
   onWalletLoaded?: (wallet: SparkzWalletResponse) => void;
   onWalletModeChange?: (wallet: SparkzWalletResponse) => void;
@@ -339,8 +402,13 @@ x-contract-id: <beia-user-uid>
 
 Purpose:
 
-- Spend SPARKZ for the charging session.
-- Return the signed spend receipt for BEIA to apply the discount.
+- Reserve SPARKZ for the charging session.
+- Return the reservation ID and 1:1 maximum kWh entitlement.
+
+### Planned: `GET /spend/reservations/:reservationId`
+
+Required for BEIA to obtain the final Aarhus-CDR settlement and pass it to the
+EMP. This endpoint is documented as planned and is not currently implemented.
 
 ### `POST /wallet/:uid/linked-wallets`
 
@@ -382,8 +450,8 @@ Relevant spend validation codes:
 
 The current charging-session flow does not implement:
 
-- Cancellation.
-- Refunds.
+- Manual cancellation before the final CDR.
+- BEIA reservation-status polling and settlement delivery to the EMP.
 - Spend caps beyond available balance.
 - Custom spend rules beyond `amount > 0` and `amount <= availableBalance`.
 

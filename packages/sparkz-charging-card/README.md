@@ -43,11 +43,11 @@ export function SparkzPanel({ userUid }: { userUid: string }) {
       contractId={userUid}
       sessionStatus={sessionStatus}
       sessionId={sessionId}
-      providerId={sessionId ? 'BEIA' : undefined}
+      providerId={sessionId ? 'EMP-PROVIDER-ID' : undefined}
       chargerId={sessionId ? 'charger-001' : undefined}
-      onSpendSuccess={(receipt) => {
-        // Forward receipt unchanged to BEIA's charging/session system.
-        console.log(receipt);
+      onReservationSuccess={(reservation) => {
+        // Store this ID; BEIA will use it to retrieve final settlement.
+        console.log(reservation);
       }}
       onSkipSession={() => {
         // User chose not to spend SPARKZ for this session.
@@ -94,7 +94,7 @@ session details.
   contractId={userUid}
   sessionStatus="PLUGGED_IN"
   sessionId="session-123"
-  providerId="BEIA"
+  providerId="EMP-PROVIDER-ID"
   chargerId="charger-001"
 />
 ```
@@ -121,17 +121,23 @@ x-contract-id: <userUid>
 ```
 
 Active-session mode is intentionally focused on the charging decision. It shows
-available SPARKZ, the admin-configured reward rates returned by
+available-to-reserve SPARKZ, the admin-configured reward rates returned by
 `/spend/session`, and the spend/skip controls. Account details, full activity,
 and the "How it works" tab remain in unplugged mode only.
 
-The `spendReceipt` returned by `/spend/me` should be forwarded unchanged to the
-BEIA session/discount system.
+`POST /spend/me` now creates a reservation. The final CDR settles no more than
+the delivered energy at `1 SPARKZ = 1 kWh` and releases the unused remainder.
+
+The EMP sends its CDR through the Aarhus database, not through BEIA. NEVERFLAT
+has no direct outbound connection to the EMP, so BEIA must retrieve the final
+reservation settlement from NEVERFLAT and forward it to the EMP. The required
+reservation-status endpoint and component polling are planned but not yet
+implemented.
 
 ### CDR received/session closed
 
-When BEIA receives the CDR or otherwise considers the session complete, pass
-`UNPLUGGED` again and remove active session props.
+When BEIA considers the session complete, pass `UNPLUGGED` again and remove
+active session props. BEIA does not receive the CDR itself.
 
 ```tsx
 <SparkzChargingCard
@@ -183,6 +189,7 @@ type SparkzChargingCardProps = {
   hideAfterSkip?: boolean;
   polygonExplorerBaseUrl?: string;
   onSpendSuccess?: (receipt: SparkzSpendReceipt) => void;
+  onReservationSuccess?: (reservation: SparkzReservation) => void;
   onSpendError?: (error: unknown) => void;
   onWalletLoaded?: (wallet: SparkzWalletResponse) => void;
   onWalletModeChange?: (wallet: SparkzWalletResponse) => void;

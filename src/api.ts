@@ -15,7 +15,7 @@ import { ethers } from 'ethers';
 import { processAwardFromCDR, processSpend } from './index';
 import { approveUserForSpendingViaFunding, moveFundsFromManagedWallet, recordSpend, revokeAllowanceOnManagedWallet } from './database/integration';
 import { getManagedWalletAddress, getUserWalletConfig, resolveActiveUidAddress, setUserWalletMode, WalletMode } from './user/userService';
-import { Awards, Spends, Users, Balances, LinkedWallets, SpendReceipts, AuditLogs, ReconciliationReports } from './database/service';
+import { Awards, Spends, Users, Balances, LinkedWallets, SpendReceipts, SpendReservations, AuditLogs, ReconciliationReports } from './database/service';
 import type { AuditLogRecord } from './database/service';
 import { RawSession, OCPICDRFormat, SpendExecutionResult } from './types';
 import { getRules, setRules, AwardRuleConfig } from './config/awardRules';
@@ -26,6 +26,7 @@ import { reconcileBalance, summarizeReconciliation } from './reconciliation';
 import { getDatabase } from './database/connection';
 import { normaliseSession } from './normaliser';
 import { prepareAward } from './awardExecutor';
+import { calculateReservationSettlement } from './reservation';
 
 const app = express();
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
@@ -537,6 +538,38 @@ async function processSpendWithAutoApproval(input: {
   }
 
   return spendResult;
+}
+
+async function settleReservationFromCdr(cdr: RawSession | OCPICDRFormat) {
+  const session = normaliseSession(cdr);
+  const reservation = await SpendReservations.claimForSettlement(session.uid, session.sessionId, session.providerId);
+  if (!reservation) return null;
+  const deliveredKwh = session.energyDirection === 'CHARGE' ? session.energyKWh : 0;
+  const { settledAmount: amount } = calculateReservationSettlement(Number(reservation.reserved_amount), deliveredKwh);
+  try {
+    if (amount === 0) return await SpendReservations.complete(reservation.id, deliveredKwh, 0);
+    const spendResult = await processSpendWithAutoApproval({
+      uid: session.uid, userAddress: reservation.wallet_address, amount,
+      sessionId: session.sessionId, auditContext: 'reservation_settlement',
+      onApprovalFailure: async () => undefined,
+    });
+    if (!spendResult.success || !spendResult.txHash) throw new Error(spendResult.error || 'Reservation settlement failed');
+    const completed = await SpendReservations.complete(reservation.id, deliveredKwh, spendResult.amount, spendResult.txHash);
+    const spendReceipt = await createAndStoreSpendReceipt({
+      uid: session.uid, walletAddress: reservation.wallet_address, amount: spendResult.amount,
+      sessionId: session.sessionId, providerId: session.providerId, txHash: spendResult.txHash,
+    });
+    await safeAuditLog({
+      eventType: 'spend.reservation_settled', actorType: 'ingest_client', actorId: session.providerId,
+      targetType: 'spend_reservation', targetId: reservation.id, status: 'success',
+      metadata: { reservedAmount: reservation.reserved_amount, settledAmount: spendResult.amount,
+        releasedAmount: completed.released_amount, deliveredKwh, receiptId: spendReceipt.payload.receiptId },
+    });
+    return { ...completed, spendReceipt };
+  } catch (err) {
+    await SpendReservations.retry(reservation.id, getErrorMessage(err));
+    throw err;
+  }
 }
 
 async function getTreasuryWalletAddress(): Promise<string | null> {
@@ -1170,7 +1203,7 @@ function buildOpenApiSpec(req: Request) {
       '/spend/me': {
         post: {
           tags: ['Spends'],
-          summary: 'Spend SPARKZ using the x-contract-id identity header',
+          summary: 'Reserve SPARKZ for settlement from the final CDR',
           security: apiKeySecurity,
           parameters: [{ $ref: '#/components/parameters/ContractIdHeader' }],
           requestBody: {
@@ -1183,10 +1216,10 @@ function buildOpenApiSpec(req: Request) {
           },
           responses: {
             200: {
-              description: 'Spend completed',
+              description: 'SPARKZ reserved; no token transfer has occurred',
               content: {
                 'application/json': {
-                  schema: { $ref: '#/components/schemas/SpendResponse' },
+                  schema: { $ref: '#/components/schemas/ReservationResponse' },
                 },
               },
             },
@@ -1875,6 +1908,27 @@ function buildOpenApiSpec(req: Request) {
             label: { type: 'string', example: 'Charging discount' },
           },
         },
+        ReservationResponse: {
+          type: 'object',
+          properties: {
+            status: { type: 'string', example: 'success' },
+            uid: { type: 'string', example: '000' },
+            sessionId: { type: 'string', example: 'spend-001' },
+            providerId: { type: 'string', example: 'NF' },
+            reservation: {
+              type: 'object',
+              properties: {
+                id: { type: 'string', format: 'uuid' },
+                status: { type: 'string', enum: ['reserved'] },
+                amount: { type: 'string', example: '5.00' },
+                kWhEntitlement: { type: 'string', example: '5.00' },
+                availableBalance: { type: 'number', example: 7.4 },
+              },
+            },
+            timestamp: { type: 'string', format: 'date-time' },
+            label: { type: 'string', example: 'Charging discount' },
+          },
+        },
         CustodialSpendRecordRequest: {
           type: 'object',
           required: ['uid', 'walletAddress', 'amount', 'txHash'],
@@ -2310,6 +2364,8 @@ app.post('/ingest/cdr', validateIngestApiKey, async (req: Request, res: Response
       });
     }
 
+    const reservationSettlement = await settleReservationFromCdr(cdr);
+
     // Check for duplicates
     const dedupKey = `${sessionId}-${providerId}`;
     const exists = await Awards.exists(dedupKey);
@@ -2332,6 +2388,7 @@ app.post('/ingest/cdr', validateIngestApiKey, async (req: Request, res: Response
         sessionId,
         providerId,
         message: 'CDR already processed',
+        reservationSettlement,
       });
     }
 
@@ -2393,6 +2450,7 @@ app.post('/ingest/cdr', validateIngestApiKey, async (req: Request, res: Response
       tokensAwarded: result.amount,
       txHash: result.txHash,
       message: result.eligible ? `${result.amount} SPARKZ awarded` : 'CDR accepted but not eligible for reward',
+      reservationSettlement,
     });
   } catch (err) {
     console.error('CDR ingestion error:', err);
@@ -2480,16 +2538,14 @@ app.post('/spend/session', validateApiKey, async (req: Request, res: Response) =
     }
 
     const walletPayload = await getWalletPayload(normalizedUid);
-    const availableBalance = Number(walletPayload.balance || 0);
+    const onChainBalance = Number(walletPayload.balance || 0);
+    const reservedBalance = await SpendReservations.getActiveTotal(normalizedUid);
+    const availableBalance = Math.max(0, onChainBalance - reservedBalance);
     const totalEarned = Number(walletPayload.totalAwarded || 0);
     const totalSpent = Number(walletPayload.totalSpent || 0);
     const hasSpendableSparkz = Number.isFinite(availableBalance) && availableBalance > 0;
-    const suggestedAmount = hasSpendableSparkz
-      ? Number(Math.min(
-        availableBalance,
-        numericEstimatedCost && numericEstimatedCost > 0 ? numericEstimatedCost : availableBalance
-      ).toFixed(2))
-      : 0;
+    // Final energy is unknown at session start; the user chooses the reservation.
+    const suggestedAmount = 0;
 
     return res.status(200).json({
       status: 'success',
@@ -2503,6 +2559,7 @@ app.post('/spend/session', validateApiKey, async (req: Request, res: Response) =
       estimatedCost: numericEstimatedCost,
       wallet: {
         availableBalance,
+        reservedBalance,
         totalEarned,
         totalSpent,
         mode: walletPayload.walletMode || 'unknown',
@@ -2513,7 +2570,7 @@ app.post('/spend/session', validateApiKey, async (req: Request, res: Response) =
         suggestedAmount,
         label: 'Charging discount',
         message: hasSpendableSparkz
-          ? `You have ${availableBalance.toFixed(2)} SPARKZ available`
+          ? `You have ${availableBalance.toFixed(2)} SPARKZ available to reserve`
           : 'No SPARKZ are available for this charging session',
       },
       recentActivity: walletPayload.history || [],
@@ -2771,7 +2828,9 @@ app.post('/spend/me', validateApiKey, async (req: Request, res: Response) => {
 
     const walletConfig = await getUserWalletConfig(normalizedUid);
     const userAddress = walletConfig.managedWalletAddress;
-    const availableBalance = Number(ethers.formatEther(await getOnChainTokenBalance(userAddress)));
+    const onChainBalance = Number(ethers.formatEther(await getOnChainTokenBalance(userAddress)));
+    const reservedBalance = await SpendReservations.getActiveTotal(normalizedUid);
+    const availableBalance = Math.max(0, onChainBalance - reservedBalance);
 
     if (amountValue > availableBalance) {
       await safeAuditLog({
@@ -2796,81 +2855,36 @@ app.post('/spend/me', validateApiKey, async (req: Request, res: Response) => {
       });
     }
 
-    await auditTreasuryGasWarning('spend.identity.before_execution');
-
-    const spendResult = await processSpendWithAutoApproval({
-      uid: normalizedUid,
-      userAddress,
-      amount: amountValue,
-      sessionId,
-      auditContext: 'identity',
-      onApprovalFailure: async approvalErr => {
-        await safeAuditLog({
-          eventType: 'spend.auto_approval_failed',
-          actorType: 'contract_identity',
-          actorId: normalizedUid,
-          targetType: 'wallet',
-          targetId: userAddress,
-          status: 'retry_required',
-          metadata: {
-            uid: normalizedUid,
-            amount: amountValue,
-            sessionId,
-            providerId,
-            error: getErrorMessage(approvalErr),
-          },
+    let reserved;
+    try {
+      reserved = await SpendReservations.reserve({
+        uid: normalizedUid, walletAddress: userAddress, sessionId, providerId,
+        amount: amountValue, onChainBalance,
+      });
+    } catch (err) {
+      const message = getErrorMessage(err);
+      if (message.startsWith('INSUFFICIENT_SPARKZ:')) {
+        const atomicAvailable = Number(message.split(':')[1] || 0);
+        return spendValidationError(res, 'INSUFFICIENT_SPARKZ', 'amount exceeds available SPARKZ balance', {
+          availableBalance: atomicAvailable, requestedAmount: amountValue,
         });
-      },
-    });
-
-    if (!spendResult.success) {
-      if (isTreasuryGasIssue(spendResult.error)) {
-        await auditTreasuryGasWarning('spend.identity.failure', spendResult.error);
       }
-      await safeAuditLog({
-        eventType: 'spend.failed',
-        actorType: 'contract_identity',
-        actorId: normalizedUid,
-        targetType: 'wallet',
-        targetId: userAddress,
-        status: 'retry_required',
-        metadata: {
-          uid: normalizedUid,
-          amount: amountValue,
-          sessionId,
-          providerId,
-          error: spendResult.error,
-        },
-      });
-      return res.status(400).json({
-        status: 'error',
-        uid: normalizedUid,
-        error: toUserFacingSpendError(spendResult.error),
-      });
+      throw err;
     }
-
-    const spendReceipt = await createAndStoreSpendReceipt({
-      uid: normalizedUid,
-      walletAddress: userAddress,
-      amount: spendResult.amount,
-      sessionId,
-      providerId,
-      txHash: spendResult.txHash!,
-    });
     await safeAuditLog({
-      eventType: 'spend.completed',
+      eventType: 'spend.reserved',
       actorType: 'contract_identity',
       actorId: normalizedUid,
-      targetType: 'token_tx',
-      targetId: spendResult.txHash,
+      targetType: 'spend_reservation',
+      targetId: reserved.reservation.id,
       status: 'success',
       metadata: {
         uid: normalizedUid,
         walletAddress: userAddress,
-        amount: spendResult.amount,
+        amount: reserved.reservation.reserved_amount,
         sessionId,
         providerId,
-        receiptId: spendReceipt.payload.receiptId,
+        existing: reserved.existing,
       },
     });
 
@@ -2879,11 +2893,15 @@ app.post('/spend/me', validateApiKey, async (req: Request, res: Response) => {
       uid: normalizedUid,
       sessionId,
       providerId,
-      tokensSpent: spendResult.amount,
-      txHash: spendResult.txHash,
+      reservation: {
+        id: reserved.reservation.id,
+        status: reserved.reservation.status,
+        amount: reserved.reservation.reserved_amount,
+        kWhEntitlement: reserved.reservation.reserved_amount,
+        availableBalance: reserved.availableBalance,
+      },
       timestamp: new Date().toISOString(),
       label,
-      spendReceipt,
     });
   } catch (err) {
     console.error('Spend (me) error:', err);

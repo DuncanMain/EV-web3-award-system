@@ -164,6 +164,16 @@ async function runMigrations() {
       console.log('[Migration] 012: Reconciliation reports already exist');
     }
 
+    // Migration 013: reserve SPARKZ at session time and settle from the final CDR.
+    const hasSpendReservations = await db.schema.hasTable('spend_reservations');
+    if (!hasSpendReservations) {
+      const { up } = await import('./migrations/013_add_spend_reservations');
+      await up(db);
+      console.log('[Migration] 013: Added spend reservations');
+    } else {
+      console.log('[Migration] 013: Spend reservations already exist');
+    }
+
     console.log('[Migration] All migrations completed successfully');
   } catch (err) {
     console.error('[Migration] Error:', err);

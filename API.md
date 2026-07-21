@@ -503,9 +503,16 @@ The SPARKZ React package uses this endpoint for the unplugged/account view.
 
 **POST** `/spend/me`
 
-Spends from the authenticated/forwarded user's wallet without passing `uid` in the body.
-Successful responses include the same signed `spendReceipt` shape returned by
-`POST /spend`.
+Reserves SPARKZ for the authenticated user's charging session without passing
+`uid` in the body. This does not transfer tokens. When the matching final CDR is
+ingested, NEVERFLAT settles `min(reserved SPARKZ, delivered kWh)` at `1 SPARKZ =
+1 kWh` and releases the remainder.
+
+The EMP supplies CDR data through the Aarhus database, while settlement data
+must travel from NEVERFLAT through BEIA to the EMP. The CDR-processing response
+is therefore not the delivery channel. A BEIA-facing reservation-status API is
+required so BEIA can retrieve and forward the final settlement. That read API
+is not yet implemented.
 
 Required header:
 - `x-contract-id: <contract-id>` (or the header name configured in `USER_IDENTITY_HEADER`)

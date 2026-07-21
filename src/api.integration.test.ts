@@ -81,6 +81,13 @@ jest.mock('./database/service', () => ({
   SpendReceipts: {
     create: jest.fn(),
   },
+  SpendReservations: {
+    getActiveTotal: jest.fn().mockResolvedValue(0),
+    reserve: jest.fn(),
+    claimForSettlement: jest.fn().mockResolvedValue(undefined),
+    complete: jest.fn(),
+    retry: jest.fn(),
+  },
   AuditLogs: mockAuditLogs,
   ReconciliationReports: {
     latest: jest.fn().mockResolvedValue(undefined),

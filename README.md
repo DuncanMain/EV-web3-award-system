@@ -129,10 +129,13 @@ The backend supports two access modes:
 - `GET /wallet/:uid` - Manual contract ID wallet lookup (legacy/test flow)
 - `POST /spend` - Manual contract ID spend (legacy/test flow)
 
-The BEAI charging flow should first call `POST /spend/session` with
-`x-contract-id`, then call `POST /spend/me` only after the user confirms an
-amount. Successful spends return `spendReceipt`, which should be forwarded
-unchanged to the EMP or settlement receiver.
+The BEIA charging flow first calls `POST /spend/session` with `x-contract-id`,
+then calls `POST /spend/me` only after the user confirms an amount. This creates
+a reservation rather than an immediate spend. The EMP's final CDR reaches
+NEVERFLAT through the Aarhus database. NEVERFLAT has no direct outbound EMP
+connection, so BEIA must retrieve the completed reservation settlement and
+forward it to the EMP. The required BEIA-facing reservation-status endpoint is
+not yet implemented.
 
 The reusable BEAI React component package lives in
 `packages/sparkz-charging-card/`. It is separate from the `frontend/` admin
@@ -145,7 +148,10 @@ The BEIA package exports `SparkzChargingCard`.
 - BEIA passes the logged-in app user UID as `contractId`
 - `UNPLUGGED` mode shows the user's SPARKZ account view via `GET /wallet/me`
 - Active session modes call `POST /spend/session` and show the spend prompt
-- `POST /spend/me` is called only after the user confirms an amount
+- `POST /spend/me` reserves SPARKZ only after the user confirms an amount
+- BEIA must use the same contract, session, and EMP provider identifiers that
+  appear in the final Aarhus CDR
+- BEIA will retrieve the final settlement from NEVERFLAT and forward it to the EMP
 - Custodial wallet mode requires an installed EVM wallet signature before mode switch
 - BEIA should set the component back to `UNPLUGGED` when the CDR/session close event is received
 

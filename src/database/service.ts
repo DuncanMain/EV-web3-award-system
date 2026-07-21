@@ -79,6 +79,24 @@ export interface SpendReceiptRecord {
   updated_at: Date;
 }
 
+export interface SpendReservationRecord {
+  id: string;
+  uid: string;
+  wallet_address: string;
+  session_id: string;
+  provider_id: string;
+  reserved_amount: string;
+  settled_amount?: string | null;
+  released_amount?: string | null;
+  delivered_kwh?: string | null;
+  status: 'reserved' | 'settling' | 'settled' | 'released';
+  tx_hash?: string | null;
+  error_message?: string | null;
+  reserved_at: Date;
+  settled_at?: Date | null;
+  updated_at: Date;
+}
+
 export interface AuditLogRecord {
   id: string;
   event_type: string;
@@ -520,6 +538,88 @@ export const SpendReceipts = {
   async findByUid(uid: string): Promise<SpendReceiptRecord[]> {
     const db = getDatabase();
     return db('spend_receipts').where({ uid }).orderBy('issued_at', 'desc');
+  },
+};
+
+/** Durable session reservations. Active reservations reduce API availability but
+ * do not move on-chain tokens until a matching final CDR is received. */
+export const SpendReservations = {
+  async getActiveTotal(uid: string): Promise<number> {
+    const db = getDatabase();
+    const row = await db('spend_reservations')
+      .where({ uid })
+      .whereIn('status', ['reserved', 'settling'])
+      .sum({ total: 'reserved_amount' })
+      .first();
+    return Number(row?.total || 0);
+  },
+
+  async reserve(data: {
+    uid: string;
+    walletAddress: string;
+    sessionId: string;
+    providerId: string;
+    amount: number;
+    onChainBalance: number;
+  }): Promise<{ reservation: SpendReservationRecord; availableBalance: number; existing: boolean }> {
+    const db = getDatabase();
+    return db.transaction(async trx => {
+      await trx.raw('select pg_advisory_xact_lock(hashtext(?))', [data.uid]);
+      const existing = await trx('spend_reservations').where({
+        uid: data.uid,
+        session_id: data.sessionId,
+        provider_id: data.providerId,
+      }).first();
+      const totalRow = await trx('spend_reservations')
+        .where({ uid: data.uid })
+        .whereIn('status', ['reserved', 'settling'])
+        .sum({ total: 'reserved_amount' })
+        .first();
+      const availableBalance = Math.max(0, data.onChainBalance - Number(totalRow?.total || 0));
+      if (existing) return { reservation: existing, availableBalance, existing: true };
+      if (data.amount > availableBalance) throw new Error(`INSUFFICIENT_SPARKZ:${availableBalance}`);
+      const [reservation] = await trx('spend_reservations').insert({
+        uid: data.uid,
+        wallet_address: data.walletAddress,
+        session_id: data.sessionId,
+        provider_id: data.providerId,
+        reserved_amount: data.amount.toFixed(2),
+        status: 'reserved',
+      }).returning('*');
+      return { reservation, availableBalance: availableBalance - data.amount, existing: false };
+    });
+  },
+
+  async claimForSettlement(uid: string, sessionId: string, providerId: string): Promise<SpendReservationRecord | undefined> {
+    const db = getDatabase();
+    const [record] = await db('spend_reservations')
+      .where({ uid, session_id: sessionId, provider_id: providerId, status: 'reserved' })
+      .update({ status: 'settling', error_message: null, updated_at: db.fn.now() })
+      .returning('*');
+    return record;
+  },
+
+  async complete(id: string, deliveredKwh: number, settledAmount: number, txHash?: string): Promise<SpendReservationRecord> {
+    const db = getDatabase();
+    const current = await db('spend_reservations').where({ id }).first();
+    const releasedAmount = Math.max(0, Number(current.reserved_amount) - settledAmount);
+    const [record] = await db('spend_reservations').where({ id }).update({
+      status: settledAmount > 0 ? 'settled' : 'released',
+      delivered_kwh: deliveredKwh.toFixed(3),
+      settled_amount: settledAmount.toFixed(2),
+      released_amount: releasedAmount.toFixed(2),
+      tx_hash: txHash || null,
+      settled_at: db.fn.now(),
+      updated_at: db.fn.now(),
+    }).returning('*');
+    return record;
+  },
+
+  async retry(id: string, error: string): Promise<void> {
+    const db = getDatabase();
+    await db('spend_reservations').where({ id }).update({
+      status: 'reserved', error_message: error, updated_at: db.fn.now(),
+    });
   },
 };
 
