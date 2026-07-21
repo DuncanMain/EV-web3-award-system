@@ -1113,10 +1113,55 @@ function validateApiKey(req: Request, res: Response, next: NextFunction): void {
 function buildOpenApiSpec(req: Request) {
   const baseUrl = `${req.protocol}://${req.get('host')}`;
   const errorResponse = {
-    description: 'Error response',
+    description: 'Request failed. Inspect `message` or `error` for the specific cause.',
     content: {
       'application/json': {
         schema: { $ref: '#/components/schemas/ErrorResponse' },
+        examples: {
+          validationFailed: {
+            summary: 'Missing or invalid request data',
+            value: {
+              status: 'error',
+              code: 'INVALID_REQUEST',
+              message: 'amount must be a number greater than zero',
+            },
+          },
+          missingApiKey: {
+            summary: 'API authentication is missing',
+            value: {
+              status: 'error',
+              message: 'Missing API key: X-API-Key header required',
+            },
+          },
+          invalidApiKey: {
+            summary: 'API authentication was rejected',
+            value: {
+              status: 'error',
+              message: 'Invalid API key',
+            },
+          },
+          identityMissing: {
+            summary: 'Gridware contract identity is missing',
+            value: {
+              status: 'error',
+              message: `Missing identity header: ${USER_IDENTITY_HEADER}`,
+            },
+          },
+          resourceNotFound: {
+            summary: 'The requested wallet or configuration was not found',
+            value: {
+              status: 'error',
+              message: 'Wallet not found for the supplied contract ID',
+            },
+          },
+          rewardNetworkUnavailable: {
+            summary: 'Temporary blockchain or RPC failure',
+            value: {
+              status: 'error',
+              error: 'The reward network is temporarily unavailable. Please retry the request shortly.',
+            },
+          },
+        },
       },
     },
   };
@@ -1814,11 +1859,30 @@ function buildOpenApiSpec(req: Request) {
       schemas: {
         ErrorResponse: {
           type: 'object',
+          required: ['status'],
+          description: 'A failed request. `message` describes request/authentication problems; `error` describes processing failures. At least one is returned.',
           properties: {
-            status: { type: 'string', example: 'error' },
-            message: { type: 'string' },
-            error: { type: 'string' },
+            status: { type: 'string', enum: ['error'], example: 'error' },
+            code: {
+              type: 'string',
+              description: 'Stable machine-readable error code when one is available.',
+              example: 'INVALID_REQUEST',
+            },
+            message: {
+              type: 'string',
+              description: 'Specific validation, identity, authentication, or not-found reason.',
+              example: 'Missing API key: X-API-Key header required',
+            },
+            error: {
+              type: 'string',
+              description: 'Safe processing-failure detail suitable for display or logging.',
+              example: 'The reward network is temporarily unavailable. Please retry the request shortly.',
+            },
           },
+          anyOf: [
+            { required: ['message'] },
+            { required: ['error'] },
+          ],
         },
         OkResponse: {
           type: 'object',

@@ -169,6 +169,16 @@ describe('api integration contracts', () => {
     expect(body.paths['/spend/session']).toBeDefined();
     expect(body.components.schemas.SpendSessionRequest).toBeDefined();
     expect(body.components.schemas.SpendSessionResponse.properties.rewardRates).toBeDefined();
+    const documentedError = body.paths['/spend/session'].post.responses['400'];
+    expect(documentedError.description).toContain('specific cause');
+    expect(documentedError.content['application/json'].examples.validationFailed.value.message)
+      .toContain('amount');
+    expect(documentedError.content['application/json'].examples.rewardNetworkUnavailable.value.error)
+      .toContain('temporarily unavailable');
+    expect(body.components.schemas.ErrorResponse.anyOf).toEqual([
+      { required: ['message'] },
+      { required: ['error'] },
+    ]);
     expect(body.components.schemas.SpendMeRequest.required).toEqual(expect.arrayContaining([
       'amount',
       'sessionId',
