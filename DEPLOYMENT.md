@@ -6,7 +6,7 @@ Identifier terminology: this project uses contract ID as the primary external us
 
 ## Prerequisites
 
-- Node.js 16+ and npm
+- Node.js 20+ and npm
 - PostgreSQL 12+
 - Polygon testnet wallet with MATIC for gas
 - SPARKZ tokens for awards (ERC20)
@@ -112,9 +112,20 @@ Server will start on `http://localhost:3000` (or configured PORT)
 
 ### Production
 
+The checked-in GitHub Actions workflow builds the image and deploys it with the
+explicit production definition:
+
 ```bash
-npm install --production
+docker compose -f compose.production.yaml pull app
+docker compose -f compose.production.yaml up -d --remove-orphans
+```
+
+For a direct non-container deployment:
+
+```bash
+npm ci
 npm run build
+npm prune --omit=dev
 node dist/api.js
 ```
 

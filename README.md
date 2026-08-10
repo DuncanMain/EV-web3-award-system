@@ -33,7 +33,7 @@ If integrating with another platform, this identifier mapping can be reconfigure
 - ✅ **User Accounts**: Deterministic contract ID → Polygon address mapping with auto-enrollment
 - ✅ **PostgreSQL Database**: Mirrors blockchain state for API queries
 - ✅ **Event Listeners**: Real-time sync from contract to database
-- ✅ **Comprehensive Tests**: 54 test cases across all modules, all passing
+- ✅ **Comprehensive Tests**: Automated unit and API-integration coverage across core modules
 - ✅ **REST API**: Identity-context and test-mode endpoints for CDR ingestion, spend processing, and wallet queries
 
 ## Installation
@@ -56,7 +56,9 @@ Build the container image and start the application with PostgreSQL:
 docker compose up --build -d
 ```
 
-This uses the included `docker-compose.yml` for both the API and PostgreSQL.
+This uses `compose.yaml`, the single local-development Compose configuration,
+for both the API and PostgreSQL. Production uses the separate
+`compose.production.yaml` file explicitly through the deployment workflow.
 
 ### Docker Secrets
 

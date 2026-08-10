@@ -15,8 +15,11 @@ dist/
 .env.test.local
 .env.production.local
 
-# IDE
-.vscode/
+# IDE and local agent configuration
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.claude/
 .idea/
 *.swp
 *.swo

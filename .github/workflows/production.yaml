@@ -48,7 +48,7 @@ jobs:
           host: ${{ secrets.SERVER_HOST }}
           username: root
           key: ${{ secrets.SERVER_SSH_KEY }}
-          source: docker-compose.yaml
+          source: compose.production.yaml
           target: /root/neverflat
           strip_components: 0
 
@@ -69,6 +69,8 @@ jobs:
           script: |
             set -euo pipefail
             cd /root/neverflat
+            rm -f docker-compose.yaml docker-compose.yml docker-compose.dev.yaml \
+              docker-compose.local.yml docker-compose.override.yml docker-stack.yml
             echo ${{ github.token }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
             docker network create shared-proxy || true
             touch .env
@@ -89,5 +91,5 @@ jobs:
             kept.extend(f'{key}={value}' for key, value in updates.items())
             path.write_text('\n'.join(kept) + '\n')
             PY
-            docker compose pull app
-            docker compose up -d
+            docker compose -f compose.production.yaml pull app
+            docker compose -f compose.production.yaml up -d --remove-orphans

@@ -16,17 +16,13 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-    networks:
-      - default
 
   app:
-    container_name: neverflat-app
     image: ghcr.io/zentrixlab/neverflat:latest
+    container_name: neverflat-app
     restart: unless-stopped
     env_file:
       - .env
-    ports:
-      - '127.0.0.1:3005:3000'
     environment:
       NODE_ENV: production
       PORT: 3000
@@ -34,6 +30,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    ports:
+      - "127.0.0.1:3005:3000"
     networks:
       - default
       - shared-proxy

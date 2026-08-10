@@ -623,7 +623,7 @@ or continue with balances split across wallets.
 
 1. **Start PostgreSQL** (via Docker or local installation):
    ```bash
-   docker-compose up -d postgres
+   docker compose up -d postgres
    ```
 
 2. **Run migrations**:
@@ -693,7 +693,7 @@ All endpoints return structured error responses:
 | `Missing required fields` | CDR missing SessionID, ProviderID, or contract ID (field `UID`) | Verify CDR format |
 | `invalid signature` | Treasury key doesn't match address | Check TREASURY_SIGNER_KEY config |
 | `insufficient allowance` | User hasn't approved treasury for spend | Requires on-chain approval first |
-| `Database not available` | PostgreSQL not running | Start DB: `docker-compose up -d postgres` |
+| `Database not available` | PostgreSQL not running | Start DB: `docker compose up -d postgres` |
 
 ---
 

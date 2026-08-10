@@ -4,7 +4,7 @@ FROM node:20-alpine AS build
 WORKDIR /usr/src/app
 
 COPY package.json package-lock.json ./
-RUN npm ci --production=false
+RUN npm ci --include=dev
 
 COPY tsconfig.json .
 COPY src ./src
@@ -21,7 +21,7 @@ FROM node:20-alpine AS runtime
 WORKDIR /usr/src/app
 
 COPY package.json package-lock.json ./
-RUN npm ci --production
+RUN npm ci --omit=dev
 
 COPY --from=build /usr/src/app/dist ./dist
 COPY --from=build /usr/src/app/frontend/dist ./frontend/dist
