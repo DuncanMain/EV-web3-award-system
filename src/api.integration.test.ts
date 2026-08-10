@@ -205,6 +205,27 @@ describe('api integration contracts', () => {
     expect((await res.json()).uid).toBe('beia-user-1');
   });
 
+  it('accepts the dedicated BEIA API key for CDR ingestion', async () => {
+    const res = await fetch(`${baseUrl}/ingest/cdr/preview`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-API-Key': 'test-beia-api-key',
+      },
+      body: JSON.stringify({
+        SessionID: 'beia-test-session',
+        EMPContractID: 'beia-test-user',
+        EMPProviderID: 'BEIA',
+        StartTime: '2026-08-10T10:00:00Z',
+        EndTime: '2026-08-10T11:00:00Z',
+        TotalEnergy: 10,
+      }),
+    });
+
+    expect(res.status).not.toBe(401);
+    expect(res.status).not.toBe(403);
+  });
+
   it('accepts the dedicated BEIA admin login', async () => {
     const res = await fetch(`${baseUrl}/admin/login`, {
       method: 'POST',

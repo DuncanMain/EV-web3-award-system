@@ -2417,7 +2417,7 @@ function validateIngestApiKey(req: Request, res: Response, next: NextFunction): 
     return;
   }
 
-  if (apiKey !== INGEST_API_KEY) {
+  if (apiKey !== INGEST_API_KEY && apiKey !== BEIA_API_KEY) {
     void safeAuditLog({
       eventType: 'auth.ingest_key_rejected',
       actorType: 'api_client',
