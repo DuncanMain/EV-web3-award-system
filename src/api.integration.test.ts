@@ -109,9 +109,12 @@ describe('api integration contracts', () => {
 
   beforeAll(async () => {
     process.env.API_KEY = 'test-api-key';
+    process.env.BEIA_API_KEY = 'test-beia-api-key';
     process.env.INGEST_API_KEY = 'test-ingest-key';
     process.env.ADMIN_EMAIL = 'admin@example.com';
     process.env.ADMIN_PASSWORD = 'correct-password';
+    process.env.BEIA_ADMIN_EMAIL = 'alex.dabija@redvector.ro';
+    process.env.BEIA_ADMIN_PASSWORD = 'beia-password';
     process.env.ENABLE_TEST_UID_LOOKUP = 'false';
     process.env.TREASURY_SIGNER_KEY = treasuryWallet.privateKey;
     process.env.TREASURY_ADDRESS = treasuryWallet.address;
@@ -188,6 +191,34 @@ describe('api integration contracts', () => {
       'sessionId',
       'providerId',
     ]));
+  });
+
+  it('accepts the dedicated BEIA API key', async () => {
+    const res = await fetch(`${baseUrl}/wallet/me`, {
+      headers: {
+        'X-API-Key': 'test-beia-api-key',
+        'x-contract-id': 'beia-user-1',
+      },
+    });
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).uid).toBe('beia-user-1');
+  });
+
+  it('accepts the dedicated BEIA admin login', async () => {
+    const res = await fetch(`${baseUrl}/admin/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: 'alex.dabija@redvector.ro',
+        password: 'beia-password',
+      }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body.adminEmail).toBe('alex.dabija@redvector.ro');
+    expect(body.token).toBeTruthy();
   });
 
   it('returns a final reservation settlement only to its contract identity', async () => {
@@ -289,8 +320,12 @@ describe('api integration contracts', () => {
   it('does not treat legacy ADMIN_USERNAME as the registered admin email', async () => {
     const previousEmail = process.env.ADMIN_EMAIL;
     const previousUsername = process.env.ADMIN_USERNAME;
+    const previousBeiaEmail = process.env.BEIA_ADMIN_EMAIL;
+    const previousBeiaPassword = process.env.BEIA_ADMIN_PASSWORD;
     process.env.ADMIN_EMAIL = '';
     process.env.ADMIN_USERNAME = 'legacy-admin';
+    process.env.BEIA_ADMIN_EMAIL = '';
+    process.env.BEIA_ADMIN_PASSWORD = '';
 
     jest.resetModules();
     const isolated = await import('./api');
@@ -323,6 +358,16 @@ describe('api integration contracts', () => {
         delete process.env.ADMIN_USERNAME;
       } else {
         process.env.ADMIN_USERNAME = previousUsername;
+      }
+      if (previousBeiaEmail === undefined) {
+        delete process.env.BEIA_ADMIN_EMAIL;
+      } else {
+        process.env.BEIA_ADMIN_EMAIL = previousBeiaEmail;
+      }
+      if (previousBeiaPassword === undefined) {
+        delete process.env.BEIA_ADMIN_PASSWORD;
+      } else {
+        process.env.BEIA_ADMIN_PASSWORD = previousBeiaPassword;
       }
       jest.resetModules();
     }

@@ -57,12 +57,15 @@ jobs:
         env:
           ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
           ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+          BEIA_API_KEY: ${{ secrets.BEIA_API_KEY }}
+          BEIA_ADMIN_EMAIL: ${{ secrets.BEIA_ADMIN_EMAIL }}
+          BEIA_ADMIN_PASSWORD: ${{ secrets.BEIA_ADMIN_PASSWORD }}
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: root
           key: ${{ secrets.SERVER_SSH_KEY }}
           command_timeout: 10m
-          envs: ADMIN_EMAIL,ADMIN_PASSWORD
+          envs: ADMIN_EMAIL,ADMIN_PASSWORD,BEIA_API_KEY,BEIA_ADMIN_EMAIL,BEIA_ADMIN_PASSWORD
           script: |
             set -euo pipefail
             cd /root/neverflat
@@ -77,6 +80,9 @@ jobs:
             updates = {
                 'ADMIN_EMAIL': os.environ['ADMIN_EMAIL'],
                 'ADMIN_PASSWORD': os.environ['ADMIN_PASSWORD'],
+                'BEIA_API_KEY': os.environ['BEIA_API_KEY'],
+                'BEIA_ADMIN_EMAIL': os.environ['BEIA_ADMIN_EMAIL'],
+                'BEIA_ADMIN_PASSWORD': os.environ['BEIA_ADMIN_PASSWORD'],
             }
             lines = path.read_text().splitlines() if path.exists() else []
             kept = [line for line in lines if not any(line.startswith(f'{key}=') for key in updates)]

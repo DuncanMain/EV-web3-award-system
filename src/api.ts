@@ -38,6 +38,7 @@ app.use(express.json());
 // Configuration
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY;
+const BEIA_API_KEY = process.env.BEIA_API_KEY;
 const INGEST_API_KEY = process.env.INGEST_API_KEY;
 const USER_IDENTITY_HEADER = (process.env.USER_IDENTITY_HEADER || 'x-contract-id').toLowerCase();
 const ENABLE_TEST_UID_LOOKUP = process.env.ENABLE_TEST_UID_LOOKUP !== 'false';
@@ -50,6 +51,8 @@ const ADMIN_ALERT_WEBHOOK_URL = process.env.ADMIN_ALERT_WEBHOOK_URL;
 // Admin credentials must be configured for admin login.
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || '').trim().toLowerCase();
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+const BEIA_ADMIN_EMAIL = (process.env.BEIA_ADMIN_EMAIL || '').trim().toLowerCase();
+const BEIA_ADMIN_PASSWORD = process.env.BEIA_ADMIN_PASSWORD;
 
 // In-memory admin session tokens
 const adminSessions = new Set<string>();
@@ -109,6 +112,13 @@ function isEmailAddress(value?: string | null): boolean {
 
 function getRegisteredAdminEmail(): string | null {
   return isEmailAddress(ADMIN_EMAIL) ? ADMIN_EMAIL : null;
+}
+
+function getRegisteredAdmins(): Array<{ email: string; password: string }> {
+  return [
+    { email: ADMIN_EMAIL, password: ADMIN_PASSWORD || '' },
+    { email: BEIA_ADMIN_EMAIL, password: BEIA_ADMIN_PASSWORD || '' },
+  ].filter((admin) => isEmailAddress(admin.email) && Boolean(admin.password));
 }
 
 async function getReadinessChecks(): Promise<Array<{
@@ -1071,7 +1081,7 @@ async function sendAdminAlert(data: {
  * Validates API_KEY header for protected endpoints
  */
 function validateApiKey(req: Request, res: Response, next: NextFunction): void {
-  if (!API_KEY) {
+  if (!API_KEY && !BEIA_API_KEY) {
     if (process.env.NODE_ENV === 'production') {
       res.status(503).json({
         status: 'error',
@@ -1099,7 +1109,7 @@ function validateApiKey(req: Request, res: Response, next: NextFunction): void {
     return;
   }
 
-  if (apiKey !== API_KEY) {
+  if (apiKey !== API_KEY && apiKey !== BEIA_API_KEY) {
     res.status(403).json({
       status: 'error',
       message: 'Invalid API key',
@@ -3967,8 +3977,9 @@ function validateAdmin(req: Request, res: Response, next: NextFunction): void {
 app.post('/admin/login', (req: Request, res: Response) => {
   const { username, email, password } = req.body;
   const submittedEmail = String(email || username || '').trim().toLowerCase();
-  const registeredAdminEmail = getRegisteredAdminEmail();
-  if (!registeredAdminEmail || !ADMIN_PASSWORD) {
+  const registeredAdmins = getRegisteredAdmins();
+  const registeredAdmin = registeredAdmins.find((admin) => admin.email === submittedEmail);
+  if (registeredAdmins.length === 0) {
     void safeAuditLog({
       eventType: 'admin.login_unconfigured',
       actorType: 'admin',
@@ -3977,8 +3988,8 @@ app.post('/admin/login', (req: Request, res: Response) => {
       targetId: null,
       status: 'error',
       metadata: {
-        adminEmailConfigured: Boolean(registeredAdminEmail),
-        adminPasswordConfigured: Boolean(ADMIN_PASSWORD),
+        adminEmailConfigured: false,
+        adminPasswordConfigured: false,
       },
     });
     res.status(503).json({
@@ -3988,7 +3999,7 @@ app.post('/admin/login', (req: Request, res: Response) => {
     return;
   }
 
-  if (submittedEmail !== registeredAdminEmail || password !== ADMIN_PASSWORD) {
+  if (!registeredAdmin || password !== registeredAdmin.password) {
     void safeAuditLog({
       eventType: 'admin.login_failed',
       actorType: 'admin',
@@ -4006,13 +4017,13 @@ app.post('/admin/login', (req: Request, res: Response) => {
   void safeAuditLog({
     eventType: 'admin.login_succeeded',
     actorType: 'admin',
-    actorId: registeredAdminEmail,
+    actorId: registeredAdmin.email,
     targetType: 'admin_session',
     targetId: token.slice(0, 8),
     status: 'success',
     metadata: {},
   });
-  res.json({ status: 'ok', token, adminEmail: registeredAdminEmail });
+  res.json({ status: 'ok', token, adminEmail: registeredAdmin.email });
 });
 
 /**
