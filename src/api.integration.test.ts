@@ -543,6 +543,23 @@ describe('api integration contracts', () => {
     });
     expect(invalidAmount.status).toBe(400);
     await expect(invalidAmount.json()).resolves.toMatchObject({ code: 'INVALID_AMOUNT' });
+
+    const overCap = await apiFetch('/spend/me', {
+      method: 'POST',
+      headers: { 'x-contract-id': 'contract-1' },
+      body: JSON.stringify({
+        sessionId: 'session-over-cap',
+        providerId: 'NF',
+        amount: 200.01,
+      }),
+    });
+    expect(overCap.status).toBe(400);
+    await expect(overCap.json()).resolves.toMatchObject({
+      code: 'TOKEN_AMOUNT_CAP_EXCEEDED',
+      operation: 'spend',
+      requestedAmount: 200.01,
+      maximumAmount: 200,
+    });
   });
 
   it('builds a retryable custodial spend intent', async () => {
@@ -595,6 +612,33 @@ describe('api integration contracts', () => {
       dedupKey: 'preview-session-1-preview-provider',
     });
     expect(body.normalised.sessionId).toBe('preview-session-1');
+  });
+
+  it('rejects CDR awards above the 200 SPARKZ operation cap', async () => {
+    const res = await apiFetch('/ingest/cdr/preview', {
+      method: 'POST',
+      headers: { 'X-Ingest-API-Key': 'test-ingest-key' },
+      body: JSON.stringify({
+        SessionID: 'preview-over-cap',
+        ProviderID: 'preview-provider',
+        EVSEID: 'DE*NVF*PREVIEW02',
+        cdr_token: { contract_id: 'contract-preview' },
+        StartTime: '2026-07-05T23:00:00.000Z',
+        EndTime: '2026-07-06T00:00:00.000Z',
+        Energy: '1000',
+        EnergyDirection: 'CHARGE',
+      }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(400);
+    expect(body).toMatchObject({
+      status: 'error',
+      code: 'TOKEN_AMOUNT_CAP_EXCEEDED',
+      operation: 'award',
+      maximumAmount: 200,
+    });
+    expect(body.requestedAmount).toBeGreaterThan(200);
   });
 
   it('audits skipped admin alert delivery when alert webhook is not configured', async () => {

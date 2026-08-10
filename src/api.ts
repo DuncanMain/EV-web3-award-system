@@ -28,6 +28,7 @@ import { normaliseSession } from './normaliser';
 import { prepareAward } from './awardExecutor';
 import { calculateReservationSettlement } from './reservation';
 import { buildReservationApprovalTransaction } from './reservationApproval';
+import { exceedsTokenOperationCap, MAX_TOKENS_PER_OPERATION } from './config/tokenLimits';
 
 const app = express();
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
@@ -229,6 +230,16 @@ function spendValidationError(res: Response, code: string, message: string, extr
     code,
     message,
     ...(extra || {}),
+  });
+}
+
+function tokenCapError(res: Response, operation: 'award' | 'spend', requestedAmount: number) {
+  return sendJsonError(res, 400, {
+    code: 'TOKEN_AMOUNT_CAP_EXCEEDED',
+    message: `${operation} amount cannot exceed ${MAX_TOKENS_PER_OPERATION} SPARKZ`,
+    operation,
+    requestedAmount,
+    maximumAmount: MAX_TOKENS_PER_OPERATION,
   });
 }
 
@@ -2495,6 +2506,10 @@ app.post('/ingest/cdr/preview', validateIngestApiKey, async (req: Request, res: 
     const normalised = normaliseSession(cdr);
     const award = prepareAward(normalised);
 
+    if (exceedsTokenOperationCap(award.amount)) {
+      return tokenCapError(res, 'award', award.amount);
+    }
+
     return res.status(200).json({
       status: 'preview',
       sideEffects: false,
@@ -2567,6 +2582,24 @@ app.post('/ingest/cdr', validateIngestApiKey, async (req: Request, res: Response
         status: 'error',
         message: 'Missing required fields: session id (SessionID or id), provider id (ProviderID, party_id, or custom_data.provider_id), and cdr_token.contract_id',
       });
+    }
+
+    const preparedAward = prepareAward(normaliseSession(cdr));
+    if (exceedsTokenOperationCap(preparedAward.amount)) {
+      await safeAuditLog({
+        eventType: 'award.validation_failed',
+        actorType: 'ingest_client',
+        actorId: String(providerId),
+        targetType: 'cdr',
+        targetId: String(sessionId),
+        status: 'error',
+        metadata: {
+          reason: 'token_amount_cap_exceeded',
+          requestedAmount: preparedAward.amount,
+          maximumAmount: MAX_TOKENS_PER_OPERATION,
+        },
+      });
+      return tokenCapError(res, 'award', preparedAward.amount);
     }
 
     const reservationSettlement = await settleReservationFromCdr(cdr);
@@ -2802,9 +2835,10 @@ app.post('/spend', validateApiKey, async (req: Request, res: Response) => {
   try {
     const { uid, sessionId, providerId, amount, label } = req.body;
     const normalizedUid = normalizeUid(String(uid || ''));
+    const amountValue = getPositiveAmount(amount);
 
     // Validate
-    if (!normalizedUid || !amount || amount <= 0) {
+    if (!normalizedUid || amountValue === null) {
       await safeAuditLog({
         eventType: 'spend.validation_failed',
         actorType: 'api_client',
@@ -2826,6 +2860,10 @@ app.post('/spend', validateApiKey, async (req: Request, res: Response) => {
       });
     }
 
+    if (exceedsTokenOperationCap(amountValue)) {
+      return tokenCapError(res, 'spend', amountValue);
+    }
+
     // Resolve uid to wallet address
     const walletConfig = await getUserWalletConfig(normalizedUid);
     const userAddress = walletConfig.managedWalletAddress;
@@ -2835,7 +2873,7 @@ app.post('/spend', validateApiKey, async (req: Request, res: Response) => {
     const spendResult = await processSpendWithAutoApproval({
       uid: normalizedUid,
       userAddress,
-      amount,
+      amount: amountValue,
       sessionId,
       auditContext: 'legacy',
       onApprovalFailure: async approvalErr => {
@@ -2953,6 +2991,9 @@ app.post('/spend/reservation-approval-intent', validateApiKey, async (req: Reque
     if (!sessionId || !providerId || amountValue === null) {
       return spendValidationError(res, 'INVALID_RESERVATION_APPROVAL', 'walletAddress, amount, sessionId and providerId are required');
     }
+    if (exceedsTokenOperationCap(amountValue)) {
+      return tokenCapError(res, 'spend', amountValue);
+    }
     const walletConfig = await getUserWalletConfig(normalizedUid);
     if (walletConfig.walletMode !== 'custodial') {
       return spendValidationError(res, 'MANAGED_WALLET_NO_APPROVAL_REQUIRED', 'Managed wallets do not require user authorization');
@@ -3056,6 +3097,10 @@ app.post('/spend/me', validateApiKey, async (req: Request, res: Response) => {
         },
       });
       return spendValidationError(res, 'INVALID_AMOUNT', 'amount must be greater than 0');
+    }
+
+    if (exceedsTokenOperationCap(amountValue)) {
+      return tokenCapError(res, 'spend', amountValue);
     }
 
     const walletConfig = await getUserWalletConfig(normalizedUid);

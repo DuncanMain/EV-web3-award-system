@@ -6,6 +6,7 @@ import { getContract } from './contract';
 import { getUserWalletConfig } from './user/userService';
 import { recordAward, approveUserForSpendingViaFunding } from './database/integration';
 import { getTreasuryAddress } from './treasury/treasuryConfig';
+import { exceedsTokenOperationCap, MAX_TOKENS_PER_OPERATION } from './config/tokenLimits';
 
 /**
  * Result of executing an award (from raw CDR through to on-chain execution)
@@ -127,6 +128,17 @@ export async function processAwardFromCDR(
         uid: normalised.uid,
         error: `Calculation failed: ${getErrorMessage(err)}`,
         stage: 'calculation',
+      });
+    }
+
+    if (exceedsTokenOperationCap(awardResult.amount)) {
+      return failedExecutionResult({
+        dedupKey: awardResult.dedupKey,
+        eligible: awardResult.eligible,
+        amount: awardResult.amount,
+        uid: awardResult.uid,
+        error: `TOKEN_AMOUNT_CAP_EXCEEDED: award amount cannot exceed ${MAX_TOKENS_PER_OPERATION} SPARKZ`,
+        stage: 'validation',
       });
     }
 
