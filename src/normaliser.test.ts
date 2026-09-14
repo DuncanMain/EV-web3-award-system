@@ -1,4 +1,4 @@
-import { normaliseSession } from './normaliser';
+import { normaliseSession, validateAndNormaliseCdr } from './normaliser';
 
 describe('normaliseSession', () => {
   it('should normalise a valid raw session with positive energy (CHARGE)', () => {
@@ -249,5 +249,86 @@ describe('normaliseSession', () => {
 
     expect(result.energyKWh).toBe(11040.483);
     expect(result.energyDirection).toBe('DISCHARGE');
+  });
+});
+
+describe('validateAndNormaliseCdr', () => {
+  const neverflatCdr = {
+    SessionID: 'session-20260914-001',
+    ProviderID: 'nvf-demo',
+    cdr_token: { contract_id: 'demo-user-001' },
+    EVSEID: 'DE*ABC*E*001',
+    StartTime: '2026-09-14T05:00:00.000Z',
+    EndTime: '2026-09-14T06:00:00.000Z',
+    Energy: '12',
+    EnergyDirection: 'CHARGE',
+  };
+
+  it('accepts the canonical NEVERFLAT CDR contract', () => {
+    expect(validateAndNormaliseCdr(neverflatCdr)).toMatchObject({
+      sessionId: 'session-20260914-001',
+      providerId: 'nvf-demo',
+      uid: 'demo-user-001',
+      evseId: 'DE*ABC*E*001',
+      energyKWh: 12,
+      energyDirection: 'CHARGE',
+    });
+  });
+
+  it('accepts the documented OCPI-style CDR contract', () => {
+    expect(validateAndNormaliseCdr({
+      id: 'cdr-session-20260914-001',
+      country_code: 'DE',
+      party_id: 'NF',
+      cdr_token: { contract_id: 'demo-user-001' },
+      cdr_location: { evse_id: 'DE*ABC*E*001' },
+      start_date_time: '2026-09-14T05:00:00.000Z',
+      end_date_time: '2026-09-14T06:00:00.000Z',
+      total_energy: 12,
+      energyDirection: 'CHARGE',
+    })).toMatchObject({
+      sessionId: 'cdr-session-20260914-001',
+      providerId: 'NF',
+      uid: 'demo-user-001',
+      evseId: 'DE*ABC*E*001',
+      energyKWh: 12,
+      energyDirection: 'CHARGE',
+    });
+  });
+
+  it.each([
+    ['EVSE identifier', { EVSEID: undefined }, 'evseId is required'],
+    ['start time', { StartTime: undefined }, 'start time is required'],
+    ['end time', { EndTime: undefined }, 'end time is required'],
+    ['energy', { Energy: undefined }, 'energy is required'],
+  ])('rejects a CDR without its required %s', (_label, override, expectedError) => {
+    expect(() => validateAndNormaliseCdr({ ...neverflatCdr, ...override }))
+      .toThrow(expectedError);
+  });
+
+  it('rejects an invalid explicit energy direction', () => {
+    expect(() => validateAndNormaliseCdr({
+      ...neverflatCdr,
+      EnergyDirection: 'EXPORT',
+    })).toThrow('energy direction must be CHARGE or DISCHARGE');
+  });
+
+  it('rejects a non-numeric energy value', () => {
+    expect(() => validateAndNormaliseCdr({
+      ...neverflatCdr,
+      Energy: 'not-a-number',
+    })).toThrow('energy must be a finite number');
+  });
+
+  it('rejects an invalid or chronologically impossible end time', () => {
+    expect(() => validateAndNormaliseCdr({
+      ...neverflatCdr,
+      EndTime: 'not-a-date',
+    })).toThrow('Invalid endTime');
+
+    expect(() => validateAndNormaliseCdr({
+      ...neverflatCdr,
+      EndTime: '2026-09-14T04:00:00.000Z',
+    })).toThrow('end time must not be before start time');
   });
 });

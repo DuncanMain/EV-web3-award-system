@@ -174,32 +174,37 @@ Do not leave `API_KEY`, `INGEST_API_KEY`, `ADMIN_EMAIL`, or
 ```bash
 POST /ingest/cdr
 Content-Type: application/json
-X-API-Key: your_api_key
+X-Ingest-API-Key: your_ingest_api_key
 
 {
   "SessionID": "session-123",
   "ProviderID": "provider-456",
-  "UID": "contract-123",
+  "cdr_token": {
+    "contract_id": "contract-123"
+  },
   "EVSEID": "DE*ABC*E*001",
   "StartTime": "2026-04-20T10:00:00Z",
   "EndTime": "2026-04-20T11:00:00Z",
-  "EnergyKWh": 10,
+  "Energy": "10",
   "EnergyDirection": "CHARGE"
 }
 ```
 
-Note: UID is a legacy request field name. Pass contract ID in this field.
+Use a unique `SessionID` for every final CDR. The contract ID belongs in
+`cdr_token.contract_id`. Validate provider payloads safely with
+`POST /ingest/cdr/preview` before calling the settlement endpoint.
 
 **Response:**
 ```json
 {
-  "status": "success",
+  "status": "accepted",
+  "sessionId": "session-123",
+  "providerId": "provider-456",
   "uid": "contract-123",
-  "dedupKey": "session-123:provider-456",
-  "awarded": true,
-  "amount": 2.5,
+  "eligible": true,
+  "tokensAwarded": 2.5,
   "txHash": "0x...",
-  "timestamp": "2026-04-20T11:05:00Z"
+  "message": "2.5 SPARKZ awarded"
 }
 ```
 

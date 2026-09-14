@@ -78,6 +78,10 @@ ingestion/rule performance evidence.
 
 Requires the same ingest authentication as `/ingest/cdr`.
 
+**Request:** use either complete request format documented for `/ingest/cdr`.
+The canonical NEVERFLAT format is recommended. The preview endpoint is safe for
+payload validation because it has no database or blockchain side effects.
+
 **Response:**
 ```json
 {
@@ -106,28 +110,58 @@ Requires the same ingest authentication as `/ingest/cdr`.
 
 Accept raw CDR data from charging network and process award if eligible.
 
-Note: the CDR payload uses `UID` as a legacy key name. Provide your contract ID in this field.
+Use `X-Ingest-API-Key` with the dedicated ingest credential. `X-API-Key` is
+also accepted for compatibility. Each `SessionID` must be unique.
 
-**Request:**
+**Canonical request (recommended):**
 ```json
 {
-  "SessionID": "sess-12345",
-  "ProviderID": "prov-DE",
-  "EVSEID": "DE*ABC*E12345",
-  "UID": "user-123",
-  "Session Start": "2026-04-16T05:00:00Z",
-  "Session End": "2026-04-16T05:30:00Z",
-  "Consumed Energy": "40"
+  "SessionID": "session-20260914-001",
+  "ProviderID": "nvf-demo",
+  "cdr_token": {
+    "contract_id": "demo-user-001"
+  },
+  "EVSEID": "DE*ABC*E*001",
+  "StartTime": "2026-09-14T05:00:00.000Z",
+  "EndTime": "2026-09-14T06:00:00.000Z",
+  "Energy": "12",
+  "EnergyDirection": "CHARGE"
 }
 ```
+
+The country prefix in `EVSEID` drives the country-specific reward rules.
+`EnergyDirection` must be `CHARGE` or `DISCHARGE`.
+
+**Supported OCPI-style request:**
+```json
+{
+  "id": "cdr-session-20260914-001",
+  "country_code": "DE",
+  "party_id": "NF",
+  "cdr_token": {
+    "contract_id": "demo-user-001"
+  },
+  "cdr_location": {
+    "evse_id": "DE*ABC*E*001"
+  },
+  "start_date_time": "2026-09-14T05:00:00.000Z",
+  "end_date_time": "2026-09-14T06:00:00.000Z",
+  "total_energy": 12,
+  "energyDirection": "CHARGE"
+}
+```
+
+Do not combine fields from the two request formats. In the OCPI-style request,
+`energyDirection` is optional and otherwise inferred from the sign of
+`total_energy`.
 
 **Response (Accepted & Eligible):**
 ```json
 {
   "status": "accepted",
-  "SessionID": "sess-12345",
-  "ProviderID": "prov-DE",
-  "uid": "user-123",
+  "sessionId": "session-20260914-001",
+  "providerId": "nvf-demo",
+  "uid": "demo-user-001",
   "eligible": true,
   "tokensAwarded": 10,
   "txHash": "0x...",
@@ -139,8 +173,8 @@ Note: the CDR payload uses `UID` as a legacy key name. Provide your contract ID 
 ```json
 {
   "status": "duplicate",
-  "SessionID": "sess-12345",
-  "ProviderID": "prov-DE",
+  "sessionId": "session-20260914-001",
+  "providerId": "nvf-demo",
   "message": "CDR already processed"
 }
 ```
@@ -149,8 +183,8 @@ Note: the CDR payload uses `UID` as a legacy key name. Provide your contract ID 
 ```json
 {
   "status": "accepted",
-  "SessionID": "sess-12345",
-  "ProviderID": "prov-DE",
+  "sessionId": "session-20260914-001",
+  "providerId": "nvf-demo",
   "eligible": false,
   "message": "CDR accepted but not eligible for reward"
 }
@@ -690,7 +724,7 @@ All endpoints return structured error responses:
 
 | Error | Cause | Solution |
 |-------|-------|----------|
-| `Missing required fields` | CDR missing SessionID, ProviderID, or contract ID (field `UID`) | Verify CDR format |
+| `INVALID_CDR` | CDR is missing its session, provider, contract, EVSE, time, or energy data | Send one complete documented CDR format, or validate it with `/ingest/cdr/preview` |
 | `invalid signature` | Treasury key doesn't match address | Check TREASURY_SIGNER_KEY config |
 | `insufficient allowance` | User hasn't approved treasury for spend | Requires on-chain approval first |
 | `Database not available` | PostgreSQL not running | Start DB: `docker compose up -d postgres` |
@@ -703,14 +737,16 @@ All endpoints return structured error responses:
 ```bash
 curl -X POST http://localhost:3000/ingest/cdr \
   -H "Content-Type: application/json" \
+  -H "X-Ingest-API-Key: your_ingest_api_key" \
   -d '{
     "SessionID": "sess-001",
     "ProviderID": "prov-DE",
+    "cdr_token": { "contract_id": "user-flow-test" },
     "EVSEID": "DE*ABC*E12345",
-    "UID": "user-flow-test",
-    "Session Start": "2026-04-15T23:00:00Z",
-    "Session End": "2026-04-15T23:30:00Z",
-    "Consumed Energy": "40"
+    "StartTime": "2026-04-15T23:00:00Z",
+    "EndTime": "2026-04-15T23:30:00Z",
+    "Energy": "40",
+    "EnergyDirection": "CHARGE"
   }'
 ```
 
@@ -867,7 +903,9 @@ Successful response:
 
 OpenAPI/Swagger note: the live Swagger spec is embedded in `src/api.ts` and is
 served by the API at `/openapi.json`, `/api-docs`, and `/docs`. Keep this
-document and the embedded spec in sync when endpoints change.
+document and the embedded spec in sync when endpoints change. The documented
+CDR examples are exercised through the side-effect-free preview endpoint by the
+API integration test suite.
 
 ---
 

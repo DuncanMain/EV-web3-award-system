@@ -17,14 +17,14 @@ import { approveUserForSpendingViaFunding, moveFundsFromManagedWallet, recordSpe
 import { getManagedWalletAddress, getUserWalletConfig, resolveActiveUidAddress, setUserWalletMode, WalletMode } from './user/userService';
 import { Awards, Spends, Users, Balances, LinkedWallets, SpendReceipts, SpendReservations, AuditLogs, ReconciliationReports } from './database/service';
 import type { AuditLogRecord } from './database/service';
-import { RawSession, OCPICDRFormat, SpendExecutionResult } from './types';
+import { RawSession, OCPICDRFormat, NormalisedSession, SpendExecutionResult } from './types';
 import { getRules, setRules, AwardRuleConfig } from './config/awardRules';
 import { getOffPeakWindows, setOffPeakWindows } from './config/offPeakWindows';
 import { TimeRange, OffPeakConfig } from './types';
 import { createSpendReceiptPayload, signSpendReceipt, SignedSpendReceipt, verifySpendReceipt } from './receipt';
 import { reconcileBalance, summarizeReconciliation } from './reconciliation';
 import { getDatabase } from './database/connection';
-import { normaliseSession } from './normaliser';
+import { validateAndNormaliseCdr } from './normaliser';
 import { prepareAward } from './awardExecutor';
 import { calculateReservationSettlement } from './reservation';
 import { buildReservationApprovalTransaction } from './reservationApproval';
@@ -573,8 +573,7 @@ async function processSpendWithAutoApproval(input: {
   return spendResult;
 }
 
-async function settleReservationFromCdr(cdr: RawSession | OCPICDRFormat) {
-  const session = normaliseSession(cdr);
+async function settleReservationFromCdr(session: NormalisedSession) {
   const reservation = await SpendReservations.claimForSettlement(session.uid, session.sessionId, session.providerId);
   if (!reservation) return null;
   const deliveredKwh = session.energyDirection === 'CHARGE' ? session.energyKWh : 0;
@@ -1132,7 +1131,49 @@ function validateApiKey(req: Request, res: Response, next: NextFunction): void {
 }
 
 function buildOpenApiSpec(req: Request) {
-  const baseUrl = `${req.protocol}://${req.get('host')}`;
+  const forwardedProtocol = req.get('x-forwarded-proto')?.split(',')[0]?.trim();
+  const protocol = forwardedProtocol || (process.env.NODE_ENV === 'production' ? 'https' : req.protocol);
+  const baseUrl = `${protocol}://${req.get('host')}`;
+  const cdrRequestExamples = {
+    neverflat: {
+      summary: 'Canonical NEVERFLAT payload (recommended)',
+      description: 'This is the payload format used by the NEVERFLAT admin panel.',
+      value: {
+        SessionID: 'session-20260914-001',
+        ProviderID: 'nvf-demo',
+        cdr_token: { contract_id: 'demo-user-001' },
+        EVSEID: 'DE*ABC*E*001',
+        StartTime: '2026-09-14T05:00:00.000Z',
+        EndTime: '2026-09-14T06:00:00.000Z',
+        Energy: '12',
+        EnergyDirection: 'CHARGE',
+      },
+    },
+    ocpi: {
+      summary: 'OCPI-style payload',
+      description: 'Supported compatibility format. The EVSE country prefix is used for reward rules.',
+      value: {
+        id: 'cdr-session-20260914-001',
+        country_code: 'DE',
+        party_id: 'NF',
+        cdr_token: { contract_id: 'demo-user-001' },
+        cdr_location: { evse_id: 'DE*ABC*E*001' },
+        start_date_time: '2026-09-14T05:00:00.000Z',
+        end_date_time: '2026-09-14T06:00:00.000Z',
+        total_energy: 12,
+        energyDirection: 'CHARGE',
+      },
+    },
+  };
+  const cdrRequestBody = {
+    required: true,
+    content: {
+      'application/json': {
+        schema: { $ref: '#/components/schemas/CdrRequest' },
+        examples: cdrRequestExamples,
+      },
+    },
+  };
   const errorResponse = {
     description: 'Request failed. Inspect `message` or `error` for the specific cause.',
     content: {
@@ -1186,14 +1227,41 @@ function buildOpenApiSpec(req: Request) {
       },
     },
   };
+  const invalidCdrResponse = {
+    description: 'The CDR is incomplete, malformed, or internally inconsistent.',
+    content: {
+      'application/json': {
+        schema: { $ref: '#/components/schemas/ErrorResponse' },
+        examples: {
+          missingEvse: {
+            summary: 'Required EVSE identifier is missing',
+            value: {
+              status: 'error',
+              code: 'INVALID_CDR',
+              message: 'evseId is required',
+            },
+          },
+          invalidDirection: {
+            summary: 'Energy direction is invalid',
+            value: {
+              status: 'error',
+              code: 'INVALID_CDR',
+              message: 'energy direction must be CHARGE or DISCHARGE',
+            },
+          },
+        },
+      },
+    },
+  };
   const apiKeySecurity = [{ ApiKeyAuth: [] }];
+  const ingestApiKeySecurity = [{ IngestApiKeyAuth: [] }, { ApiKeyAuth: [] }];
   const adminSecurity = [{ AdminBearerAuth: [] }];
 
   return {
     openapi: '3.0.3',
     info: {
       title: 'NEVERFLAT SPARKZ Award System API',
-      version: '1.0.0',
+      version: '1.1.0',
       description: 'Backend API for CDR ingestion, SPARKZ rewards, spends, wallet management, and award administration.',
     },
     servers: [{ url: baseUrl }],
@@ -1232,15 +1300,9 @@ function buildOpenApiSpec(req: Request) {
         post: {
           tags: ['Awards'],
           summary: 'Ingest a charging CDR and award SPARKZ if eligible',
-          security: apiKeySecurity,
-          requestBody: {
-            required: true,
-            content: {
-              'application/json': {
-                schema: { $ref: '#/components/schemas/CdrRequest' },
-              },
-            },
-          },
+          description: 'Processes a final CDR. Use the canonical NEVERFLAT example unless an OCPI payload is required. Session IDs must be unique.',
+          security: ingestApiKeySecurity,
+          requestBody: cdrRequestBody,
           responses: {
             200: {
               description: 'CDR accepted, duplicate, or accepted but not eligible',
@@ -1250,10 +1312,32 @@ function buildOpenApiSpec(req: Request) {
                 },
               },
             },
-            400: errorResponse,
+            400: invalidCdrResponse,
             401: errorResponse,
             403: errorResponse,
             500: errorResponse,
+          },
+        },
+      },
+      '/ingest/cdr/preview': {
+        post: {
+          tags: ['Awards'],
+          summary: 'Validate and preview a CDR without side effects',
+          description: 'Runs the same validation, normalisation, and reward rules as ingestion without database writes or blockchain settlement.',
+          security: ingestApiKeySecurity,
+          requestBody: cdrRequestBody,
+          responses: {
+            200: {
+              description: 'CDR is valid and the reward calculation was previewed',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/CdrPreviewResponse' },
+                },
+              },
+            },
+            400: invalidCdrResponse,
+            401: errorResponse,
+            403: errorResponse,
           },
         },
       },
@@ -1876,6 +1960,12 @@ function buildOpenApiSpec(req: Request) {
           in: 'header',
           name: 'X-API-Key',
         },
+        IngestApiKeyAuth: {
+          type: 'apiKey',
+          in: 'header',
+          name: 'X-Ingest-API-Key',
+          description: 'Dedicated CDR ingestion key. X-API-Key is also accepted for compatibility.',
+        },
         AdminBearerAuth: {
           type: 'http',
           scheme: 'bearer',
@@ -1952,34 +2042,112 @@ function buildOpenApiSpec(req: Request) {
           },
         },
         CdrRequest: {
+          description: 'A complete final CDR in either the canonical NEVERFLAT format or the supported OCPI-style format. Do not combine the two formats in one request.',
+          oneOf: [
+            { $ref: '#/components/schemas/NeverflatCdrRequest' },
+            { $ref: '#/components/schemas/OcpiCdrRequest' },
+          ],
+        },
+        CdrToken: {
           type: 'object',
-          required: ['id', 'party_id', 'cdr_token'],
+          required: ['contract_id'],
           properties: {
-            id: { type: 'string', example: 'cdr-session-001' },
-            party_id: { type: 'string', example: 'NF' },
-            custom_data: {
-              type: 'object',
-              properties: {
-                provider_id: { type: 'string', example: 'NF' },
-              },
+            contract_id: {
+              type: 'string',
+              minLength: 1,
+              description: 'External contract ID. For the demo account use demo-user-001.',
+              example: 'demo-user-001',
             },
-            cdr_token: {
+            uid: { type: 'string', description: 'Optional OCPI token UID.' },
+            type: { type: 'string', description: 'Optional OCPI token type.' },
+            country_code: { type: 'string', minLength: 2, maxLength: 2 },
+            party_id: { type: 'string' },
+          },
+          additionalProperties: true,
+        },
+        NeverflatCdrRequest: {
+          type: 'object',
+          title: 'Canonical NEVERFLAT CDR',
+          description: 'Recommended public integration contract and the format used by the admin panel.',
+          required: [
+            'SessionID',
+            'ProviderID',
+            'cdr_token',
+            'EVSEID',
+            'StartTime',
+            'EndTime',
+            'Energy',
+            'EnergyDirection',
+          ],
+          properties: {
+            SessionID: { type: 'string', minLength: 1, example: 'session-20260914-001' },
+            ProviderID: { type: 'string', minLength: 1, example: 'nvf-demo' },
+            cdr_token: { $ref: '#/components/schemas/CdrToken' },
+            EVSEID: {
+              type: 'string',
+              minLength: 2,
+              description: 'EVSE identifier. Its country prefix drives country-specific reward rules.',
+              example: 'DE*ABC*E*001',
+            },
+            StartTime: { type: 'string', format: 'date-time' },
+            EndTime: { type: 'string', format: 'date-time' },
+            Energy: {
+              type: 'string',
+              pattern: '^-?[0-9]+(?:\\.[0-9]+)*$',
+              description: 'Energy in kWh. A numeric string is used by the admin integration.',
+              example: '12',
+            },
+            EnergyDirection: {
+              type: 'string',
+              enum: ['CHARGE', 'DISCHARGE'],
+              example: 'CHARGE',
+            },
+          },
+          additionalProperties: false,
+        },
+        OcpiCdrRequest: {
+          type: 'object',
+          title: 'OCPI-style CDR',
+          description: 'Supported compatibility contract. energyDirection is optional; when omitted, the sign of total_energy determines direction.',
+          required: [
+            'id',
+            'party_id',
+            'cdr_token',
+            'cdr_location',
+            'start_date_time',
+            'end_date_time',
+            'total_energy',
+          ],
+          properties: {
+            id: { type: 'string', minLength: 1, example: 'cdr-session-20260914-001' },
+            country_code: {
+              type: 'string',
+              minLength: 2,
+              maxLength: 2,
+              description: 'OCPI party country code. Reward rules use the EVSE ID country prefix.',
+              example: 'DE',
+            },
+            party_id: { type: 'string', minLength: 1, example: 'NF' },
+            cdr_token: { $ref: '#/components/schemas/CdrToken' },
+            cdr_location: {
               type: 'object',
-              required: ['contract_id'],
+              required: ['evse_id'],
               properties: {
-                contract_id: { type: 'string', example: '000' },
+                evse_id: { type: 'string', minLength: 2, example: 'DE*ABC*E*001' },
               },
+              additionalProperties: true,
             },
             start_date_time: { type: 'string', format: 'date-time' },
             end_date_time: { type: 'string', format: 'date-time' },
             total_energy: { type: 'number', example: 40 },
-            country_code: { type: 'string', example: 'GB' },
-            SessionID: { type: 'string', example: 'legacy-session-001' },
-            ProviderID: { type: 'string', example: 'NF' },
-            'Session Start': { type: 'string', format: 'date-time' },
-            'Session End': { type: 'string', format: 'date-time' },
-            'Consumed Energy': { type: 'string', example: '40' },
+            energyDirection: {
+              type: 'string',
+              enum: ['CHARGE', 'DISCHARGE'],
+              description: 'Optional explicit override for the sign-based direction inference.',
+              example: 'CHARGE',
+            },
           },
+          additionalProperties: false,
         },
         CdrResponse: {
           type: 'object',
@@ -1992,6 +2160,38 @@ function buildOpenApiSpec(req: Request) {
             tokensAwarded: { type: 'number', example: 10 },
             txHash: { type: 'string', example: '0xabc...' },
             message: { type: 'string', example: '10 SPARKZ awarded' },
+            reservationSettlement: {
+              type: 'object',
+              nullable: true,
+              additionalProperties: true,
+            },
+          },
+        },
+        CdrPreviewResponse: {
+          type: 'object',
+          required: ['status', 'sideEffects', 'eligible', 'tokensAwarded', 'uid', 'dedupKey', 'normalised'],
+          properties: {
+            status: { type: 'string', enum: ['preview'], example: 'preview' },
+            sideEffects: { type: 'boolean', enum: [false], example: false },
+            eligible: { type: 'boolean', example: true },
+            tokensAwarded: { type: 'number', example: 3 },
+            uid: { type: 'string', example: 'demo-user-001' },
+            dedupKey: { type: 'string', example: 'session-20260914-001-nvf-demo' },
+            normalised: {
+              type: 'object',
+              required: ['sessionId', 'providerId', 'uid', 'evseId', 'startTime', 'endTime', 'energyKWh', 'energyDirection'],
+              properties: {
+                sessionId: { type: 'string' },
+                providerId: { type: 'string' },
+                uid: { type: 'string' },
+                evseId: { type: 'string' },
+                startTime: { type: 'string', format: 'date-time' },
+                endTime: { type: 'string', format: 'date-time' },
+                energyKWh: { type: 'number' },
+                energyDirection: { type: 'string', enum: ['CHARGE', 'DISCHARGE'] },
+              },
+            },
+            metadata: { type: 'object', additionalProperties: true },
           },
         },
         SpendSessionRequest: {
@@ -2503,7 +2703,7 @@ app.post('/spend-receipts/verify', validateApiKey, (req: Request, res: Response)
 app.post('/ingest/cdr/preview', validateIngestApiKey, async (req: Request, res: Response) => {
   try {
     const cdr: RawSession | OCPICDRFormat = req.body;
-    const normalised = normaliseSession(cdr);
+    const normalised = validateAndNormaliseCdr(cdr);
     const award = prepareAward(normalised);
 
     if (exceedsTokenOperationCap(award.amount)) {
@@ -2543,7 +2743,8 @@ app.post('/ingest/cdr/preview', validateIngestApiKey, async (req: Request, res: 
     });
     return res.status(400).json({
       status: 'error',
-      message: err instanceof Error ? err.message : String(err),
+      code: 'INVALID_CDR',
+      message: getErrorMessage(err),
     });
   }
 });
@@ -2559,32 +2760,32 @@ app.post('/ingest/cdr', validateIngestApiKey, async (req: Request, res: Response
   try {
     const cdr: RawSession | OCPICDRFormat = req.body;
 
-    // Validate required fields — supports both legacy flat format and OCPI 2.2 format
-    const sessionId = cdr.SessionID || cdr.id;
-    const providerId = cdr.ProviderID || cdr.custom_data?.provider_id || cdr.party_id;
-    const contractId = cdr.cdr_token?.contract_id || cdr.cdr_token_contract_id;
-
-    if (!sessionId || !providerId || !contractId) {
+    let normalised: NormalisedSession;
+    try {
+      normalised = validateAndNormaliseCdr(cdr);
+    } catch (validationError) {
       await safeAuditLog({
         eventType: 'award.validation_failed',
         actorType: 'ingest_client',
-        actorId: providerId ? String(providerId) : null,
+        actorId: cdr?.ProviderID || cdr?.party_id || cdr?.custom_data?.provider_id || null,
         targetType: 'cdr',
-        targetId: sessionId ? String(sessionId) : null,
+        targetId: cdr?.SessionID || cdr?.id || null,
         status: 'error',
         metadata: {
-          sessionId,
-          providerId,
-          reason: 'missing_required_fields',
+          reason: 'invalid_cdr',
+          error: getErrorMessage(validationError),
         },
       });
       return res.status(400).json({
         status: 'error',
-        message: 'Missing required fields: session id (SessionID or id), provider id (ProviderID, party_id, or custom_data.provider_id), and cdr_token.contract_id',
+        code: 'INVALID_CDR',
+        message: getErrorMessage(validationError),
       });
     }
 
-    const preparedAward = prepareAward(normaliseSession(cdr));
+    const { sessionId, providerId, uid: contractId } = normalised;
+
+    const preparedAward = prepareAward(normalised);
     if (exceedsTokenOperationCap(preparedAward.amount)) {
       await safeAuditLog({
         eventType: 'award.validation_failed',
@@ -2602,7 +2803,7 @@ app.post('/ingest/cdr', validateIngestApiKey, async (req: Request, res: Response
       return tokenCapError(res, 'award', preparedAward.amount);
     }
 
-    const reservationSettlement = await settleReservationFromCdr(cdr);
+    const reservationSettlement = await settleReservationFromCdr(normalised);
 
     // Check for duplicates
     const dedupKey = `${sessionId}-${providerId}`;

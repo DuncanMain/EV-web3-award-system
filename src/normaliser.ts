@@ -102,3 +102,65 @@ export function normaliseSession(raw: RawSession | OCPICDRFormat): NormalisedSes
     energyDirection,
   };
 }
+
+function hasCdrValue(value: unknown): boolean {
+  return value !== undefined && value !== null && String(value).trim() !== '';
+}
+
+/**
+ * Validates the fields required at the HTTP ingestion boundary before applying
+ * the flexible legacy/OCPI normalisation rules. Keeping this separate from
+ * normaliseSession preserves backwards compatibility for internal callers while
+ * ensuring incomplete final CDRs receive a clear 400 response from the API.
+ */
+export function validateAndNormaliseCdr(raw: RawSession | OCPICDRFormat): NormalisedSession {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('CDR request body must be a JSON object');
+  }
+
+  const startTime = raw["Session Start"] || raw["Charging Start"] || raw.StartTime ||
+    raw.timestamp || raw.start_date_time;
+  if (!hasCdrValue(startTime)) {
+    throw new Error('start time is required (StartTime or start_date_time)');
+  }
+  if (Number.isNaN(new Date(String(startTime)).getTime())) {
+    throw new Error('Invalid startTime');
+  }
+
+  const endTime = raw["Session End"] || raw["Charging End"] || raw.EndTime || raw.end_date_time;
+  if (!hasCdrValue(endTime)) {
+    throw new Error('end time is required (EndTime or end_date_time)');
+  }
+  if (Number.isNaN(new Date(String(endTime)).getTime())) {
+    throw new Error('Invalid endTime');
+  }
+
+  const energy = [
+    raw["Consumed Energy"],
+    raw.Energy,
+    raw.chargedEnergyKwh,
+    raw.charged,
+    raw.total_energy,
+  ].find(hasCdrValue);
+  if (!hasCdrValue(energy)) {
+    throw new Error('energy is required (Energy or total_energy)');
+  }
+
+  const explicitDirection = raw.EnergyDirection || raw.energyDirection;
+  if (hasCdrValue(explicitDirection) && explicitDirection !== 'CHARGE' && explicitDirection !== 'DISCHARGE') {
+    throw new Error('energy direction must be CHARGE or DISCHARGE');
+  }
+
+  const normalised = normaliseSession(raw);
+  if (typeof normalised.evseId !== 'string') {
+    throw new Error('EVSE identifier must be a string');
+  }
+  if (!Number.isFinite(normalised.energyKWh)) {
+    throw new Error('energy must be a finite number');
+  }
+  if (normalised.endTime.getTime() < normalised.startTime.getTime()) {
+    throw new Error('end time must not be before start time');
+  }
+
+  return normalised;
+}

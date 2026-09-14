@@ -171,6 +171,9 @@ describe('api integration contracts', () => {
 
     expect(res.status).toBe(200);
     expect(body.openapi).toBe('3.0.3');
+    expect(body.info.version).toBe('1.1.0');
+    expect(body.paths['/ingest/cdr']).toBeDefined();
+    expect(body.paths['/ingest/cdr/preview']).toBeDefined();
     expect(body.paths['/spend/session']).toBeDefined();
     expect(body.paths['/spend/reservations/{reservationId}']).toBeDefined();
     expect(body.components.schemas.ReservationStatusResponse).toBeDefined();
@@ -191,6 +194,90 @@ describe('api integration contracts', () => {
       'sessionId',
       'providerId',
     ]));
+    expect(body.components.schemas.CdrRequest.oneOf).toEqual([
+      { $ref: '#/components/schemas/NeverflatCdrRequest' },
+      { $ref: '#/components/schemas/OcpiCdrRequest' },
+    ]);
+    expect(body.components.schemas.NeverflatCdrRequest.required).toEqual(expect.arrayContaining([
+      'SessionID',
+      'ProviderID',
+      'cdr_token',
+      'EVSEID',
+      'StartTime',
+      'EndTime',
+      'Energy',
+      'EnergyDirection',
+    ]));
+    expect(body.components.schemas.OcpiCdrRequest.required).toEqual(expect.arrayContaining([
+      'id',
+      'party_id',
+      'cdr_token',
+      'cdr_location',
+      'start_date_time',
+      'end_date_time',
+      'total_energy',
+    ]));
+    expect(body.components.securitySchemes.IngestApiKeyAuth.name).toBe('X-Ingest-API-Key');
+    expect(body.paths['/ingest/cdr'].post.responses['400'].content['application/json']
+      .examples.missingEvse.value).toMatchObject({
+        code: 'INVALID_CDR',
+        message: 'evseId is required',
+      });
+  });
+
+  it('uses the forwarded HTTPS scheme in the published server URL', async () => {
+    const res = await fetch(`${baseUrl}/openapi.json`, {
+      headers: { 'x-forwarded-proto': 'https' },
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body.servers[0].url).toMatch(/^https:\/\//);
+  });
+
+  it('keeps every documented CDR example executable through the side-effect-free preview', async () => {
+    const specRes = await fetch(`${baseUrl}/openapi.json`);
+    const spec = await specRes.json();
+    const examples = spec.paths['/ingest/cdr'].post.requestBody.content['application/json'].examples;
+
+    expect(Object.keys(examples)).toEqual(['neverflat', 'ocpi']);
+    for (const example of Object.values(examples) as Array<{ value: Record<string, unknown> }>) {
+      const previewRes = await apiFetch('/ingest/cdr/preview', {
+        method: 'POST',
+        headers: { 'X-Ingest-API-Key': 'test-ingest-key' },
+        body: JSON.stringify(example.value),
+      });
+      const preview = await previewRes.json();
+
+      expect(previewRes.status).toBe(200);
+      expect(preview.status).toBe('preview');
+      expect(preview.sideEffects).toBe(false);
+      expect(preview.normalised.evseId).toBe('DE*ABC*E*001');
+    }
+  });
+
+  it('returns a specific 400 response when a CDR omits its EVSE identifier', async () => {
+    const res = await apiFetch('/ingest/cdr', {
+      method: 'POST',
+      headers: { 'X-Ingest-API-Key': 'test-ingest-key' },
+      body: JSON.stringify({
+        SessionID: 'invalid-cdr-without-evse',
+        ProviderID: 'nvf-demo',
+        cdr_token: { contract_id: 'demo-user-001' },
+        StartTime: '2026-09-14T05:00:00.000Z',
+        EndTime: '2026-09-14T06:00:00.000Z',
+        Energy: '12',
+        EnergyDirection: 'CHARGE',
+      }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(400);
+    expect(body).toMatchObject({
+      status: 'error',
+      code: 'INVALID_CDR',
+      message: 'evseId is required',
+    });
   });
 
   it('accepts the dedicated BEIA API key', async () => {

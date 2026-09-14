@@ -373,14 +373,15 @@ Use `processAwardFromCDR()` for end-to-end orchestration from raw CDR to on-chai
 import { processAwardFromCDR } from 'nvf-award-core';
 
 // Raw CDR from charging provider
-const ocpiCDR = {
+const neverflatCDR = {
   SessionID: 'a1b09f5b-b75d-4c9e-aef2-4f0c74cc7623',
   ProviderID: 'DE-NWQ',
+  cdr_token: { contract_id: '0475804AA47330' },
   EVSEID: 'DE*GUC*E*EZO*0877',
-  "Session Start": '2026-02-16T02:00:00Z',  // Off-peak in DE
-  "Session End": '2026-02-16T03:00:00Z',
-  "Consumed Energy": '40',  // 40 kWh charged
-  UID: '0475804AA47330',  // Contract ID from source payload - address auto-resolved from this
+  StartTime: '2026-02-16T02:00:00Z',  // Off-peak in DE
+  EndTime: '2026-02-16T03:00:00Z',
+  Energy: '40',  // 40 kWh charged
+  EnergyDirection: 'CHARGE',
 };
 
 // Get treasury signer
@@ -389,9 +390,9 @@ const treasurySigner = await getTreasurySigner();
 // Single function handles all stages:
 // 1. Normalise CDR
 // 2. Calculate tokens based on rules
-// 3. Resolve contract ID (from UID field) -> Polygon address (creates if first time)
+// 3. Resolve contract ID (from cdr_token.contract_id) -> Polygon address (creates if first time)
 // 4. Execute on-chain token transfer
-const result = await processAwardFromCDR(ocpiCDR, treasurySigner);
+const result = await processAwardFromCDR(neverflatCDR, treasurySigner);
 
 console.log(result);
 // {
@@ -413,7 +414,7 @@ Prevent double-processing by checking if the session was already awarded:
 const treasurySigner = await getTreasurySigner();
 
 const result = await processAwardFromCDR(
-  ocpiCDR,
+  neverflatCDR,
   treasurySigner,
   async (dedupKey) => {
     // Check your DB for existing award
