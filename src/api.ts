@@ -1254,7 +1254,7 @@ function buildOpenApiSpec(req: Request) {
     },
   };
   const apiKeySecurity = [{ ApiKeyAuth: [] }];
-  const ingestApiKeySecurity = [{ IngestApiKeyAuth: [] }, { ApiKeyAuth: [] }];
+  const ingestApiKeySecurity = [{ IngestApiKeyAuth: [] }, { ApiKeyAuth: [] }, { AdminBearerAuth: [] }];
   const adminSecurity = [{ AdminBearerAuth: [] }];
 
   return {
@@ -1964,7 +1964,7 @@ function buildOpenApiSpec(req: Request) {
           type: 'apiKey',
           in: 'header',
           name: 'X-Ingest-API-Key',
-          description: 'Dedicated CDR ingestion key. X-API-Key is also accepted for compatibility.',
+          description: 'CDR ingestion credential. A dedicated key is enforced when configured; otherwise an issued API key is accepted. X-API-Key is also supported.',
         },
         AdminBearerAuth: {
           type: 'http',
@@ -2615,20 +2615,35 @@ app.get(['/api-docs', '/docs'], (_req: Request, res: Response) => {
 });
 
 function validateIngestApiKey(req: Request, res: Response, next: NextFunction): void {
-  if (!INGEST_API_KEY) {
-    return validateApiKey(req, res, next);
+  const auth = req.header('Authorization');
+  const adminToken = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (adminToken && adminSessions.has(adminToken)) {
+    return next();
   }
 
   const apiKey = req.header('X-Ingest-API-Key') || req.header('X-API-Key');
-  if (!apiKey) {
-    res.status(401).json({
+  const acceptedKeys = (INGEST_API_KEY
+    ? [INGEST_API_KEY, BEIA_API_KEY]
+    : [API_KEY, BEIA_API_KEY]
+  ).filter((key): key is string => Boolean(key));
+
+  if (acceptedKeys.length === 0) {
+    res.status(503).json({
       status: 'error',
-      message: 'Missing ingest API key: X-Ingest-API-Key header required',
+      message: 'Ingest API key authentication is not configured',
     });
     return;
   }
 
-  if (apiKey !== INGEST_API_KEY && apiKey !== BEIA_API_KEY) {
+  if (!apiKey) {
+    res.status(401).json({
+      status: 'error',
+      message: 'Missing ingest API key: X-Ingest-API-Key or X-API-Key header required',
+    });
+    return;
+  }
+
+  if (!acceptedKeys.includes(apiKey)) {
     void safeAuditLog({
       eventType: 'auth.ingest_key_rejected',
       actorType: 'api_client',

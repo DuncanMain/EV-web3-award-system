@@ -297,20 +297,26 @@ describe('api integration contracts', () => {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-API-Key': 'test-beia-api-key',
+        'X-Ingest-API-Key': 'test-beia-api-key',
       },
       body: JSON.stringify({
         SessionID: 'beia-test-session',
-        EMPContractID: 'beia-test-user',
-        EMPProviderID: 'BEIA',
+        ProviderID: 'BEIA',
+        cdr_token: { contract_id: 'beia-test-user' },
+        EVSEID: 'RO*BEIA*E*001',
         StartTime: '2026-08-10T10:00:00Z',
         EndTime: '2026-08-10T11:00:00Z',
-        TotalEnergy: 10,
+        Energy: '10',
+        EnergyDirection: 'CHARGE',
       }),
     });
 
-    expect(res.status).not.toBe(401);
-    expect(res.status).not.toBe(403);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      status: 'preview',
+      sideEffects: false,
+      uid: 'beia-test-user',
+    });
   });
 
   it('accepts the dedicated BEIA admin login', async () => {
@@ -327,6 +333,27 @@ describe('api integration contracts', () => {
     expect(res.status).toBe(200);
     expect(body.adminEmail).toBe('alex.dabija@redvector.ro');
     expect(body.token).toBeTruthy();
+
+    const previewRes = await fetch(`${baseUrl}/ingest/cdr/preview`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${body.token}`,
+      },
+      body: JSON.stringify({
+        SessionID: 'admin-preview-session',
+        ProviderID: 'nvf-admin',
+        cdr_token: { contract_id: 'admin-preview-user' },
+        EVSEID: 'DE*NVF*E*ADMIN01',
+        StartTime: '2026-09-14T05:00:00.000Z',
+        EndTime: '2026-09-14T06:00:00.000Z',
+        Energy: '4',
+        EnergyDirection: 'CHARGE',
+      }),
+    });
+
+    expect(previewRes.status).toBe(200);
+    expect(await previewRes.json()).toMatchObject({ status: 'preview', sideEffects: false });
   });
 
   it('returns a final reservation settlement only to its contract identity', async () => {
