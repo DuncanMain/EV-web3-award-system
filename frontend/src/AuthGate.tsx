@@ -18,6 +18,7 @@ export default function AuthGate({ title, subtitle = 'Authorised access only', o
   const [adminToken, setAdminToken] = useState<string | null>(null);
   const [loginUsername, setLoginUsername] = useState('');
   const [loginPassword, setLoginPassword] = useState('');
+  const [showLoginPassword, setShowLoginPassword] = useState(false);
   const [loginError, setLoginError] = useState('');
   const [baseUrl, setBaseUrl] = useState(getDefaultApiBaseUrl());
 
@@ -41,6 +42,7 @@ export default function AuthGate({ title, subtitle = 'Authorised access only', o
       }
       setAdminToken(data.token);
       setLoginPassword('');
+      setShowLoginPassword(false);
     } catch (err) {
       setLoginError(err instanceof Error ? err.message : String(err));
     }
@@ -80,10 +82,26 @@ export default function AuthGate({ title, subtitle = 'Authorised access only', o
             Admin email
             <input type="email" value={loginUsername} onChange={e => setLoginUsername(e.target.value)} autoComplete="username" required />
           </label>
-          <label>
-            Password
-            <input type="password" value={loginPassword} onChange={e => setLoginPassword(e.target.value)} autoComplete="current-password" required />
-          </label>
+          <label htmlFor="admin-login-password">Password</label>
+          <div className="password-field">
+            <input
+              id="admin-login-password"
+              type={showLoginPassword ? 'text' : 'password'}
+              value={loginPassword}
+              onChange={e => setLoginPassword(e.target.value)}
+              autoComplete="current-password"
+              required
+            />
+            <button
+              type="button"
+              className="password-toggle"
+              aria-controls="admin-login-password"
+              aria-pressed={showLoginPassword}
+              onClick={() => setShowLoginPassword(current => !current)}
+            >
+              {showLoginPassword ? 'Hide password' : 'Show password'}
+            </button>
+          </div>
           {loginError && <p className="admin-error">{loginError}</p>}
           <button type="submit">Sign In</button>
         </form>

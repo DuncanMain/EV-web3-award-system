@@ -1,4 +1,5 @@
 import React, { FormEvent, useEffect, useState } from 'react';
+import { presentAuditEvent, type AuditPresentation } from '../../src/auditPresentation';
 
 type TimeRange = { start: string; end: string };
 type OffPeakWindows = Record<string, TimeRange[]>;
@@ -30,9 +31,21 @@ function isValidCdrCountryCode(code: string): boolean {
 }
 
 interface RuleConfig {
+  version?: string | number;
+  policyRevision?: string | number;
   offPeakCharging: { enabled: boolean; tokensPerKWh: number; description: string };
   v2gDischarge: { enabled: boolean; tokensPerKWh: number; description: string };
 }
+
+type PolicyMetadata = {
+  revision: string;
+  updatedAt?: string;
+};
+
+type FeedbackNotice = {
+  kind: 'success' | 'warning' | 'error';
+  message: string;
+};
 
 type AuditEvent = {
   id?: string;
@@ -43,6 +56,7 @@ type AuditEvent = {
   target_id?: string | null;
   status: string;
   metadata?: Record<string, unknown>;
+  presentation?: AuditPresentation;
   created_at: string;
 };
 
@@ -96,18 +110,66 @@ type PilotMetrics = {
   };
 };
 
+function objectMetadata(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function stringMetadata(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value : null;
+}
+
+function revisionMetadata(value: unknown): string | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  return stringMetadata(value);
+}
+
+function AuditEventRow({ event }: { event: AuditEvent }) {
+  const presentation = event.presentation || presentAuditEvent(event);
+  const hasPresentationDetails = presentation.details.length > 0 || presentation.reason || presentation.guidance;
+
+  return (
+    <div className="admin-audit-row">
+      <div>
+        <strong>{event.event_type}</strong>
+        <p className="subtle">
+          {new Date(event.created_at).toLocaleString()} | {event.actor_type}{event.actor_id ? `:${event.actor_id}` : ''}
+        </p>
+        {hasPresentationDetails && (
+          <dl className="admin-audit-identity">
+            {presentation.details.map((detail, index) => (
+              <React.Fragment key={`${detail.label}-${index}`}>
+                <dt>{detail.label}</dt>
+                <dd>{detail.value}</dd>
+              </React.Fragment>
+            ))}
+            {presentation.reason && <><dt>{presentation.reasonLabel || 'Recorded detail'}</dt><dd>{presentation.reason}</dd></>}
+            {presentation.guidance && <><dt>Operator guidance</dt><dd>{presentation.guidance}</dd></>}
+          </dl>
+        )}
+      </div>
+      <span className={`admin-status-pill admin-status-pill--${event.status}`}>{event.status}</span>
+    </div>
+  );
+}
+
 interface AdminDashboardProps {
   baseUrl: string;
   externalToken?: string;
-  section: 'rules' | 'monitoring';
+  section: 'overview' | 'rules' | 'audit' | 'health';
 }
 
 export default function AdminDashboard({ baseUrl, externalToken, section }: AdminDashboardProps) {
   const [token, setToken] = useState<string | null>(externalToken ?? null);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [showLoginPassword, setShowLoginPassword] = useState(false);
   const [loginError, setLoginError] = useState('');
   const [rules, setRules] = useState<RuleConfig | null>(null);
+  const [rulesLoaded, setRulesLoaded] = useState(false);
+  const [rulesLoadError, setRulesLoadError] = useState('');
+  const [policyMetadata, setPolicyMetadata] = useState<PolicyMetadata | null>(null);
   const [offPeakRate, setOffPeakRate] = useState('');
   const [v2gRate, setV2gRate] = useState('');
   const [offPeakEnabled, setOffPeakEnabled] = useState(true);
@@ -118,21 +180,23 @@ export default function AdminDashboard({ baseUrl, externalToken, section }: Admi
 
   // Off-peak windows state
   const [offPeakWindows, setOffPeakWindowsState] = useState<OffPeakWindows>({});
+  const [offPeakWindowsLoaded, setOffPeakWindowsLoaded] = useState(false);
+  const [offPeakWindowsLoadError, setOffPeakWindowsLoadError] = useState('');
   const [newCountryCode, setNewCountryCode] = useState('');
   const [windowsFeedback, setWindowsFeedback] = useState('');
   const [windowsFeedbackKind, setWindowsFeedbackKind] = useState<'success' | 'error' | 'idle'>('idle');
   const [savingWindows, setSavingWindows] = useState(false);
-  const [auditStatus, setAuditStatus] = useState('retry_required');
+  const [auditStatus, setAuditStatus] = useState('all');
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [auditFeedback, setAuditFeedback] = useState('');
   const [loadingAudit, setLoadingAudit] = useState(false);
   const [reconciliationReports, setReconciliationReports] = useState<ReconciliationReport[]>([]);
-  const [reconciliationFeedback, setReconciliationFeedback] = useState('');
+  const [reconciliationFeedback, setReconciliationFeedback] = useState<FeedbackNotice | null>(null);
   const [runningReconciliation, setRunningReconciliation] = useState(false);
   const [readiness, setReadiness] = useState<ReadinessResponse | null>(null);
   const [readinessFeedback, setReadinessFeedback] = useState('');
   const [testingAlert, setTestingAlert] = useState(false);
-  const [alertTestFeedback, setAlertTestFeedback] = useState('');
+  const [alertTestFeedback, setAlertTestFeedback] = useState<FeedbackNotice | null>(null);
   const [exportingEvidence, setExportingEvidence] = useState(false);
   const [pilotMetrics, setPilotMetrics] = useState<PilotMetrics | null>(null);
   const [pilotMetricsFeedback, setPilotMetricsFeedback] = useState('');
@@ -162,6 +226,7 @@ export default function AdminDashboard({ baseUrl, externalToken, section }: Admi
       }
       setToken(data.token);
       setPassword('');
+      setShowLoginPassword(false);
     } catch (err) {
       setLoginError(err instanceof Error ? err.message : String(err));
     }
@@ -173,36 +238,68 @@ export default function AdminDashboard({ baseUrl, externalToken, section }: Admi
     }
     if (!externalToken) setToken(null);
     setRules(null);
+    setRulesLoaded(false);
+    setRulesLoadError('');
+    setPolicyMetadata(null);
+    setOffPeakWindowsLoaded(false);
+    setOffPeakWindowsLoadError('');
   }
 
   async function loadRules() {
+    setRulesLoaded(false);
+    setRulesLoadError('');
     try {
       const res = await adminRequest('/admin/rules');
       const data = await res.json();
-      if (!res.ok) return;
-      const nextRules = data.rules.rules;
+      if (!res.ok) throw new Error(data?.message || data?.error || 'Failed to load token rules');
+      const nextRules = data?.rules?.rules as RuleConfig | undefined;
+      if (!nextRules?.offPeakCharging || !nextRules?.v2gDischarge) {
+        throw new Error('Token rules response was incomplete');
+      }
       setRules(nextRules);
       setOffPeakRate(String(nextRules.offPeakCharging.tokensPerKWh));
       setV2gRate(String(nextRules.v2gDischarge.tokensPerKWh));
       setOffPeakEnabled(nextRules.offPeakCharging.enabled);
       setV2gEnabled(nextRules.v2gDischarge.enabled);
+      const responsePolicy = objectMetadata(data?.policy);
+      const revision = revisionMetadata(responsePolicy?.revision)
+        || revisionMetadata(data?.policyRevision)
+        || revisionMetadata(objectMetadata(data?.rules)?.policyRevision)
+        || revisionMetadata(nextRules.policyRevision)
+        || revisionMetadata(nextRules.version);
+      const updatedAt = stringMetadata(responsePolicy?.updatedAt)
+        || stringMetadata(data?.policyUpdatedAt)
+        || stringMetadata(objectMetadata(data?.rules)?.policyUpdatedAt);
+      setPolicyMetadata(revision ? { revision, ...(updatedAt ? { updatedAt } : {}) } : null);
+      setRulesLoaded(true);
     } catch (err) {
-      // silently ignore
+      setRulesLoadError(err instanceof Error ? err.message : String(err));
     }
   }
 
   async function loadOffPeakWindows() {
+    setOffPeakWindowsLoaded(false);
+    setOffPeakWindowsLoadError('');
     try {
       const res = await adminRequest('/admin/off-peak');
       const data = await res.json();
-      if (!res.ok) return;
+      if (!res.ok) throw new Error(data?.message || data?.error || 'Failed to load off-peak config');
+      if (!data || typeof data.windows !== 'object' || Array.isArray(data.windows)) {
+        throw new Error('Off-peak config response was incomplete');
+      }
       setOffPeakWindowsState(data.windows ?? {});
-    } catch {
-      // silently ignore
+      setOffPeakWindowsLoaded(true);
+    } catch (err) {
+      setOffPeakWindowsLoadError(err instanceof Error ? err.message : String(err));
     }
   }
 
   async function saveOffPeakWindows() {
+    if (!offPeakWindowsLoaded) {
+      setWindowsFeedbackKind('error');
+      setWindowsFeedback('Off-peak config has not loaded successfully; saving is disabled until it does.');
+      return;
+    }
     setSavingWindows(true);
     setWindowsFeedback('');
     try {
@@ -218,6 +315,8 @@ export default function AdminDashboard({ baseUrl, externalToken, section }: Admi
       }
       const nextWindows = data.windows ?? {};
       setOffPeakWindowsState(nextWindows);
+      setOffPeakWindowsLoaded(true);
+      setOffPeakWindowsLoadError('');
       setWindowsFeedbackKind('success');
       setWindowsFeedback('Off-peak config saved. New CDRs will use these windows immediately.');
     } catch (err) {
@@ -260,7 +359,7 @@ export default function AdminDashboard({ baseUrl, externalToken, section }: Admi
     setAuditFeedback('');
     try {
       const params = new URLSearchParams({ limit: '25' });
-      if (status) params.set('status', status);
+      if (status && status !== 'all') params.set('status', status);
       const res = await adminRequest(`/admin/audit?${params.toString()}`);
       const data = await res.json();
       if (!res.ok) {
@@ -276,17 +375,23 @@ export default function AdminDashboard({ baseUrl, externalToken, section }: Admi
   }
 
   async function loadReconciliationReports() {
-    setReconciliationFeedback('');
+    setReconciliationFeedback(null);
     try {
       const res = await adminRequest('/admin/reconciliation?limit=5');
       const data = await res.json();
       if (!res.ok) {
-        setReconciliationFeedback(data?.message || data?.error || 'Failed to load reconciliation reports');
+        setReconciliationFeedback({
+          kind: 'error',
+          message: data?.message || data?.error || 'Failed to load reconciliation reports',
+        });
         return;
       }
       setReconciliationReports(data.reports ?? []);
     } catch (err) {
-      setReconciliationFeedback(err instanceof Error ? err.message : String(err));
+      setReconciliationFeedback({
+        kind: 'error',
+        message: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
@@ -337,20 +442,37 @@ export default function AdminDashboard({ baseUrl, externalToken, section }: Admi
 
   async function sendTestAlert() {
     setTestingAlert(true);
-    setAlertTestFeedback('');
+    setAlertTestFeedback(null);
     try {
       const res = await adminRequest('/admin/alerts/test', { method: 'POST' });
       const data = await res.json();
       if (!res.ok) {
-        setAlertTestFeedback(data?.message || data?.error || 'Failed to send test alert');
+        setAlertTestFeedback({
+          kind: 'error',
+          message: data?.message || data?.error || 'Failed to send test alert',
+        });
         return;
       }
-      setAlertTestFeedback(data?.message || 'Test alert request recorded.');
+      const deliveryStatus = data?.status;
+      const kind: FeedbackNotice['kind'] = deliveryStatus === 'delivery_skipped'
+        ? 'warning'
+        : deliveryStatus === 'sent_or_queued'
+          ? 'success'
+          : 'error';
+      setAlertTestFeedback({
+        kind,
+        message: data?.message || (kind === 'error'
+          ? 'Test alert response did not confirm delivery; inspect the audit log.'
+          : 'Test alert request recorded.'),
+      });
       await loadAuditEvents();
       await loadReadiness();
       await loadPilotMetrics();
     } catch (err) {
-      setAlertTestFeedback(err instanceof Error ? err.message : String(err));
+      setAlertTestFeedback({
+        kind: 'error',
+        message: err instanceof Error ? err.message : String(err),
+      });
     } finally {
       setTestingAlert(false);
     }
@@ -384,7 +506,7 @@ export default function AdminDashboard({ baseUrl, externalToken, section }: Admi
 
   async function runReconciliation() {
     setRunningReconciliation(true);
-    setReconciliationFeedback('');
+    setReconciliationFeedback(null);
     try {
       const res = await adminRequest('/admin/reconciliation/run', {
         method: 'POST',
@@ -392,16 +514,35 @@ export default function AdminDashboard({ baseUrl, externalToken, section }: Admi
       });
       const data = await res.json();
       if (!res.ok) {
-        setReconciliationFeedback(data?.message || data?.error || 'Failed to run reconciliation');
+        setReconciliationFeedback({
+          kind: 'error',
+          message: data?.message || data?.error || 'Failed to run reconciliation',
+        });
         return;
       }
-      setReconciliationFeedback(`Reconciliation complete: ${data.report?.status || 'unknown'}`);
+      const reportStatus = data?.report?.status;
+      const kind: FeedbackNotice['kind'] = reportStatus === 'matched'
+        ? 'success'
+        : reportStatus === 'mismatch'
+          ? 'warning'
+          : 'error';
+      setReconciliationFeedback({
+        kind,
+        message: reportStatus === 'matched'
+          ? 'Reconciliation complete: matched.'
+          : reportStatus === 'mismatch'
+            ? 'Reconciliation complete: mismatch requires review.'
+            : 'Reconciliation response did not contain a recognised result; inspect the report list.',
+      });
       await loadReconciliationReports();
       await loadAuditEvents();
       await loadReadiness();
       await loadPilotMetrics();
     } catch (err) {
-      setReconciliationFeedback(err instanceof Error ? err.message : String(err));
+      setReconciliationFeedback({
+        kind: 'error',
+        message: err instanceof Error ? err.message : String(err),
+      });
     } finally {
       setRunningReconciliation(false);
     }
@@ -431,17 +572,22 @@ export default function AdminDashboard({ baseUrl, externalToken, section }: Admi
 
   useEffect(() => {
     if (token) {
-      loadRules();
-      loadOffPeakWindows();
-      loadAuditEvents();
-      loadReconciliationReports();
-      loadReadiness();
-      loadPilotMetrics();
+      void loadRules();
+      void loadOffPeakWindows();
+      void loadAuditEvents();
+      void loadReconciliationReports();
+      void loadReadiness();
+      void loadPilotMetrics();
     }
   }, [token]);
 
   async function saveRules(e: FormEvent) {
     e.preventDefault();
+    if (!rulesLoaded) {
+      setFeedbackKind('error');
+      setFeedback('Token rules have not loaded successfully; saving is disabled until they do.');
+      return;
+    }
     setSaving(true);
     setFeedback('');
     try {
@@ -462,6 +608,18 @@ export default function AdminDashboard({ baseUrl, externalToken, section }: Admi
       }
       const nextRules = data.rules.rules;
       setRules(nextRules);
+      setRulesLoaded(true);
+      setRulesLoadError('');
+      const responsePolicy = objectMetadata(data?.policy);
+      const revision = revisionMetadata(responsePolicy?.revision)
+        || revisionMetadata(data?.policyRevision)
+        || revisionMetadata(objectMetadata(data?.rules)?.policyRevision)
+        || revisionMetadata(nextRules?.policyRevision)
+        || revisionMetadata(nextRules?.version);
+      const updatedAt = stringMetadata(responsePolicy?.updatedAt)
+        || stringMetadata(data?.policyUpdatedAt)
+        || stringMetadata(objectMetadata(data?.rules)?.policyUpdatedAt);
+      setPolicyMetadata(revision ? { revision, ...(updatedAt ? { updatedAt } : {}) } : null);
       setFeedbackKind('success');
       setFeedback('Rules updated successfully. New CDRs will use these rates immediately.');
     } catch (err) {
@@ -482,16 +640,26 @@ export default function AdminDashboard({ baseUrl, externalToken, section }: Admi
             Admin email
             <input type="email" value={username} onChange={e => setUsername(e.target.value)} autoComplete="username" required />
           </label>
-          <label>
-            Password
+          <label htmlFor="admin-dashboard-login-password">Password</label>
+          <div className="password-field">
             <input
-              type="password"
+              id="admin-dashboard-login-password"
+              type={showLoginPassword ? 'text' : 'password'}
               value={password}
               onChange={e => setPassword(e.target.value)}
               autoComplete="current-password"
               required
             />
-          </label>
+            <button
+              type="button"
+              className="password-toggle"
+              aria-controls="admin-dashboard-login-password"
+              aria-pressed={showLoginPassword}
+              onClick={() => setShowLoginPassword(current => !current)}
+            >
+              {showLoginPassword ? 'Hide password' : 'Show password'}
+            </button>
+          </div>
           {loginError && <p className="admin-error">{loginError}</p>}
           <button type="submit">Sign In</button>
         </form>
@@ -510,23 +678,56 @@ export default function AdminDashboard({ baseUrl, externalToken, section }: Admi
   const latestReport = reconciliationReports[0];
   const readinessStatus = readiness?.status || 'not_ready';
   const isRulesTab = section === 'rules';
+  const isOverviewTab = section === 'overview';
+  const isAuditTab = section === 'audit';
+  const isHealthTab = section === 'health';
+  const sectionTitle = isRulesTab
+    ? 'Token rules'
+    : isAuditTab
+      ? 'Audit log'
+      : isHealthTab
+        ? 'System health'
+        : 'Overview';
+  const sectionDescription = isRulesTab
+    ? 'Changes apply immediately to all new CDRs. No restart required.'
+    : isAuditTab
+      ? 'Review immutable operational attempt history, including protocol identity normalisation outcomes.'
+      : isHealthTab
+        ? 'Check API availability, pilot readiness, and database-to-chain reconciliation.'
+        : 'Monitor pilot activity, readiness, and the latest operational signals.';
 
   return (
     <div className="admin-wrap">
       <div className="admin-header">
         <div>
-          <h2>{isRulesTab ? 'Reward Rules' : 'Operational Monitoring'}</h2>
-          <p className="subtle">
-            {isRulesTab
-              ? 'Changes apply immediately to all new CDRs. No restart required.'
-              : 'Track readiness, alerts, audit events, and reconciliation checks.'}
-          </p>
+          <h2>{sectionTitle}</h2>
+          <p className="subtle">{sectionDescription}</p>
         </div>
-        <button className="btn-ghost" onClick={logout}>Sign Out</button>
+        {!externalToken && <button type="button" className="btn-ghost" onClick={logout}>Sign Out</button>}
       </div>
+
+      {section === 'rules' && rulesLoadError && (
+        <div className="action-card admin-rules-card" role="alert">
+          <strong>Token rules could not be loaded.</strong>
+          <p className="admin-error">{rulesLoadError}</p>
+          <p className="subtle">Saving is disabled until the current rules load successfully. Refresh and try again.</p>
+        </div>
+      )}
+
+      {section === 'rules' && !rules && !rulesLoadError && (
+        <div className="action-card admin-rules-card">
+          <p className="subtle">Loading token rules...</p>
+        </div>
+      )}
 
       {section === 'rules' && rules && (
         <form className="action-card admin-rules-card" onSubmit={saveRules}>
+          {policyMetadata && (
+            <p className="subtle admin-policy-revision" role="status">
+              Policy revision: <strong>{policyMetadata.revision}</strong>
+              {policyMetadata.updatedAt ? ` · Updated ${new Date(policyMetadata.updatedAt).toLocaleString()}` : ''}
+            </p>
+          )}
           <div className="admin-rule-group">
             <div className="admin-rule-header">
               <h4>Off-Peak Charging</h4>
@@ -603,7 +804,7 @@ export default function AdminDashboard({ baseUrl, externalToken, section }: Admi
             <p className={feedbackKind === 'success' ? 'admin-success' : 'admin-error'}>{feedback}</p>
           )}
 
-          <button type="submit" disabled={saving}>
+          <button type="submit" disabled={saving || !rulesLoaded}>
             {saving ? 'Saving...' : 'Save Rules'}
           </button>
         </form>
@@ -625,11 +826,20 @@ export default function AdminDashboard({ baseUrl, externalToken, section }: Admi
         </p>
         <p className="subtle">Country codes must match CDR ISO alpha-2 country codes.</p>
 
-        {!hasOffPeakCountries && (
+        {offPeakWindowsLoadError && (
+          <p className="admin-error" role="alert">
+            Off-peak config could not be loaded: {offPeakWindowsLoadError} Saving is disabled until the current config loads successfully.
+          </p>
+        )}
+        {!offPeakWindowsLoaded && !offPeakWindowsLoadError && (
+          <p className="subtle">Loading off-peak config...</p>
+        )}
+
+        {offPeakWindowsLoaded && !hasOffPeakCountries && (
           <p className="subtle" style={{ fontStyle: 'italic' }}>No countries configured yet.</p>
         )}
 
-        {offPeakCountryEntries.map(([code, slots]) => (
+        {offPeakWindowsLoaded && offPeakCountryEntries.map(([code, slots]) => (
           <div key={code} className="admin-rule-group off-peak-country-group">
             <div className="admin-rule-header">
               <h5 className="country-code-label">{getCountryLabel(code)}</h5>
@@ -726,7 +936,7 @@ export default function AdminDashboard({ baseUrl, externalToken, section }: Admi
         <button
           type="button"
           onClick={saveOffPeakWindows}
-          disabled={savingWindows}
+          disabled={savingWindows || !offPeakWindowsLoaded}
           style={{ marginTop: '1rem' }}
         >
           {savingWindows ? 'Saving...' : 'Save Off-Peak Config'}
@@ -735,18 +945,19 @@ export default function AdminDashboard({ baseUrl, externalToken, section }: Admi
         </>
       )}
 
-      {section === 'monitoring' && (
+      {!isRulesTab && (
         <>
       <div className="admin-section-spacer" />
 
       <div className="action-card admin-rules-card">
         <div className="admin-rule-header">
-          <h4>Operational Monitoring</h4>
+          <h4>{sectionTitle}</h4>
           <button type="button" className="btn-ghost" onClick={() => { loadAuditEvents(); loadReconciliationReports(); loadReadiness(); loadPilotMetrics(); }}>
             Refresh
           </button>
         </div>
 
+        {(isOverviewTab || isHealthTab) && (
         <div className="admin-monitor-panel admin-api-health-panel">
           <div className="admin-rule-header">
             <h5 className="country-code-label">API Status</h5>
@@ -760,7 +971,9 @@ export default function AdminDashboard({ baseUrl, externalToken, section }: Admi
           </label>
           <p className="health">{healthStatus}</p>
         </div>
+        )}
 
+        {(isOverviewTab || isHealthTab) && (
         <div className="admin-monitor-panel admin-readiness-panel">
           <div className="admin-rule-header">
             <h5 className="country-code-label">Pilot Readiness</h5>
@@ -807,12 +1020,14 @@ export default function AdminDashboard({ baseUrl, externalToken, section }: Admi
           )}
           {readinessFeedback && <p className="admin-error">{readinessFeedback}</p>}
           {alertTestFeedback && (
-            <p className={alertTestFeedback.toLowerCase().includes('failed') ? 'admin-error' : 'admin-success'}>
-              {alertTestFeedback}
+            <p className={`admin-${alertTestFeedback.kind}`} role={alertTestFeedback.kind === 'error' ? 'alert' : 'status'}>
+              {alertTestFeedback.message}
             </p>
           )}
         </div>
+        )}
 
+        {isOverviewTab && (
         <div className="admin-monitor-panel admin-pilot-metrics-panel">
           <div className="admin-rule-header">
             <h5 className="country-code-label">Pilot Activity</h5>
@@ -865,76 +1080,78 @@ export default function AdminDashboard({ baseUrl, externalToken, section }: Admi
           )}
           {pilotMetricsFeedback && <p className="admin-error">{pilotMetricsFeedback}</p>}
         </div>
+        )}
 
-        <div className="admin-monitor-grid">
-          <div className="admin-monitor-panel">
-            <div className="admin-rule-header">
-              <h5 className="country-code-label">Reconciliation</h5>
-              <button type="button" className="btn-ghost" onClick={runReconciliation} disabled={runningReconciliation}>
-                {runningReconciliation ? 'Running...' : 'Run Check'}
-              </button>
-            </div>
-            {latestReport ? (
-              <div className="admin-metric-grid">
-                <div>
-                  <span className={`admin-status-pill admin-status-pill--${latestReport.status}`}>{latestReport.status}</span>
-                  <p className="subtle">{new Date(latestReport.created_at).toLocaleString()}</p>
-                </div>
-                <div>
-                  <strong>{latestReport.checked_count}</strong>
-                  <p className="subtle">Checked</p>
-                </div>
-                <div>
-                  <strong>{latestReport.mismatch_count}</strong>
-                  <p className="subtle">Mismatches</p>
-                </div>
-              </div>
-            ) : (
-              <p className="subtle">No reconciliation report has been stored yet.</p>
-            )}
-            {reconciliationFeedback && (
-              <p className={reconciliationFeedback.toLowerCase().includes('failed') ? 'admin-error' : 'admin-success'}>
-                {reconciliationFeedback}
-              </p>
-            )}
+        {(isOverviewTab || isHealthTab) && (
+        <div className="admin-monitor-panel admin-reconciliation-panel">
+          <div className="admin-rule-header">
+            <h5 className="country-code-label">Reconciliation</h5>
+            <button type="button" className="btn-ghost" onClick={runReconciliation} disabled={runningReconciliation}>
+              {runningReconciliation ? 'Running...' : 'Run Check'}
+            </button>
           </div>
+          {latestReport ? (
+            <div className="admin-metric-grid">
+              <div>
+                <span className={`admin-status-pill admin-status-pill--${latestReport.status}`}>{latestReport.status}</span>
+                <p className="subtle">{new Date(latestReport.created_at).toLocaleString()}</p>
+              </div>
+              <div>
+                <strong>{latestReport.checked_count}</strong>
+                <p className="subtle">Checked</p>
+              </div>
+              <div>
+                <strong>{latestReport.mismatch_count}</strong>
+                <p className="subtle">Mismatches</p>
+              </div>
+            </div>
+          ) : (
+            <p className="subtle">No reconciliation report has been stored yet.</p>
+          )}
+          {reconciliationFeedback && (
+            <p className={`admin-${reconciliationFeedback.kind}`} role={reconciliationFeedback.kind === 'error' ? 'alert' : 'status'}>
+              {reconciliationFeedback.message}
+            </p>
+          )}
+        </div>
+        )}
 
-          <div className="admin-monitor-panel">
-            <div className="admin-rule-header">
-              <h5 className="country-code-label">Audit Feed</h5>
+        {(isOverviewTab || isAuditTab) && (
+        <div className="admin-monitor-panel admin-audit-panel">
+          <div className="admin-rule-header">
+            <h5 className="country-code-label">Audit feed</h5>
+            <label className="admin-audit-filter">
+              <span className="sr-only">Filter audit events by status</span>
               <select
+                aria-label="Filter audit events by status"
                 value={auditStatus}
                 onChange={e => {
                   setAuditStatus(e.target.value);
                   loadAuditEvents(e.target.value);
                 }}
               >
+                <option value="all">All statuses</option>
                 <option value="retry_required">Retry required</option>
                 <option value="warning">Warnings</option>
                 <option value="error">Errors</option>
-                <option value="">All statuses</option>
               </select>
-            </div>
-            {loadingAudit && <p className="subtle">Loading events...</p>}
-            {auditFeedback && <p className="admin-error">{auditFeedback}</p>}
-            {!loadingAudit && !auditEvents.length && !auditFeedback && (
-              <p className="subtle">No matching audit events.</p>
-            )}
-            <div className="admin-audit-list">
-              {auditEvents.slice(0, 8).map((event, idx) => (
-                <div className="admin-audit-row" key={event.id || `${event.event_type}-${event.created_at}-${idx}`}>
-                  <div>
-                    <strong>{event.event_type}</strong>
-                    <p className="subtle">
-                      {new Date(event.created_at).toLocaleString()} | {event.actor_type}{event.actor_id ? `:${event.actor_id}` : ''}
-                    </p>
-                  </div>
-                  <span className={`admin-status-pill admin-status-pill--${event.status}`}>{event.status}</span>
-                </div>
-              ))}
-            </div>
+            </label>
+          </div>
+          <p className="subtle admin-audit-history-note">
+            Append-only attempt history. Current operation state and recovery guidance are shown in Transactions.
+          </p>
+          {loadingAudit && <p className="subtle">Loading events...</p>}
+          {auditFeedback && <p className="admin-error">{auditFeedback}</p>}
+          {!loadingAudit && !auditEvents.length && !auditFeedback && (
+            <p className="subtle">No matching audit events.</p>
+          )}
+          <div className="admin-audit-list">
+            {auditEvents.slice(0, 25).map((event, idx) => (
+              <AuditEventRow event={event} key={event.id || `${event.event_type}-${event.created_at}-${idx}`} />
+            ))}
           </div>
         </div>
+        )}
       </div>
         </>
       )}

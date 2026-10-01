@@ -5,6 +5,35 @@ import './demo.css';
 
 function DemoApp() {
   const [pluggedIn, setPluggedIn] = useState(false);
+  const [demoEmaid, setDemoEmaid] = useState<string | null>(null);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    fetch('/api/sparkz/demo-config')
+      .then(response => {
+        if (!response.ok) throw new Error('Local demo identity is not configured.');
+        return response.json() as Promise<{ emaid?: string }>;
+      })
+      .then(config => {
+        if (!cancelled) setDemoEmaid(config.emaid?.trim() || null);
+      })
+      .catch(() => {
+        if (!cancelled) setDemoEmaid('');
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  if (demoEmaid === null) {
+    return <main className="demo-shell"><p>Loading local demo identity...</p></main>;
+  }
+
+  if (demoEmaid === '') {
+    return (
+      <main className="demo-shell">
+        <p role="alert">Local demo identity is not configured.</p>
+      </main>
+    );
+  }
 
   return (
     <main className="demo-shell">
@@ -17,14 +46,17 @@ function DemoApp() {
         </button>
       </div>
       <SparkzChargingCard
-        apiBaseUrl="http://127.0.0.1:3005"
-        contractId="000"
+        apiBaseUrl="/api/sparkz"
+        // The dev endpoint exposes only the configured public eMAID. The
+        // proxy still server-binds the same value for every request.
+        contractId={demoEmaid}
         sessionId={pluggedIn ? 'spend-001' : undefined}
         providerId={pluggedIn ? 'NF' : undefined}
         chargerId={pluggedIn ? 'charger-001' : undefined}
         sessionStatus={pluggedIn ? 'PLUGGED_IN' : 'UNPLUGGED'}
         hideAfterSpend={false}
         hideAfterSkip={false}
+        reservationPollIntervalMs={1000}
       />
     </main>
   );

@@ -7,4 +7,11 @@ export type {
   SparkzSessionStatus,
   SparkzSessionResponse,
 } from './types';
+export {
+  apiUrl,
+  isTerminalReservationSettlement,
+  matchesReservationContext,
+  normalizeApiBaseUrl,
+  sessionScopeKey,
+} from './chargingCardContract';
 import './styles.css';

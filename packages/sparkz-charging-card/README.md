@@ -7,7 +7,7 @@ The component has two runtime modes:
 - `UNPLUGGED`: account view for the logged-in user.
 - Active charging session: spend prompt view after BEIA provides session details.
 
-BEIA should use the logged-in app user's UID as `contractId`. The backend reads
+BEIA should use the logged-in user's charging-contract eMAID as `contractId`, matching the final CDR. An app account ID or RFID UID is not interchangeable with it. The backend reads
 that value through the existing `x-contract-id` identity header.
 
 ## Install
@@ -16,7 +16,7 @@ Until this package is published to a registry, install from a packed tarball or
 from this folder in a workspace.
 
 ```bash
-npm install ./sparkz-charging-card-0.2.0.tgz
+npm install ./neverflat-sparkz-charging-card-0.2.1-rc.1.tgz
 ```
 
 Import the component and styles:
@@ -33,17 +33,17 @@ import { useState } from 'react';
 import { SparkzChargingCard, SparkzSessionStatus } from '@neverflat/sparkz-charging-card';
 import '@neverflat/sparkz-charging-card/styles.css';
 
-export function SparkzPanel({ userUid }: { userUid: string }) {
+export function SparkzPanel({ emaid }: { emaid: string }) {
   const [sessionStatus, setSessionStatus] = useState<SparkzSessionStatus>('UNPLUGGED');
   const [sessionId, setSessionId] = useState<string | undefined>();
 
   return (
     <SparkzChargingCard
-      apiBaseUrl="https://api.example.com"
-      contractId={userUid}
+      apiBaseUrl="/api/sparkz"
+      contractId={emaid}
       sessionStatus={sessionStatus}
       sessionId={sessionId}
-      providerId={sessionId ? 'EMP-PROVIDER-ID' : undefined}
+      providerId={sessionId ? 'CDR-PROVIDER-ID' : undefined}
       chargerId={sessionId ? 'charger-001' : undefined}
       onReservationSuccess={(reservation) => {
         // The component starts polling this reservation automatically.
@@ -70,8 +70,8 @@ event is received.
 
 ```tsx
 <SparkzChargingCard
-  apiBaseUrl="https://api.example.com"
-  contractId={userUid}
+  apiBaseUrl="/api/sparkz"
+  contractId={emaid}
   sessionStatus="UNPLUGGED"
 />
 ```
@@ -80,7 +80,7 @@ In this mode the component calls:
 
 ```http
 GET /wallet/me
-x-contract-id: <userUid>
+x-contract-id: <emaid>
 ```
 
 It shows balance, totals, recent activity, blockchain address, contract ID,
@@ -94,11 +94,11 @@ session details.
 
 ```tsx
 <SparkzChargingCard
-  apiBaseUrl="https://api.example.com"
-  contractId={userUid}
+  apiBaseUrl="/api/sparkz"
+  contractId={emaid}
   sessionStatus="PLUGGED_IN"
   sessionId="session-123"
-  providerId="EMP-PROVIDER-ID"
+  providerId="CDR-PROVIDER-ID"
   chargerId="charger-001"
 />
 ```
@@ -113,7 +113,7 @@ In this mode the component calls:
 
 ```http
 POST /spend/session
-x-contract-id: <userUid>
+x-contract-id: <emaid>
 ```
 
 The spend prompt appears only after that endpoint returns. If the user applies a
@@ -121,7 +121,7 @@ discount, the component calls:
 
 ```http
 POST /spend/me
-x-contract-id: <userUid>
+x-contract-id: <emaid>
 ```
 
 Active-session mode is intentionally focused on the charging decision. It shows
@@ -132,11 +132,34 @@ and the "How it works" tab remain in unplugged mode only.
 `POST /spend/me` now creates a reservation. The final CDR settles no more than
 the delivered energy at `1 SPARKZ = 1 kWh` and releases the unused remainder.
 
+The card blocks a second reservation while the previous one is still `reserved`
+or `settling`. This protects the saved reservation context while the CDR is
+being processed; once the reservation is `released`, or is `settled` with
+`receiptStatus: "settled"` and a signed `spendReceipt`, a later session can
+reserve independently.
+
 The EMP sends its CDR through the Aarhus database, not through BEIA. NEVERFLAT
 has no direct outbound connection to the EMP, so the component polls
 `GET /spend/reservations/:reservationId`. It calls `onReservationSettlement`
-once the result is `settled` or `released`; BEIA must forward that result to the
-EMP.
+once the result is `settled` with its signed receipt, or `released` without a
+spend. BEIA forwards that result to the EMP, which applies the actual discount.
+The component keeps polling when the token movement is confirmed but its
+receipt is pending. Polling observes saved state; the CDR integration retries
+the original CDR to recover incomplete processing.
+
+Persist the returned reservation ID in BEIA and pass it back as the optional
+`reservationId` prop when remounting the card. This resumes read-only polling
+for that existing reservation; it never creates or retries a spend. The poll
+requires the original `sessionId` and `providerId` props as well as the
+original eMAID, and checks all three returned identifiers before notifying the
+host. A browser component cannot guarantee
+durable polling while it is unmounted, so BEIA should also poll the status API
+from its backend when the app is not running.
+
+The legacy `onSpendSuccess` callback is not emitted by this reservation flow,
+because `POST /spend/me` does not produce a signed receipt immediately. Use
+`onReservationSettlement` as the single settlement delivery callback after the
+receipt is persisted.
 
 For an active external wallet, the component obtains a capped ERC-20 approval
 transaction from `POST /spend/reservation-approval-intent`, asks the wallet to
@@ -152,8 +175,8 @@ active session props. BEIA does not receive the CDR itself.
 
 ```tsx
 <SparkzChargingCard
-  apiBaseUrl="https://api.example.com"
-  contractId={userUid}
+  apiBaseUrl="/api/sparkz"
+  contractId={emaid}
   sessionStatus="UNPLUGGED"
 />
 ```
@@ -190,6 +213,7 @@ type SparkzChargingCardProps = {
   sessionId?: string;
   providerId?: string;
   chargerId?: string;
+  reservationId?: string; // resumes read-only polling for an existing reservation
   sessionStatus?: 'UNPLUGGED' | 'CDR_RECEIVED' | 'CHARGER_OPENED' | 'PLUGGED_IN' | 'SESSION_STARTED';
   countryCode?: string;
   estimatedKwh?: number;
@@ -199,6 +223,7 @@ type SparkzChargingCardProps = {
   hideAfterSpend?: boolean;
   hideAfterSkip?: boolean;
   polygonExplorerBaseUrl?: string;
+  /** Deprecated for reservation flow; use onReservationSettlement. */
   onSpendSuccess?: (receipt: SparkzSpendReceipt) => void;
   onReservationSuccess?: (reservation: SparkzReservation) => void;
   onReservationSettlement?: (settlement: SparkzReservationSettlement) => void;
@@ -222,9 +247,17 @@ type SparkzChargingCardProps = {
 ```bash
 cd packages/sparkz-charging-card
 npm install
+$env:NVF_DEMO_API_ORIGIN = 'http://127.0.0.1:3005' # isolated local API only
+$env:NVF_DEMO_API_KEY = '<isolated-local-api-key>'
+$env:NVF_DEMO_EMAID = '<isolated-local-emaid>'
 npm run dev -- --host 127.0.0.1 --port 3002
 ```
 
-The local demo includes `Unplugged` and `Plugged in` simulator buttons. BEIA
-should not ship those controls; their app should switch props based on real
-session/CDR state.
+The local demo includes `Unplugged` and `Plugged in` simulator buttons. Its
+Vite-only proxy accepts loopback API origins only, allows only the package's
+wallet/session/reservation routes, strips browser credential headers, and adds
+the configured API key and eMAID server-side. The demo reads the configured
+eMAID from a local no-store config response; the API key is never sent to or
+bundled into the browser. Missing configuration and non-loopback targets fail
+closed. BEIA should not ship these controls; its app should use the same
+server-bound proxy pattern and switch props based on real session/CDR state.

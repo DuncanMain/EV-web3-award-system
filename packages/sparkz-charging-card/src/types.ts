@@ -69,7 +69,7 @@ export type SparkzSpendReceipt = {
 
 export type SparkzReservation = {
   id: string;
-  status: 'reserved';
+  status: 'reserved' | 'settling' | 'settled' | 'released';
   amount: string;
   kWhEntitlement: string;
   availableBalance: number;
@@ -87,6 +87,10 @@ export type SparkzReservationSettlement = {
   freeKwh: string;
   txHash: string | null;
   spendReceipt: SparkzSpendReceipt | null;
+  /** Settled reservations continue polling until receiptStatus is settled. */
+  receiptStatus?: 'not_created' | 'pending' | 'settled' | 'none' | 'orphaned' | 'invalid' | string;
+  /** A review-required response can never be treated as a terminal success. */
+  requiresReview?: boolean;
   updatedAt: string;
 };
 
@@ -124,6 +128,12 @@ export type SparkzChargingCardProps = {
   sessionId?: string;
   providerId?: string;
   chargerId?: string;
+  /**
+   * Resume polling for a reservation created before this component mounted.
+   * The component only observes the reservation; it never creates a new one
+   * from this prop. The owning eMAID is still sent in x-contract-id.
+   */
+  reservationId?: string;
   sessionStatus?: SparkzSessionStatus;
   countryCode?: string;
   estimatedKwh?: number;
@@ -133,6 +143,10 @@ export type SparkzChargingCardProps = {
   hideAfterSpend?: boolean;
   hideAfterSkip?: boolean;
   polygonExplorerBaseUrl?: string;
+  /**
+   * @deprecated The reservation flow does not emit an immediate spend receipt.
+   * Use onReservationSettlement when the signed receipt is persisted.
+   */
   onSpendSuccess?: (receipt: SparkzSpendReceipt) => void;
   onReservationSuccess?: (reservation: SparkzReservation) => void;
   onReservationSettlement?: (settlement: SparkzReservationSettlement) => void;

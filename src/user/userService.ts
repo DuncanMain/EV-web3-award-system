@@ -1,4 +1,5 @@
 import { ethers } from 'ethers';
+import { createRpcProvider } from '../rpcProvider';
 import { userRegistry } from './userRegistry';
 import { Users } from '../database/service';
 
@@ -189,13 +190,13 @@ export function clearUserRegistry(): void {
 export async function approveUserForSpending(
   uid: string,
   treasuryAddress: string,
-  provider: ethers.Provider = new ethers.JsonRpcProvider(process.env.POLYGON_RPC_URL || 'https://polygon-amoy.drpc.org')
+  provider: ethers.Provider = createRpcProvider()
 ): Promise<string> {
   const derivationSalt = process.env.USER_ADDRESS_DERIVATION_SALT || 'nvf-award-core-v1';
   const userWallet = generateDeterministicWallet(uid, derivationSalt);
   const userSigner = userWallet.connect(provider);
 
-  const contractAddress = '0x605871D30DC278a036F09e2ace771df8a224624B'; // Token contract address
+  const contractAddress = process.env.TOKEN_CONTRACT_ADDRESS || '0x605871D30DC278a036F09e2ace771df8a224624B'; // Token contract address
 
   // Create contract interface for approval
   const tokenInterface = new ethers.Interface([

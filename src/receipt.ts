@@ -25,6 +25,21 @@ export interface SignedSpendReceipt {
   canonicalPayload: string;
 }
 
+export type TrustedSpendReceiptFailureCode =
+  | 'invalid_trusted_signer'
+  | 'invalid_claimed_signer'
+  | 'signer_mismatch'
+  | 'invalid_signature';
+
+export interface TrustedSpendReceiptVerification {
+  valid: boolean;
+  recoveredSignerAddress?: string;
+  failure?: {
+    code: TrustedSpendReceiptFailureCode;
+    message: string;
+  };
+}
+
 function sortForCanonicalJson(value: unknown): unknown {
   if (Array.isArray(value)) {
     return value.map(sortForCanonicalJson);
@@ -113,4 +128,78 @@ export function verifySpendReceipt(
 ): boolean {
   const recovered = ethers.verifyMessage(canonicalizeReceiptPayload(payload), signature);
   return recovered.toLowerCase() === expectedSignerAddress.toLowerCase();
+}
+
+/**
+ * Verifies a receipt against the server-configured signer. The caller's
+ * self-declared signer address is accepted only as a consistency claim and
+ * must match the trusted configured address before the signature is checked.
+ */
+export function verifySpendReceiptAgainstTrustedSigner(
+  payload: SpendReceiptPayload,
+  signature: string,
+  claimedSignerAddress: string,
+  trustedSignerAddress: string
+): TrustedSpendReceiptVerification {
+  let trustedAddress: string;
+  try {
+    trustedAddress = ethers.getAddress(trustedSignerAddress);
+  } catch {
+    return {
+      valid: false,
+      failure: {
+        code: 'invalid_trusted_signer',
+        message: 'configured receipt signer address is invalid',
+      },
+    };
+  }
+
+  let claimedAddress: string;
+  try {
+    claimedAddress = ethers.getAddress(claimedSignerAddress);
+  } catch {
+    return {
+      valid: false,
+      failure: {
+        code: 'invalid_claimed_signer',
+        message: 'receipt signerAddress is invalid',
+      },
+    };
+  }
+
+  if (claimedAddress.toLowerCase() !== trustedAddress.toLowerCase()) {
+    return {
+      valid: false,
+      failure: {
+        code: 'signer_mismatch',
+        message: 'receipt signerAddress does not match the configured NEVERFLAT receipt signer',
+      },
+    };
+  }
+
+  let recoveredSignerAddress: string;
+  try {
+    recoveredSignerAddress = ethers.verifyMessage(canonicalizeReceiptPayload(payload), signature);
+  } catch {
+    return {
+      valid: false,
+      failure: {
+        code: 'invalid_signature',
+        message: 'receipt signature is malformed or cannot be recovered',
+      },
+    };
+  }
+
+  if (recoveredSignerAddress.toLowerCase() !== trustedAddress.toLowerCase()) {
+    return {
+      valid: false,
+      recoveredSignerAddress,
+      failure: {
+        code: 'invalid_signature',
+        message: 'receipt signature was not produced by the configured NEVERFLAT receipt signer',
+      },
+    };
+  }
+
+  return { valid: true, recoveredSignerAddress };
 }

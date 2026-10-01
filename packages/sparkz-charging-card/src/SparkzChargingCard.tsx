@@ -11,6 +11,14 @@ import type {
   SparkzSpendReceipt,
   SparkzWalletResponse,
 } from './types';
+import {
+  apiUrl,
+  isTerminalReservationSettlement,
+  matchesReservationContext,
+  normalizeApiBaseUrl,
+  sessionScopeKey,
+  type SparkzReservationTrackingContext,
+} from './chargingCardContract';
 import sparkzLogo from './sparkz-logo.svg';
 
 type SpendResponse = {
@@ -28,6 +36,35 @@ type ReservationApprovalIntent = {
 type BrowserEthereumProvider = {
   request: (args: { method: string; params?: unknown[] }) => Promise<unknown>;
 };
+
+type SpendOperationContext = {
+  token: number;
+  ownerGeneration: number;
+  contractId: string;
+  apiBaseUrl: string;
+  sessionGeneration: number;
+  sessionScopeKey: string;
+  sessionId: string;
+  providerId: string;
+};
+
+class StaleSpendOperationError extends Error {
+  constructor() {
+    super('The charging session changed before the reservation could be completed.');
+    this.name = 'StaleSpendOperationError';
+  }
+}
+
+function invokeHostCallback(callback: (() => unknown) | undefined, onError: (error: unknown) => void): void {
+  try {
+    const result = callback?.();
+    if (result && typeof (result as { then?: unknown }).then === 'function') {
+      void Promise.resolve(result).catch(onError);
+    }
+  } catch (error) {
+    onError(error);
+  }
+}
 
 const activeSessionStatuses: SparkzActiveSessionStatus[] = ['CHARGER_OPENED', 'PLUGGED_IN', 'SESSION_STARTED'];
 
@@ -104,6 +141,7 @@ export default function SparkzChargingCard({
   sessionId,
   providerId,
   chargerId = '',
+  reservationId,
   sessionStatus,
   countryCode,
   estimatedKwh,
@@ -137,43 +175,251 @@ export default function SparkzChargingCard({
   const [receipt, setReceipt] = useState<SparkzSpendReceipt | null>(null);
   const [reservation, setReservation] = useState<SparkzReservation | null>(null);
   const [settlement, setSettlement] = useState<SparkzReservationSettlement | null>(null);
+  const [reservationTracking, setReservationTracking] = useState<SparkzReservationTrackingContext | null>(null);
+  const [walletOwnerContractId, setWalletOwnerContractId] = useState<string | null>(null);
+  const [walletOwnerApiBaseUrl, setWalletOwnerApiBaseUrl] = useState<string | null>(null);
+  const [sessionContextKey, setSessionContextKey] = useState<string | null>(null);
   const notifiedSettlementId = useRef<string | null>(null);
+  const onReservationSettlementRef = useRef(onReservationSettlement);
+  const activeSessionScopeRef = useRef<string | null>(null);
+  const ownerGenerationRef = useRef(0);
+  const ownerScopeRef = useRef({ contractId, apiBaseUrl: normalizeApiBaseUrl(apiBaseUrl) });
+  const sessionGenerationRef = useRef(0);
+  const sessionScopeRef = useRef(sessionScopeKey(contractId, sessionId, providerId));
+  const currentSessionContextRef = useRef({
+    scopeKey: sessionScopeKey(contractId, sessionId, providerId),
+    hasSessionContext: Boolean(contractId && sessionId && providerId && isActiveSessionStatus(sessionStatus)),
+    sessionId,
+    providerId,
+  });
+  const activeOperationTokenRef = useRef(0);
+  const activeWalletOperationTokenRef = useRef(0);
+  const mountedRef = useRef(true);
   const [dismissed, setDismissed] = useState(false);
   const [activeTab, setActiveTab] = useState<'activity' | 'account' | 'about'>('activity');
 
   const hasActiveSessionStatus = isActiveSessionStatus(sessionStatus);
   const hasSessionContext = Boolean(contractId && sessionId && providerId && hasActiveSessionStatus);
-  const displayStatus = session ? session.sessionStatus.replace(/_/g, ' ') : 'UNPLUGGED';
-  const activityItems = session?.recentActivity || wallet?.history || [];
-  const walletBalance = session?.wallet.availableBalance ?? wallet?.balance ?? 0;
-  const walletEarned = wallet?.totalAwarded || session?.wallet.totalEarned || 0;
-  const walletSpent = wallet?.totalSpent || session?.wallet.totalSpent || 0;
+  const normalizedApiBaseUrl = normalizeApiBaseUrl(apiBaseUrl);
+  const currentSessionScopeKey = sessionScopeKey(contractId, sessionId, providerId);
+  const currentSessionContextKey = `${normalizedApiBaseUrl}\u0001${currentSessionScopeKey}`;
+
+  currentSessionContextRef.current = {
+    scopeKey: currentSessionScopeKey,
+    hasSessionContext,
+    sessionId,
+    providerId,
+  };
+
+  // Update these guards during render so a response resolving between a prop
+  // change and the cleanup of the previous effect cannot mutate the new owner.
+  if (ownerScopeRef.current.contractId !== contractId
+    || ownerScopeRef.current.apiBaseUrl !== normalizedApiBaseUrl) {
+    ownerScopeRef.current = { contractId, apiBaseUrl: normalizedApiBaseUrl };
+    ownerGenerationRef.current += 1;
+    activeOperationTokenRef.current += 1;
+    activeWalletOperationTokenRef.current += 1;
+  }
+  if (sessionScopeRef.current !== currentSessionScopeKey) {
+    sessionScopeRef.current = currentSessionScopeKey;
+    sessionGenerationRef.current += 1;
+  }
+
+  const isOwnerGenerationCurrent = (
+    generation: number,
+    expectedContractId: string,
+    expectedApiBaseUrl: string,
+  ): boolean => ownerGenerationRef.current === generation
+    && mountedRef.current
+    && ownerScopeRef.current.contractId === expectedContractId
+    && ownerScopeRef.current.apiBaseUrl === expectedApiBaseUrl;
+  const isSessionGenerationCurrent = (generation: number, expectedScope: string): boolean =>
+    sessionGenerationRef.current === generation && sessionScopeRef.current === expectedScope;
+  const visibleWallet = walletOwnerContractId === contractId && walletOwnerApiBaseUrl === normalizedApiBaseUrl ? wallet : null;
+  const visibleSession = sessionContextKey === currentSessionContextKey ? session : null;
+  const reservationOwnedByCurrentEndpoint = reservationTracking?.contractId === contractId
+    && reservationTracking.apiBaseUrl === normalizedApiBaseUrl;
+  const reservationMatchesCurrentSession = reservationOwnedByCurrentEndpoint
+    && (!hasSessionContext
+      || (reservationTracking.sessionId === sessionId && reservationTracking.providerId === providerId));
+  const visibleReservation = reservationMatchesCurrentSession ? reservation : null;
+  const visibleSettlement = reservationMatchesCurrentSession
+    && settlement?.reservationId === reservationTracking?.reservationId ? settlement : null;
+  const visibleReceipt = reservationMatchesCurrentSession
+    && settlement?.reservationId === reservationTracking?.reservationId ? receipt : null;
+  const visibleSettlementIsTerminal = Boolean(visibleSettlement && isTerminalReservationSettlement(visibleSettlement));
+  const reservationPending = Boolean(
+    reservationOwnedByCurrentEndpoint
+    && (!settlement
+      || settlement.reservationId !== reservationTracking?.reservationId
+      || !isTerminalReservationSettlement(settlement)),
+  );
+  const displayStatus = visibleSession ? visibleSession.sessionStatus.replace(/_/g, ' ') : 'UNPLUGGED';
+  const activityItems = visibleSession?.recentActivity || visibleWallet?.history || [];
+  const walletBalance = visibleSession?.wallet.availableBalance ?? visibleWallet?.balance ?? 0;
+  const walletEarned = visibleWallet?.totalAwarded || visibleSession?.wallet.totalEarned || 0;
+  const walletSpent = visibleWallet?.totalSpent || visibleSession?.wallet.totalSpent || 0;
+
+  const isSpendOwnerOperationCurrent = (operation: SpendOperationContext): boolean => {
+    if (!mountedRef.current) return false;
+    if (!isOwnerGenerationCurrent(operation.ownerGeneration, operation.contractId, operation.apiBaseUrl)) {
+      return false;
+    }
+    return activeOperationTokenRef.current === operation.token;
+  };
+  const isSpendRequestCurrent = (operation: SpendOperationContext): boolean => {
+    if (!isSpendOwnerOperationCurrent(operation)) return false;
+    // A new request must remain tied to the session that authorized it. Once
+    // /spend/me has been sent, the separate retention guard preserves the
+    // server-created reservation across a close or a new active session.
+    const current = currentSessionContextRef.current;
+    return current.hasSessionContext
+      && current.scopeKey === operation.sessionScopeKey
+      && current.sessionId === operation.sessionId
+      && current.providerId === operation.providerId
+      && isSessionGenerationCurrent(operation.sessionGeneration, operation.sessionScopeKey);
+  };
+  const isReservationRetentionCurrent = (operation: SpendOperationContext): boolean =>
+    isSpendOwnerOperationCurrent(operation);
+  const shouldDismissAfterReservation = (operation: SpendOperationContext): boolean => {
+    if (isSessionGenerationCurrent(operation.sessionGeneration, operation.sessionScopeKey)) return true;
+    const current = currentSessionContextRef.current;
+    if (current.hasSessionContext) return false;
+    return (!current.sessionId || current.sessionId === operation.sessionId)
+      && (!current.providerId || current.providerId === operation.providerId);
+  };
 
   useEffect(() => {
-    if (!reservation?.id) return;
+    onReservationSettlementRef.current = onReservationSettlement;
+  }, [onReservationSettlement]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  // A contract/eMAID change is an ownership boundary. Clear all data that was
+  // loaded under the previous owner before the next request can render it.
+  // Session close is deliberately excluded: the reservation poll must keep
+  // using its captured owner until the final receipt or release is observed.
+  useEffect(() => {
+    setWallet(null);
+    setWalletOwnerContractId(null);
+    setWalletOwnerApiBaseUrl(null);
+    setConnectedWallet('');
+    setSession(null);
+    setSessionContextKey(null);
+    setReservation(null);
+    setReservationTracking(null);
+    setSettlement(null);
+    setReceipt(null);
+    setLoading(false);
+    setLoadingWallet(false);
+    setSpending(false);
+    setSwitchingMode(false);
+    setSigningWallet(false);
+    setError('');
+    setWalletError('');
+    notifiedSettlementId.current = null;
+    setDismissed(false);
+  }, [contractId, normalizedApiBaseUrl]);
+
+  // Resume an existing reservation after a remount. This only starts the
+  // read-only status poll; it cannot create a new reservation.
+  useEffect(() => {
+    const requestedReservationId = reservationId?.trim();
+    if (!requestedReservationId || !contractId) return;
+    if (!sessionId || !providerId) {
+      setError('A resumed reservation requires its original session ID and provider ID.');
+      return;
+    }
+    if (reservationTracking?.reservationId === requestedReservationId
+      && reservationTracking.contractId === contractId
+      && reservationTracking.apiBaseUrl === normalizedApiBaseUrl) return;
+    if (reservationTracking && (!settlement || !isTerminalReservationSettlement(settlement))) {
+      setError('A previous reservation is still settling. Keep polling it before selecting another reservation.');
+      return;
+    }
+    setReservation({
+      id: requestedReservationId,
+      status: 'reserved',
+      amount: '0.00',
+      kWhEntitlement: '0.00',
+      availableBalance: 0,
+    });
+    setReservationTracking({
+      reservationId: requestedReservationId,
+      contractId,
+      apiBaseUrl: normalizedApiBaseUrl,
+      sessionId,
+      providerId,
+    });
+    setSettlement(null);
+    setReceipt(null);
+    notifiedSettlementId.current = null;
+  }, [contractId, normalizedApiBaseUrl, providerId, reservationId, sessionId, reservationTracking, settlement]);
+
+  useEffect(() => {
+    const tracking = reservationTracking;
+    if (!tracking) return;
+    const trackingContext: SparkzReservationTrackingContext = tracking;
+    const trackingOwnerGeneration = ownerGenerationRef.current;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
 
+    const isPollingCurrent = () => !cancelled
+      && mountedRef.current
+      && isOwnerGenerationCurrent(
+        trackingOwnerGeneration,
+        trackingContext.contractId,
+        trackingContext.apiBaseUrl,
+      );
+    const isPollingUiCurrent = () => {
+      if (!isPollingCurrent()) return false;
+      const current = currentSessionContextRef.current;
+      return !current.hasSessionContext
+        || (current.sessionId === trackingContext.sessionId && current.providerId === trackingContext.providerId);
+    };
+
+    const reportCallbackError = (label: string, err: unknown) => {
+      if (isPollingUiCurrent()) setError(`${label} callback failed: ${getErrorMessage(err)}`);
+    };
+
     async function pollReservation() {
+      if (!isPollingCurrent()) return;
       try {
-        const res = await fetch(`${apiBaseUrl}/spend/reservations/${encodeURIComponent(reservation!.id)}`, {
+        const res = await fetch(apiUrl(trackingContext.apiBaseUrl, `/spend/reservations/${encodeURIComponent(trackingContext.reservationId)}`), {
           method: 'GET',
-          headers: contractHeaders(contractId),
+          headers: contractHeaders(trackingContext.contractId),
         });
         const data = await readJson<SparkzReservationSettlement>(res);
-        if (cancelled) return;
+        if (!isPollingCurrent()) return;
+        if (!matchesReservationContext(data, trackingContext)) {
+          if (isPollingUiCurrent()) {
+            setError('Reservation status did not match the saved charging session; polling stopped for safety.');
+          }
+          return;
+        }
         setSettlement(data);
-        if (data.status === 'settled' || data.status === 'released') {
+        if (isTerminalReservationSettlement(data)) {
+          setReceipt(data.spendReceipt || null);
           if (notifiedSettlementId.current !== data.reservationId) {
+            // Mark before invoking application callbacks so a callback error or
+            // rerender cannot cause a second settlement notification.
             notifiedSettlementId.current = data.reservationId;
-            onReservationSettlement?.(data);
+            invokeHostCallback(
+              () => onReservationSettlementRef.current?.(data),
+              err => reportCallbackError('Reservation settlement', err),
+            );
           }
           return;
         }
       } catch (err) {
-        if (!cancelled) setError(getErrorMessage(err));
+        if (isPollingUiCurrent()) setError(getErrorMessage(err));
       }
-      if (!cancelled) timer = setTimeout(pollReservation, Math.max(1000, reservationPollIntervalMs));
+      if (isPollingCurrent()) timer = setTimeout(pollReservation, Math.max(1000, reservationPollIntervalMs));
     }
 
     void pollReservation();
@@ -181,7 +427,7 @@ export default function SparkzChargingCard({
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [apiBaseUrl, contractId, onReservationSettlement, reservation?.id, reservationPollIntervalMs]);
+  }, [normalizedApiBaseUrl, reservationPollIntervalMs, reservationTracking]);
 
   const sessionRequest = useMemo(() => ({
     sessionId,
@@ -195,26 +441,37 @@ export default function SparkzChargingCard({
 
   useEffect(() => {
     let cancelled = false;
+    const walletOwnerGeneration = ownerGenerationRef.current;
+    const isWalletCurrent = () => !cancelled
+      && mountedRef.current
+      && isOwnerGenerationCurrent(walletOwnerGeneration, contractId, normalizedApiBaseUrl);
 
     async function loadWallet() {
+      if (!isWalletCurrent()) return;
       setLoadingWallet(true);
       setWalletError('');
       try {
-        const res = await fetch(`${apiBaseUrl}/wallet/me`, {
+        const res = await fetch(apiUrl(normalizedApiBaseUrl, '/wallet/me'), {
           method: 'GET',
           headers: contractHeaders(contractId),
         });
         const data = await readJson<SparkzWalletResponse>(res);
-        if (cancelled) return;
+        if (!isWalletCurrent()) return;
         setWallet(data);
+        setWalletOwnerContractId(contractId);
+        setWalletOwnerApiBaseUrl(normalizedApiBaseUrl);
         setConnectedWallet(data.walletMode === 'custodial' ? data.walletAddress : '');
-        onWalletLoaded?.(data);
+        invokeHostCallback(() => onWalletLoaded?.(data), (callbackError) => {
+          if (isWalletCurrent()) setWalletError(`Wallet loaded, but the host callback failed: ${getErrorMessage(callbackError)}`);
+        });
       } catch (err) {
-        if (cancelled) return;
+        if (!isWalletCurrent()) return;
         setWallet(null);
+        setWalletOwnerContractId(null);
+        setWalletOwnerApiBaseUrl(null);
         setWalletError(getErrorMessage(err));
       } finally {
-        if (!cancelled) setLoadingWallet(false);
+        if (isWalletCurrent()) setLoadingWallet(false);
       }
     }
 
@@ -222,6 +479,8 @@ export default function SparkzChargingCard({
       void loadWallet();
     } else {
       setWallet(null);
+      setWalletOwnerContractId(null);
+      setWalletOwnerApiBaseUrl(null);
       setWalletError('');
       setLoadingWallet(false);
     }
@@ -229,39 +488,48 @@ export default function SparkzChargingCard({
     return () => {
       cancelled = true;
     };
-  }, [apiBaseUrl, contractId, onWalletLoaded]);
+  }, [contractId, normalizedApiBaseUrl, onWalletLoaded]);
 
   useEffect(() => {
     let cancelled = false;
+    const sessionOwnerGeneration = ownerGenerationRef.current;
+    const sessionGeneration = sessionGenerationRef.current;
+    const sessionScope = currentSessionScopeKey;
+    const isSessionLoadCurrent = () => !cancelled
+      && mountedRef.current
+      && isOwnerGenerationCurrent(sessionOwnerGeneration, contractId, normalizedApiBaseUrl)
+      && isSessionGenerationCurrent(sessionGeneration, sessionScope);
 
     async function loadSession() {
+      if (!isSessionLoadCurrent()) return;
       setLoading(true);
       setError('');
-      setReceipt(null);
-      setDismissed(false);
       try {
-        const res = await fetch(`${apiBaseUrl}/spend/session`, {
+        const res = await fetch(apiUrl(normalizedApiBaseUrl, '/spend/session'), {
           method: 'POST',
           headers: contractHeaders(contractId),
           body: JSON.stringify(sessionRequest),
         });
         const data = await readJson<SparkzSessionResponse>(res);
-        if (cancelled) return;
+        if (!isSessionLoadCurrent()) return;
         setSession(data);
+        setSessionContextKey(currentSessionContextKey);
         setSelectedAmount(data.spend.suggestedAmount > 0 ? data.spend.suggestedAmount.toString() : '');
       } catch (err) {
-        if (cancelled) return;
+        if (!isSessionLoadCurrent()) return;
         setSession(null);
+        setSessionContextKey(null);
         setError(getErrorMessage(err));
       } finally {
-        if (!cancelled) setLoading(false);
+        if (isSessionLoadCurrent()) setLoading(false);
       }
     }
 
     if (hasSessionContext) {
       void loadSession();
-    } else {
+    } else if (isSessionLoadCurrent()) {
       setSession(null);
+      setSessionContextKey(null);
       setError('');
       setLoading(false);
     }
@@ -269,47 +537,85 @@ export default function SparkzChargingCard({
     return () => {
       cancelled = true;
     };
-  }, [apiBaseUrl, contractId, providerId, sessionId, sessionStatus, sessionRequest, hasSessionContext]);
+  }, [contractId, currentSessionContextKey, currentSessionScopeKey, hasSessionContext, normalizedApiBaseUrl, providerId, sessionId, sessionRequest, sessionStatus]);
+
+  useEffect(() => {
+    if (!hasSessionContext) {
+      activeSessionScopeRef.current = null;
+      return;
+    }
+    if (activeSessionScopeRef.current !== currentSessionScopeKey) {
+      activeSessionScopeRef.current = currentSessionScopeKey;
+      setDismissed(false);
+      setReceipt(null);
+    }
+  }, [currentSessionScopeKey, hasSessionContext]);
 
   async function applyDiscount(e: FormEvent) {
     e.preventDefault();
-    if (!session || !sessionId || !providerId) return;
+    if (!visibleSession || !sessionId || !providerId) return;
+    if (reservationPending) {
+      setError('A previous reservation is still settling. Wait for its signed receipt or release before creating another reservation.');
+      return;
+    }
 
     const amount = Number(selectedAmount);
     if (!Number.isFinite(amount) || amount <= 0) {
       setError('Enter an amount greater than 0.');
       return;
     }
-    if (amount > session.spend.maxSpendable) {
-      setError(`Amount cannot exceed ${money(session.spend.maxSpendable)} SPARKZ.`);
+    if (amount > visibleSession.spend.maxSpendable) {
+      setError(`Amount cannot exceed ${money(visibleSession.spend.maxSpendable)} SPARKZ.`);
       return;
     }
 
+    const operation: SpendOperationContext = {
+      token: activeOperationTokenRef.current + 1,
+      ownerGeneration: ownerGenerationRef.current,
+      contractId,
+      apiBaseUrl: normalizedApiBaseUrl,
+      sessionGeneration: sessionGenerationRef.current,
+      sessionScopeKey: currentSessionScopeKey,
+      sessionId,
+      providerId,
+    };
+    activeOperationTokenRef.current = operation.token;
     setSpending(true);
     setError('');
     setReceipt(null);
+    let spendRequestStarted = false;
     try {
+      const assertCurrent = () => {
+        if (!isSpendRequestCurrent(operation)) throw new StaleSpendOperationError();
+      };
+      assertCurrent();
       let authorizationTxHash: string | undefined;
       let reservationWalletAddress: string | undefined;
-      if (wallet?.walletMode === 'custodial') {
+      if (visibleWallet?.walletMode === 'custodial') {
         const ethereum = (window as Window & { ethereum?: BrowserEthereumProvider }).ethereum;
         if (!ethereum) throw new Error('Open the linked wallet to authorize this reservation.');
-        reservationWalletAddress = wallet.walletAddress;
-        const intentRes = await fetch(`${apiBaseUrl}/spend/reservation-approval-intent`, {
+        reservationWalletAddress = visibleWallet.walletAddress;
+        assertCurrent();
+        const intentRes = await fetch(apiUrl(normalizedApiBaseUrl, '/spend/reservation-approval-intent'), {
           method: 'POST',
           headers: contractHeaders(contractId),
           body: JSON.stringify({ walletAddress: reservationWalletAddress, amount, sessionId, providerId }),
         });
         const intent = await readJson<ReservationApprovalIntent>(intentRes);
+        assertCurrent();
         authorizationTxHash = await ethereum.request({
           method: 'eth_sendTransaction', params: [intent.transaction],
         }) as string;
+        assertCurrent();
         if (!authorizationTxHash) throw new Error('The wallet did not return an approval transaction hash.');
         const browserProvider = new ethers.BrowserProvider(ethereum);
         const approvalReceipt = await browserProvider.waitForTransaction(authorizationTxHash);
+        assertCurrent();
         if (!approvalReceipt || approvalReceipt.status !== 1) throw new Error('The wallet authorization transaction failed.');
       }
-      const res = await fetch(`${apiBaseUrl}/spend/me`, {
+      assertCurrent();
+      spendRequestStarted = true;
+      const res = await fetch(apiUrl(normalizedApiBaseUrl, '/spend/me'), {
         method: 'POST',
         headers: contractHeaders(contractId),
         body: JSON.stringify({
@@ -322,49 +628,88 @@ export default function SparkzChargingCard({
         }),
       });
       const data = await readJson<SpendResponse>(res);
+      if (!isReservationRetentionCurrent(operation)) throw new StaleSpendOperationError();
       setReservation(data.reservation);
+      setReservationTracking({
+        reservationId: data.reservation.id,
+        contractId,
+        apiBaseUrl: normalizedApiBaseUrl,
+        sessionId,
+        providerId,
+      });
       setSettlement(null);
       notifiedSettlementId.current = null;
-      onReservationSuccess?.(data.reservation);
-      if (hideAfterSpend) {
+      invokeHostCallback(() => onReservationSuccess?.(data.reservation), (callbackError) => {
+        if (isReservationRetentionCurrent(operation)) {
+          setError(`Reservation created, but the host callback failed: ${getErrorMessage(callbackError)}`);
+        }
+      });
+      if (!isReservationRetentionCurrent(operation)) return;
+      if (hideAfterSpend && shouldDismissAfterReservation(operation)) {
         setDismissed(true);
-        onDismiss?.('spent');
+        invokeHostCallback(() => onDismiss?.('spent'), (callbackError) => {
+          if (isReservationRetentionCurrent(operation)) {
+            setError(`Reservation created, but the host dismiss callback failed: ${getErrorMessage(callbackError)}`);
+          }
+        });
       }
     } catch (err) {
-      setError(getErrorMessage(err));
-      onSpendError?.(err);
+      if (err instanceof StaleSpendOperationError && !spendRequestStarted) return;
+      if (!isSpendOwnerOperationCurrent(operation)) return;
+      if (isSpendRequestCurrent(operation)) setError(getErrorMessage(err));
+      invokeHostCallback(() => onSpendError?.(err), (callbackError) => {
+        if (isSpendOwnerOperationCurrent(operation)) {
+          setError(`Spend failed, but the host error callback failed: ${getErrorMessage(callbackError)}`);
+        }
+      });
     } finally {
-      setSpending(false);
+      if (isSpendOwnerOperationCurrent(operation)) setSpending(false);
     }
   }
 
   function skipSession() {
-    if (!session || !sessionId || !providerId) return;
-    onSkipSession?.({ contractId, sessionId, providerId, chargerId, sessionStatus: session.sessionStatus });
+    if (!visibleSession || !sessionId || !providerId) return;
+    onSkipSession?.({ contractId, sessionId, providerId, chargerId, sessionStatus: visibleSession.sessionStatus });
     if (hideAfterSkip) {
       setDismissed(true);
       onDismiss?.('skipped');
     }
   }
 
-  async function loadWalletProfile() {
-    const walletRes = await fetch(`${apiBaseUrl}/wallet/me`, {
+  async function loadWalletProfile(
+    expectedOwnerGeneration = ownerGenerationRef.current,
+    expectedOperationToken = activeWalletOperationTokenRef.current,
+  ) {
+    const isCurrent = () => isOwnerGenerationCurrent(expectedOwnerGeneration, contractId, normalizedApiBaseUrl)
+      && activeWalletOperationTokenRef.current === expectedOperationToken;
+    if (!isCurrent()) throw new StaleSpendOperationError();
+    const walletRes = await fetch(apiUrl(normalizedApiBaseUrl, '/wallet/me'), {
       method: 'GET',
       headers: contractHeaders(contractId),
     });
     const walletData = await readJson<SparkzWalletResponse>(walletRes);
+    if (!isCurrent()) throw new StaleSpendOperationError();
     setWallet(walletData);
+    setWalletOwnerContractId(contractId);
+    setWalletOwnerApiBaseUrl(normalizedApiBaseUrl);
     setConnectedWallet(walletData.walletMode === 'custodial' ? walletData.walletAddress : '');
     return walletData;
   }
 
-  async function connectAndSignCustodialWallet(): Promise<string> {
+  async function connectAndSignCustodialWallet(
+    expectedOwnerGeneration: number,
+    expectedOperationToken: number,
+  ): Promise<string> {
+    const isCurrent = () => isOwnerGenerationCurrent(expectedOwnerGeneration, contractId, normalizedApiBaseUrl)
+      && activeWalletOperationTokenRef.current === expectedOperationToken;
+    if (!isCurrent()) throw new StaleSpendOperationError();
     const ethereum = (window as Window & { ethereum?: BrowserEthereumProvider }).ethereum;
     if (!ethereum) {
       throw new Error('No wallet app found. Install or open MetaMask, Rabby, or another EVM wallet.');
     }
 
     const accounts = await ethereum.request({ method: 'eth_requestAccounts' }) as string[];
+    if (!isCurrent()) throw new StaleSpendOperationError();
     const rawWalletAddress = accounts?.[0];
     if (!rawWalletAddress) {
       throw new Error('No wallet account was selected.');
@@ -374,21 +719,25 @@ export default function SparkzChargingCard({
     const message = getLinkedWalletSignatureMessage(contractId, walletAddress);
     let signature: unknown;
     try {
+      if (!isCurrent()) throw new StaleSpendOperationError();
       signature = await ethereum.request({ method: 'personal_sign', params: [message, walletAddress] });
     } catch {
+      if (!isCurrent()) throw new StaleSpendOperationError();
       signature = await ethereum.request({ method: 'personal_sign', params: [walletAddress, message] });
     }
 
+    if (!isCurrent()) throw new StaleSpendOperationError();
     if (typeof signature !== 'string' || !signature) {
       throw new Error('Wallet signature was not returned.');
     }
 
-    const linkRes = await fetch(`${apiBaseUrl}/wallet/${encodeURIComponent(contractId)}/linked-wallets`, {
+    const linkRes = await fetch(apiUrl(normalizedApiBaseUrl, `/wallet/${encodeURIComponent(contractId)}/linked-wallets`), {
       method: 'POST',
       headers: contractHeaders(contractId),
       body: JSON.stringify({ walletAddress, signature }),
     });
     await readJson<SparkzWalletResponse>(linkRes);
+    if (!isCurrent()) throw new StaleSpendOperationError();
     setConnectedWallet(walletAddress);
     return walletAddress;
   }
@@ -396,16 +745,23 @@ export default function SparkzChargingCard({
   async function switchWalletMode(mode: 'managed' | 'custodial') {
     if (!contractId) return;
 
+    const operationOwnerGeneration = ownerGenerationRef.current;
+    const operationToken = activeWalletOperationTokenRef.current + 1;
+    activeWalletOperationTokenRef.current = operationToken;
+    const isCurrent = () => isOwnerGenerationCurrent(operationOwnerGeneration, contractId, normalizedApiBaseUrl)
+      && activeWalletOperationTokenRef.current === operationToken;
     setSwitchingMode(true);
     setWalletError('');
     try {
+      if (!isCurrent()) throw new StaleSpendOperationError();
       let walletAddress: string | undefined;
       if (mode === 'custodial') {
         setSigningWallet(true);
-        walletAddress = await connectAndSignCustodialWallet();
+        walletAddress = await connectAndSignCustodialWallet(operationOwnerGeneration, operationToken);
+        if (!isCurrent()) throw new StaleSpendOperationError();
       }
 
-      const res = await fetch(`${apiBaseUrl}/wallet/${encodeURIComponent(contractId)}/mode`, {
+      const res = await fetch(apiUrl(normalizedApiBaseUrl, `/wallet/${encodeURIComponent(contractId)}/mode`), {
         method: 'POST',
         headers: contractHeaders(contractId),
         body: JSON.stringify({
@@ -415,13 +771,19 @@ export default function SparkzChargingCard({
         }),
       });
       await readJson<{ status: 'success' }>(res);
-      const walletData = await loadWalletProfile();
-      onWalletModeChange?.(walletData);
+      if (!isCurrent()) throw new StaleSpendOperationError();
+      const walletData = await loadWalletProfile(operationOwnerGeneration, operationToken);
+      invokeHostCallback(() => onWalletModeChange?.(walletData), (callbackError) => {
+        if (isCurrent()) setWalletError(`Wallet mode changed, but the host callback failed: ${getErrorMessage(callbackError)}`);
+      });
     } catch (err) {
+      if (err instanceof StaleSpendOperationError || !isCurrent()) return;
       setWalletError(getErrorMessage(err));
     } finally {
-      setSwitchingMode(false);
-      setSigningWallet(false);
+      if (isCurrent()) {
+        setSwitchingMode(false);
+        setSigningWallet(false);
+      }
     }
   }
 
@@ -464,39 +826,39 @@ export default function SparkzChargingCard({
         <dl className="sparkz-card__metadata">
           <div>
             <dt>Contract ID</dt>
-            <dd>{wallet?.uid || contractId}</dd>
+            <dd>{visibleWallet?.uid || contractId}</dd>
           </div>
           <div>
             <dt>Blockchain address</dt>
             <dd>
-              {wallet?.walletAddress ? (
-                <a href={`${polygonExplorerBaseUrl.replace(/\/$/, '')}/address/${wallet.walletAddress}`} target="_blank" rel="noopener noreferrer">
-                  {shortAddress(wallet.walletAddress)}
+              {visibleWallet?.walletAddress ? (
+                <a href={`${polygonExplorerBaseUrl.replace(/\/$/, '')}/address/${visibleWallet.walletAddress}`} target="_blank" rel="noopener noreferrer">
+                  {shortAddress(visibleWallet.walletAddress)}
                 </a>
               ) : 'Loading...'}
             </dd>
           </div>
           <div>
             <dt>Wallet mode</dt>
-            <dd>{wallet?.walletMode || 'managed'}</dd>
+            <dd>{visibleWallet?.walletMode || 'managed'}</dd>
           </div>
           <div>
             <dt>Managed wallet</dt>
-            <dd>{shortAddress(wallet?.managedWalletAddress)}</dd>
+            <dd>{shortAddress(visibleWallet?.managedWalletAddress)}</dd>
           </div>
         </dl>
 
-        {wallet?.contractIds && wallet.contractIds.length > 1 && (
+        {visibleWallet?.contractIds && visibleWallet.contractIds.length > 1 && (
           <div className="sparkz-card__account-list">
             <strong>Linked contract IDs</strong>
-            <span>{wallet.contractIds.join(', ')}</span>
+            <span>{visibleWallet.contractIds.join(', ')}</span>
           </div>
         )}
 
-        {wallet?.linkedWallets && wallet.linkedWallets.length > 0 && (
+        {visibleWallet?.linkedWallets && visibleWallet.linkedWallets.length > 0 && (
           <div className="sparkz-card__account-list">
             <strong>Linked wallets</strong>
-            {wallet.linkedWallets.map(item => (
+            {visibleWallet.linkedWallets.map(item => (
               <span key={item.walletAddress}>{item.walletName ? `${item.walletName}: ` : ''}{shortAddress(item.walletAddress)}</span>
             ))}
           </div>
@@ -514,7 +876,7 @@ export default function SparkzChargingCard({
           </button>
         </div>
 
-        {wallet?.walletMode === 'custodial' && (
+        {visibleWallet?.walletMode === 'custodial' && (
           <button className="sparkz-card__secondary-button" type="button" onClick={() => void switchWalletMode('managed')} disabled={switchingMode}>
             Use managed wallet
           </button>
@@ -559,28 +921,28 @@ export default function SparkzChargingCard({
           <img className="sparkz-card__logo-image" src={logoSrc || sparkzLogo} alt="SPARKZ" />
         </div>
         <span className="sparkz-card__pill">{displayStatus}</span>
-        {session && (
+        {visibleSession && (
           <div className="sparkz-card__headline">
-            <h2>{session.spend.message}</h2>
+            <h2>{visibleSession.spend.message}</h2>
           </div>
         )}
       </div>
 
       {loading && <p className="sparkz-card__muted">Loading session rewards...</p>}
-      {loadingWallet && !wallet && <p className="sparkz-card__muted">Loading SPARKZ account...</p>}
+      {loadingWallet && !visibleWallet && <p className="sparkz-card__muted">Loading SPARKZ account...</p>}
 
-      {!session && !loading && (
+      {!visibleSession && !loading && (
         <div className="sparkz-card__idle">
           <p>No active charging session.</p>
         </div>
       )}
 
-      <div className={`sparkz-card__stats${session ? ' sparkz-card__stats--session' : ''}`}>
+      <div className={`sparkz-card__stats${visibleSession ? ' sparkz-card__stats--session' : ''}`}>
         <div>
           <span>Available</span>
           <strong>{money(walletBalance)}</strong>
         </div>
-        {!session && (
+        {!visibleSession && (
           <>
             <div>
               <span>Earned</span>
@@ -594,25 +956,32 @@ export default function SparkzChargingCard({
         )}
       </div>
 
-      {session && (
+      {visibleSession && (
         <>
-          {renderRewardRates(session.rewardRates)}
+          {renderRewardRates(visibleSession.rewardRates)}
 
-          {session.spend.eligible ? (
+          {reservationPending && (
+            <p className="sparkz-card__notice" role="status">
+              A previous reservation is still settling. Wait for its signed receipt or release before creating another reservation.
+            </p>
+          )}
+
+          {visibleSession.spend.eligible ? (
             <form className="sparkz-card__form" onSubmit={applyDiscount}>
               <label>
                 Use SPARKZ for this charging session?
                 <input
                   type="number"
                   min="0.01"
-                  max={session.spend.maxSpendable}
+                  max={visibleSession.spend.maxSpendable}
                   step="0.01"
                   value={selectedAmount}
                   onChange={(event) => setSelectedAmount(event.target.value)}
+                  disabled={reservationPending}
                 />
               </label>
-              <button type="submit" disabled={spending}>
-                {spending ? 'Applying...' : 'Apply discount'}
+              <button type="submit" disabled={spending || reservationPending}>
+                {spending ? 'Applying...' : reservationPending ? 'Waiting for reservation' : 'Apply discount'}
               </button>
               <button className="sparkz-card__secondary-button" type="button" onClick={skipSession} disabled={spending}>
                 Do not spend tokens for this session
@@ -620,7 +989,7 @@ export default function SparkzChargingCard({
             </form>
           ) : (
             <div className="sparkz-card__notice">
-              <p>{session.spend.message}</p>
+              <p>{visibleSession.spend.message}</p>
               <button className="sparkz-card__secondary-button" type="button" onClick={skipSession}>
                 Continue without SPARKZ
               </button>
@@ -629,7 +998,7 @@ export default function SparkzChargingCard({
         </>
       )}
 
-      {!session && showWalletDetails && (
+      {!visibleSession && showWalletDetails && (
         <div className="sparkz-card__details">
           <div className="sparkz-card__tabs" role="tablist" aria-label="SPARKZ details">
             <button
@@ -668,22 +1037,34 @@ export default function SparkzChargingCard({
         </div>
       )}
 
-      {receipt && (
+      {visibleReceipt && (
         <div className="sparkz-card__receipt" role="status">
           <strong>Discount applied</strong>
-          <span>Receipt {receipt.payload.receiptId}</span>
+          <span>Receipt {visibleReceipt.payload.receiptId}</span>
         </div>
       )}
-      {reservation && (
+      {visibleReservation && (
         <div className="sparkz-card__receipt" role="status">
-          <strong>{settlement?.status === 'settled'
-            ? `${settlement.settledSparkz} SPARKZ settled`
-            : settlement?.status === 'released'
+          <strong>{visibleSettlementIsTerminal && visibleSettlement?.status === 'settled'
+            ? `${visibleSettlement.settledSparkz} SPARKZ settled`
+            : visibleSettlementIsTerminal && visibleSettlement?.status === 'released'
               ? 'SPARKZ reservation released'
-              : `${reservation.amount} SPARKZ reserved`}</strong>
-          <span>{settlement?.status === 'settled' || settlement?.status === 'released'
-            ? `${settlement.freeKwh} kWh free; ${settlement.releasedSparkz || '0.00'} SPARKZ released.`
-            : `Up to ${reservation.kWhEntitlement} kWh will be free. Unused SPARKZ are released after the final CDR.`}</span>
+              : visibleSettlement?.requiresReview
+                ? 'SPARKZ settlement requires review'
+              : visibleSettlement?.status === 'settled'
+                ? 'SPARKZ settlement confirmed; receipt pending'
+              : `${visibleReservation.amount === '0.00' ? 'Existing' : visibleReservation.amount} SPARKZ reserved`}</strong>
+          <span>{visibleSettlementIsTerminal
+            ? `${visibleSettlement?.freeKwh || '0.00'} kWh free; ${visibleSettlement?.releasedSparkz || '0.00'} SPARKZ released.`
+            : visibleSettlement?.requiresReview
+              ? 'The saved settlement needs review before the card can confirm it.'
+            : visibleSettlement?.status === 'settled'
+              ? 'The token movement is known. The signed receipt is pending.'
+            : visibleSettlement?.status === 'released'
+              ? 'The release response needs validation before it can be confirmed.'
+            : visibleReservation.amount === '0.00'
+              ? 'Resumed reservation status is loading.'
+              : `Up to ${visibleReservation.kWhEntitlement} kWh will be free. Unused SPARKZ are released after the final CDR.`}</span>
         </div>
       )}
 
