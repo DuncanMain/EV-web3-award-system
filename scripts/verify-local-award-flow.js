@@ -45,17 +45,8 @@ const REPLACEMENT_PROVIDER_ID = 'local-replacement-provider';
 const REPLACEMENT_PROVIDER_ALT_ID = 'local-replacement-provider-alt';
 const REPLACEMENT_EVSE_ID = 'DE*REPLACE*1';
 const DERIVATION_SALT = `nvf-local-acceptance-${HARNESS_ID}`;
-
-function requiredPrivateKey(name) {
-  const value = process.env[name];
-  if (!/^0x[0-9a-fA-F]{64}$/.test(value || '')) {
-    throw new Error(`${name} must be supplied as a 32-byte local test key; no key is embedded in this harness`);
-  }
-  return value;
-}
-
-const TREASURY_PRIVATE_KEY = requiredPrivateKey('NVF_LOCAL_TREASURY_PRIVATE_KEY');
-const HARDHAT_ACCOUNT_ONE_PRIVATE_KEY = requiredPrivateKey('NVF_LOCAL_HARDHAT_ACCOUNT_ONE_PRIVATE_KEY');
+const TREASURY_PRIVATE_KEY = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
+const HARDHAT_ACCOUNT_ONE_PRIVATE_KEY = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d';
 
 const children = new Set();
 const resources = {

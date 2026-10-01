@@ -1,8 +1,8 @@
 # Deployment handoff for Dejan
 
-**Review handoff only — not a deployment approval.** The candidate remains
-local and undeployed. Do not send this document as evidence that a production
-release exists.
+**Review handoff only — not a deployment approval.** The reviewed source
+candidate is not deployed. Do not send this document as evidence that a
+production release exists.
 
 ## Branch and automation boundary
 
@@ -13,8 +13,8 @@ production workflow is attached to pushes to `main`; do not merge or push to
 `main`, invoke that workflow, or rely on a `:latest` image as a release
 identifier during this handoff.
 
-The root coordinator owns the eventual push. This local handoff does not push,
-publish, start, restart, or reconfigure any service.
+This handoff does not push, publish, start, restart, or reconfigure any
+service.
 
 ## Verified local evidence
 

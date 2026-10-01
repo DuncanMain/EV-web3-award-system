@@ -16,17 +16,11 @@ provider, partner webhook, or production wallet was used.
 | Backend build | `npm.cmd run build` | Passed. |
 | Backend tests | `npm.cmd test -- --runInBand` | 17 suites; 321 passed, 6 opt-in tests skipped. |
 | Disposable PostgreSQL | `node scripts/run-disposable-postgres-tests.js` | 2 suites; 15 passed against a unique disposable database. |
-| HTTP contract | `node scripts/verify-api-contract-matrix.js` | 178/178 finite disposable HTTP cases passed; route inventory and safe error checks included. The runner requires environment-supplied local test keys and never commits them. |
+| HTTP contract | `node scripts/verify-api-contract-matrix.js` | 178/178 finite disposable HTTP cases passed; route inventory and safe error checks included. |
 | Admin HTTP contract | `node scripts/verify-local-admin-api-matrix.js` | 199/199 disposable-fixture cases passed with no findings. |
-| Award/recovery flow | `node scripts/verify-local-award-flow.js` | Local disposable PostgreSQL, Hardhat 31337, and API flow passed identity, policy, receipt, recovery, failure, concurrency, and replacement-session checks. The runner requires environment-supplied local test keys. |
+| Award/recovery flow | `node scripts/verify-local-award-flow.js` | Local disposable PostgreSQL, Hardhat 31337, and API flow passed identity, policy, receipt, recovery, failure, concurrency, and replacement-session checks. |
 | Frontend | `npm.cmd --prefix frontend run build` and the focused strict TypeScript command in `DEPLOYMENT.md` | Passed. |
 | BEIA package | `npm.cmd --prefix packages/sparkz-charging-card test` | 12 package lifecycle/artifact checks passed; package remains unpublished. |
-
-The two disposable Hardhat-backed harnesses require the local-only environment
-variables `NVF_LOCAL_TREASURY_PRIVATE_KEY` and
-`NVF_LOCAL_HARDHAT_ACCOUNT_ONE_PRIVATE_KEY`. They validate the variables and
-do not contain or print private keys. Values must be supplied outside Git and
-must never be copied into a release record.
 
 The local candidate also recorded policy persistence/reload, migration 017,
 financial/identity digest preservation, admin recovery, audit redaction,
