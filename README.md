@@ -13,25 +13,11 @@ This module provides internal functions for:
 
 Built for Polygon Amoy network integration with the NVF contract.
 
-## Deployment status
+## Production deployment
 
-The deployed main baseline is merge commit
-`87b35bdf4e0d9bde7b4d8c4cbb93ab459b0f321a` (PR #6, 6 October 2026). GitHub
-independently recorded successful production run [Deploy Neverflat #45](https://github.com/ZentrixLab/neverflat/actions/runs/37457660589)
-and mirror run [Mirror Repositories #33](https://github.com/ZentrixLab/neverflat/actions/runs/37457660702).
-The immutable candidate commit `5a3b4386d71d97d568942dc5d705f4f438c6133d`
-had the same released tree `d5382d1eff4dadb8b189ae1869095418637e6e0d` as
-that merge. This branch adds the follow-up fixes and will be identified by its
-own review commit.
-The built image digest and post-start target health, readiness, backup, and
-migration acceptance evidence are not captured in this record. This
-release-fixes branch is prepared for review on Zentrix `development`; Dejan
-promotes it to `main` after review, so its follow-up changes are outside the
-verified `87b35bd` deployment until that promotion and a separate acceptance
-record.
-
-See [`DEPLOYMENT.md`](DEPLOYMENT.md) for immutable-image preflight,
-backup/restore, migration, rollout, and rollback gates.
+Production deployments run when `main` is updated in `ZentrixLab/neverflat`.
+See [`DEPLOYMENT.md`](DEPLOYMENT.md) for configuration, preflight, backup,
+migration, rollout, and rollback procedures.
 
 ## Identifier Terminology
 

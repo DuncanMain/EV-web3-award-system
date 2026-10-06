@@ -1,17 +1,14 @@
 # BEIA SPARKZ Integration Guide
 
-This guide describes the `@neverflat/sparkz-charging-card` integration for the
-deployed main backend baseline and the follow-up package prepared for Zentrix
-`development`. It is an integration contract; it does not claim registry or
-partner publication or live target acceptance.
+This guide describes the `@neverflat/sparkz-charging-card` integration and its
+backend/API contract. It does not claim registry or partner publication or
+live target acceptance. See [DEPLOYMENT.md](../DEPLOYMENT.md) for operational
+configuration and target acceptance procedures.
 
-## Candidate and deployment status
+## Package status
 
-The deployed backend baseline is merge commit
-`87b35bdf4e0d9bde7b4d8c4cbb93ab459b0f321a` (PR #6, 6 October 2026). The
-follow-up package is prepared for Zentrix `development` and awaits Dejan's
-promotion to `main`; package publication and partner handoff are not claimed.
-The tracked 0.2.0 archive is historical and must not be overwritten.
+Package publication and partner handoff are not claimed. The tracked 0.2.0
+archive is historical and must not be overwritten.
 
 The current workspace artifact is
 `@neverflat/sparkz-charging-card@0.2.1-rc.1`. Its source-tree filename and

@@ -1,12 +1,10 @@
 # NEVERFLAT SPARKZ API
 
-**Documentation status:** the deployed main baseline is merge commit
-`87b35bdf4e0d9bde7b4d8c4cbb93ab459b0f321a` (PR #6, 6 October 2026). This
-release-fixes branch contains follow-up deployment, package, migration, and
-active-wallet changes prepared for Zentrix `development` and awaiting Dejan's
-promotion to `main`; those changes are outside the verified baseline until a
-separate deployment acceptance record. This file does not confirm target
-credentials, database contents, RPC availability, or live post-start checks.
+This document defines the API contract. Deployment configuration, operational
+procedures, and target acceptance evidence are maintained in
+[DEPLOYMENT.md](DEPLOYMENT.md) and the dated release records. This file does
+not confirm target credentials, database contents, RPC availability, or live
+post-start checks.
 
 The machine-readable contract is served by the same build at `GET /openapi.json`
 and by the `/docs` and `/api-docs` aliases. Keep this document and the embedded
@@ -19,8 +17,8 @@ made 178 requests with 178 passing cases; the separate admin matrix passed
 the disposable PostgreSQL checks passed 15 tests, and the local
 award-flow/reliability harness passed. The [local release verification
 record](docs/RELEASE_VERIFICATION_2026-10-01.md) consolidates the safe result
-summary. These are dated historical local evidence for the earlier candidate,
-not deployment approval or acceptance evidence for the development follow-up.
+summary. These are dated historical local evidence, not deployment approval or
+target acceptance evidence.
 
 ## 1. Identity and authentication
 
@@ -571,10 +569,8 @@ Keep existing wallet derivation, database column names, and standards wire names
 unchanged. The additive policy, charging-session, and active-wallet schema work
 requires a target-specific reviewed migration/backup procedure. Local
 activation used loopback disposable/controlled resources and does not authorize
-a production migration. The successful production workflow recorded for the
-deployed baseline is [Deploy Neverflat #45](https://github.com/ZentrixLab/neverflat/actions/runs/37457660589);
-its image digest and post-start target acceptance response are not recorded
-here.
+a production migration. See [DEPLOYMENT.md](DEPLOYMENT.md) for the operational
+procedure and target acceptance record.
 
 For BEIA component integration, use the [BEIA guide](docs/BEIA_INTEGRATION.md).
 For rationale and system architecture, see

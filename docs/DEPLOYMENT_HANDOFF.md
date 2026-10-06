@@ -1,30 +1,25 @@
-# Deployment handoff for Dejan
+# Deployment handoff
 
-**Review handoff only — not a deployment approval.** The deployed main
-baseline is merge commit `87b35bdf4e0d9bde7b4d8c4cbb93ab459b0f321a` (PR #6,
-6 October 2026). The follow-up fixes in this handoff are prepared for
-Zentrix `development` and await Dejan's review and promotion to `main`.
+The deployed main baseline is merge commit `87b35bdf4e0d9bde7b4d8c4cbb93ab459b0f321a`
+(PR #6, 6 October 2026). This handoff records the operational procedures,
+current verification evidence, and target facts required before a production
+rollout.
 
 ## Branch and automation boundary
 
-The reviewed fixes are prepared for the existing ZentrixLab/neverflat
-`development` branch. Keep the deployed baseline and Zentrix `main` unchanged
-until the target release has passed the backup, migration, preservation, and
-acceptance gates. Dejan promotes the reviewed development result to `main`;
-the production workflow is attached to pushes to `main`. The workflow uses an
-immutable Docker digest, not a `:latest` release identifier.
-
-This handoff does not push, publish, start, restart, or reconfigure any
-service.
+The existing ZentrixLab/neverflat `development` branch is used for integration.
+Keep the deployed baseline and `main` unchanged until the target release has
+passed the backup, migration, preservation, and acceptance gates. The
+production workflow is attached to pushes to `main` and uses an immutable
+Docker digest, not a `:latest` release identifier.
 
 ## Verified local evidence
 
 The exact command results are consolidated in
 [RELEASE_VERIFICATION_2026-10-01.md](RELEASE_VERIFICATION_2026-10-01.md):
 
-These results are the dated historical local candidate record; they predate the
-follow-up fixes in this handoff and are not acceptance evidence for that
-follow-up.
+These results are the dated historical local candidate record; they are not
+target acceptance evidence for the current source.
 
 - backend build passed;
 - 17 Jest suites passed with 321 tests passed and 6 opt-in tests skipped;
@@ -39,8 +34,8 @@ target data, target restore, live RPC/provider behavior, post-start health or
 readiness, or partner webhook delivery. Package publication and partner
 handoff remain unclaimed.
 
-The current follow-up workspace artifact was repacked after the reproducible
-build instructions were changed to `npm ci`. Its SHA-256 is
+The current package artifact was repacked after the reproducible build
+instructions were changed to `npm ci`. Its SHA-256 is
 `1E7B4666445AC129FA00299F1F5BA9A784DD61DDD3565527AC962784B3AD4AFE`.
 Node 22 backend verification passed 19 Jest suites with 327 tests and 12
 opt-in tests skipped, plus 21 real PostgreSQL integration checks. The current
@@ -67,7 +62,7 @@ vulnerabilities. The target acceptance record remains pending.
    UID constraint, and review migration 015 duplicate transaction hashes.
    Approve a target-specific additive migration procedure for policy 016,
    session guard 017, and standalone active-wallet migration 022. Campaign
-   migrations 018–021 remain outside this branch.
+   migrations 018–021 remain outside this release.
 6. Apply the reviewed migration with the API stopped, verify schema/index
    readiness, and compare the preservation snapshot. Do not use local
    loopback migration runners against a target.
@@ -108,6 +103,6 @@ resolved.
 The production workflow and mirror results for the deployed baseline are
 recorded in the root deployment documentation. The built image digest and
 target post-start acceptance response for that run are not captured here. The
-follow-up release SHA, image digest, target database/backup record, restore
-result, migration decision, maintenance window, target secret owners, and
-final approval remain target-specific handoff fields.
+source revision, image digest, target database/backup record, restore result,
+migration decision, maintenance window, target secret owners, and final
+approval remain target-specific handoff fields.

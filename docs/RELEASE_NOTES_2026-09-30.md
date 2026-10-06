@@ -5,14 +5,13 @@ deployed main baseline is merge commit
 `87b35bdf4e0d9bde7b4d8c4cbb93ab459b0f321a` (PR #6, 6 October 2026), with
 successful [production run #45](https://github.com/ZentrixLab/neverflat/actions/runs/37457660589)
 and [mirror run #33](https://github.com/ZentrixLab/neverflat/actions/runs/37457660702).
-The follow-up fixes are prepared for Zentrix `development` and await Dejan's
-promotion to `main`. This dated note remains historical local evidence and is
-not a substitute for target acceptance.
+This dated note remains historical local evidence and is not a substitute for
+target acceptance.
 
 The operator rollout procedure is [`DEPLOYMENT.md`](../DEPLOYMENT.md). The
 successful workflow results do not capture the built image digest or
 post-start target health/readiness, backup, or migration acceptance evidence.
-Those target facts are intentionally not fabricated in these notes.
+Those target facts are not recorded in these historical notes.
 
 ## Included in this candidate
 
@@ -104,8 +103,8 @@ names remain where required, but their ownership value must be the provisioned
 eMAID. No automatic wallet relinking is performed. Partners adding direct
 manual spends must adopt stable idempotency keys; OCPI/OICP senders must supply
 an agreeing eMAID-bearing identity. The package must be aligned with the
-matching backend/API version. The documented baseline is deployed; the
-development follow-up remains subject to review and promotion.
+matching backend/API version. The documented baseline is deployed; source
+changes require the target acceptance procedure before rollout.
 
 The local schema work is additive. The strict historical migration path still
 encounters legacy duplicate data. Local activation used reviewed scoped runners
@@ -113,7 +112,7 @@ for token-operation safeguards, reward policy migration 016, and charging-
 session guard migration 017; those runners are local review tools, not
 production deployment commands. Standalone migration 022 adds explicit
 active-wallet selection; campaign migrations 018–021 remain outside this
-branch. Production needs a target-specific reviewed migration procedure,
+release. Production needs a target-specific reviewed migration procedure,
 fresh physical backup, verified backup evidence, before/after financial and
 wallet/eMAID digests, and a tested rollback plan.
 
@@ -178,7 +177,7 @@ manual-spend keys, reservation resume, reconciliation, alerts, and rollback.
 These are post-deployment acceptance checks, not a request to add speculative
 features before the API is available.
 
-The target acceptance record for the development follow-up remains pending:
+The target acceptance record for this source change remains pending:
 candidate commit, immutable image digest, target host/proxy, database and TLS
 facts, verified backup manifest, restore result, writer-quiescence window,
 target migration result, before/after financial and wallet/eMAID digests,

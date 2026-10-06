@@ -12,17 +12,14 @@ recorded successful [Deploy Neverflat #45](https://github.com/ZentrixLab/neverfl
 and [Mirror Repositories #33](https://github.com/ZentrixLab/neverflat/actions/runs/37457660702).
 The immutable candidate commit `5a3b4386d71d97d568942dc5d705f4f438c6133d`
 had the same released tree `d5382d1eff4dadb8b189ae1869095418637e6e0d` as
-that merge. This branch adds the follow-up fixes and will be identified by its
-own review commit.
-Those workflow results do not record the built image digest or post-start target
-health/readiness, backup, or migration acceptance evidence. The follow-up fixes
-in this branch are prepared for Zentrix `development` and await Dejan's review
-and promotion to `main`; they are outside the verified `87b35bd` deployment.
+that merge. Those workflow results do not record the built image digest or
+post-start target health/readiness, backup, or migration acceptance evidence.
+Current source changes require the same operational gates and a separate target
+acceptance record before production rollout.
 
 The local verification used disposable PostgreSQL, Hardhat 31337, and API
 processes. It did not use the live server, Polygon Amoy, external providers,
-the active dashboard database, or production credentials. It also did not
-modify `STATE.md`.
+the active dashboard database, or production credentials.
 
 See the [dated release notes](docs/RELEASE_NOTES_2026-09-30.md) and the
 [local release verification record](docs/RELEASE_VERIFICATION_2026-10-01.md)
@@ -80,7 +77,7 @@ repository or logs:
 - the provisioned test eMAID and partner smoke-test payloads; and
 - the reviewed target migration procedure and its rollback/recovery decision.
 
-The operator `.env` must already contain the target values before promotion:
+The operator `.env` must already contain the target values before deployment:
 `COMPOSE_PROJECT_NAME=neverflat`, `DEPLOY_ENV_FILE` pointing to that same
 file, `POSTGRES_VOLUME_NAME` matching the existing `neverflat-db` data volume,
 `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, and a matching
@@ -174,15 +171,15 @@ The package remains an artifact handoff with no registry publication claim. If
 source, dependencies, or configuration change after that evidence, rerun the
 affected checks before assigning a release record.
 
-The current `release-fixes` follow-up has separate focused evidence: Node 22
-backend verification passed 19 Jest suites with 327 tests and 12 opt-in tests
-skipped, plus 21 real PostgreSQL integration checks; the offline deployment
-helper suite passed 16 tests, the charging-card package passed 12 tests, the
+The current source verification has separate focused evidence: Node 22 backend
+verification passed 19 Jest suites with 327 tests and 12 opt-in tests skipped,
+plus 21 real PostgreSQL integration checks; the offline deployment helper suite
+passed 16 tests, the charging-card package passed 12 tests, the
 frontend build and package/frontend audits passed, and a portable Node 22 probe
 returned `v22.23.3`. The combined Node 22.23.3 root/frontend/Sparkz
 `npm run ci:check` passed with all audits at zero vulnerabilities. These checks
-do not replace the historical backend evidence above; the target acceptance
-record remains pending in this handoff.
+do not replace the historical backend evidence above; target post-start
+acceptance remains a separate operational record.
 
 The isolated deployment helper checks are run with:
 
@@ -256,7 +253,7 @@ confirms migration 008's scoped uniqueness and removal of the obsolete global
 UID constraint, handles migration 015 duplicate transaction hashes, policy 016,
 guard 017, and standalone migration 022 according to the actual target schema
 and data. Migration 022 is the standalone active-wallet fix; the campaign's
-reserved 018–021 range remains outside this branch. The target-specific
+reserved 018–021 range remains outside this release. The target-specific
 procedure and migration result are not yet recorded here.
 
 The source audit also requires two focused acceptance checks for the follow-up

@@ -1,19 +1,15 @@
 ---
 source_document: NEVERFLAT_Award_System_Documentation.docx
-status: deployed main baseline with development follow-up fixes
+status: system documentation
 updated: 2026-10-06
 ---
 
 # NEVERFLAT Award and Wallet System
 
-This document describes the deployed main baseline and the follow-up changes
-prepared for Zentrix `development`. The baseline is merge commit
-`87b35bdf4e0d9bde7b4d8c4cbb93ab459b0f321a` (PR #6, 6 October 2026). GitHub
-recorded successful [production run #45](https://github.com/ZentrixLab/neverflat/actions/runs/37457660589)
-and [mirror run #33](https://github.com/ZentrixLab/neverflat/actions/runs/37457660702).
-The image digest and post-start target health, readiness, backup, and migration
-acceptance evidence are not captured here. Development follow-up changes await
-Dejan's promotion to `main` and are outside that verified baseline.
+This document describes the NEVERFLAT award and wallet system, its API
+contracts, and its operational invariants. Deployment procedures and dated
+release evidence are maintained in [DEPLOYMENT.md](DEPLOYMENT.md), the API
+contract in [API.md](API.md), and the linked release records.
 
 The complete HTTP contract is in [API.md](API.md). The BEIA component contract
 is in [docs/BEIA_INTEGRATION.md](docs/BEIA_INTEGRATION.md). The safe local
@@ -21,7 +17,7 @@ verification summary is in [docs/RELEASE_VERIFICATION_2026-10-01.md](docs/RELEAS
 
 ## System position
 
-| Area | Deployed baseline and development follow-up |
+| Area | System behavior and contract |
 | --- | --- |
 | Ownership | eMAID is the canonical internal owner. Existing `contract_id`, `EvcoID`, `contractId`, `x-contract-id`, `uid`, and database column names remain wire/compatibility names where required. |
 | Award input | One normaliser detects OCPI or OICP from payload structure. OCPI uses `cdr_token.contract_id`; OICP uses all present supported `Identification.*.EvcoID` values, which must agree. |
@@ -32,7 +28,6 @@ verification summary is in [docs/RELEASE_VERIFICATION_2026-10-01.md](docs/RELEAS
 | Receipts | Backend-signed spend receipts carry canonical settlement context. A receiver must independently verify the signature and expected eMAID/wallet/amount/session/transaction context. |
 | Operations | Durable token operations retain original intent, hashes, movement outcome, and recovery context. Read-only evidence retries are bounded; unknown movement remains review-only. |
 | Admin | Six operational tabs: Overview, eMAIDs & balances, Transactions, Token rules, Audit log, and System health. |
-| Release state | Main baseline `87b35bd` is deployed; the development follow-up is awaiting review and promotion. |
 
 ## 1. Functional flows
 
@@ -215,16 +210,16 @@ facts.
 
 ### Current follow-up checks
 
-The current `release-fixes` follow-up has separate focused evidence: Node 22
-backend verification passed 19 Jest suites with 327 tests and 12 opt-in tests
-skipped, plus 21 real PostgreSQL integration checks; the offline deployment
-helper suite passed 16 tests, the charging-card package passed 12 tests, the
+The current source verification has separate focused evidence: Node 22 backend
+verification passed 19 Jest suites with 327 tests and 12 opt-in tests skipped,
+plus 21 real PostgreSQL integration checks; the offline deployment helper suite
+passed 16 tests, the charging-card package passed 12 tests, the
 frontend build and package/frontend audits passed, and a portable Node 22 probe
 returned `v22.23.3`. The combined Node 22.23.3 root/frontend/Sparkz
 `npm run ci:check` passed with all audits at zero vulnerabilities. These checks
-are distinct from the historical candidate record above. The target acceptance
-record remains pending in this handoff; neither is inferred from the historical
-321-test result.
+are distinct from the historical local record above. Target post-start
+acceptance remains a separate operational record; neither result is inferred
+from the historical 321-test result.
 
 ## 5. Predeployment responsibilities
 
@@ -239,10 +234,9 @@ and deduplicate delivery.
 
 After an API exists in the target environment, run the appropriate partner
 smoke tests and capture health, preview, representative CDR, reservation,
-receipt verification, reconciliation, alert, and evidence-pack results. The
-successful production workflow is recorded above, while post-start target
-acceptance remains unrecorded here for both the deployed baseline and the
-development follow-up.
+receipt verification, reconciliation, alert, and evidence-pack results. See
+[DEPLOYMENT.md](DEPLOYMENT.md) for the operational acceptance procedure and
+record; post-start target acceptance is not recorded in this system overview.
 
 ## Appendix: source references
 
