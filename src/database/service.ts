@@ -1,4 +1,5 @@
 import { getDatabase } from './connection';
+import type { Knex } from 'knex';
 import {
   canonicalTokenAmount,
   requireCanonicalTransactionHash,
@@ -16,6 +17,7 @@ export interface UserRecord {
   uid: string;
   wallet_address: string;
   wallet_name?: string | null;
+  is_active?: boolean;
   created_at: Date;
   updated_at: Date;
 }
@@ -431,15 +433,30 @@ export const ApprovalPreparations = {
 export const Users = {
   async create(uid: string, walletAddress: string, walletName?: string | null): Promise<UserRecord> {
     const db = getDatabase();
-    const [record] = await db('users')
-      .insert({ uid, wallet_address: walletAddress, wallet_name: walletName || null })
-      .returning('*');
-    return record;
+    return db.transaction(async trx => {
+      await lockUid(trx, uid);
+      const existing = await trx('users')
+        .where({ uid })
+        .whereRaw('lower(wallet_address) = lower(?)', [walletAddress])
+        .first();
+      if (existing) return existing as UserRecord;
+
+      const hasExistingUid = await trx('users').where({ uid }).first('id');
+      const [record] = await trx('users')
+        .insert({
+          uid,
+          wallet_address: walletAddress,
+          wallet_name: walletName || null,
+          is_active: !hasExistingUid,
+        })
+        .returning('*');
+      return record as UserRecord;
+    });
   },
 
   async findByUid(uid: string): Promise<UserRecord | undefined> {
     const db = getDatabase();
-    return db('users').where({ uid }).orderBy('created_at', 'asc').first();
+    return db('users').where({ uid, is_active: true }).first();
   },
 
   async findByUidAndWallet(uid: string, walletAddress: string): Promise<UserRecord | undefined> {
@@ -504,19 +521,73 @@ export const Users = {
   },
 
   async linkContractId(uid: string, walletAddress: string, walletName?: string | null): Promise<UserRecord> {
-    const existing = await this.findByUidAndWallet(uid, walletAddress);
-    if (existing) {
-      return existing;
-    }
     return this.create(uid, walletAddress, walletName || null);
+  },
+
+  /**
+   * Atomically select one historical or newly linked wallet for a UID.
+   * Ordinary links use create() and remain inactive; only this method changes
+   * the persisted selection.
+   */
+  async activateWallet(uid: string, walletAddress: string, walletName?: string | null): Promise<UserRecord> {
+    const db = getDatabase();
+    return db.transaction(async trx => {
+      await lockUid(trx, uid);
+      const existing = await trx('users')
+        .where({ uid })
+        .whereRaw('lower(wallet_address) = lower(?)', [walletAddress])
+        .first() as UserRecord | undefined;
+
+      if (existing) {
+        await trx('users')
+          .where({ uid })
+          .whereNot({ id: existing.id })
+          .update({ is_active: false });
+        const [activated] = await trx('users')
+          .where({ id: existing.id })
+          .update({ is_active: true })
+          .returning('*');
+        return activated as UserRecord;
+      }
+
+      await trx('users').where({ uid }).update({ is_active: false });
+      const [created] = await trx('users')
+        .insert({
+          uid,
+          wallet_address: walletAddress,
+          wallet_name: walletName || null,
+          is_active: true,
+        })
+        .returning('*');
+      return created as UserRecord;
+    });
   },
 
   async deleteByUidAndWallet(uid: string, walletAddress: string): Promise<number> {
     const db = getDatabase();
-    return db('users')
-      .where({ uid })
-      .whereRaw('lower(wallet_address) = lower(?)', [walletAddress])
-      .delete();
+    return db.transaction(async trx => {
+      await lockUid(trx, uid);
+      const existing = await trx('users')
+        .where({ uid })
+        .whereRaw('lower(wallet_address) = lower(?)', [walletAddress])
+        .first() as UserRecord | undefined;
+      if (!existing) return 0;
+
+      const deleted = await trx('users')
+        .where({ id: existing.id })
+        .delete();
+      if (existing.is_active) {
+        const replacement = await trx('users')
+          .where({ uid })
+          .orderBy('created_at', 'asc')
+          .orderBy('id', 'asc')
+          .first() as UserRecord | undefined;
+        if (replacement) {
+          await trx('users').where({ id: replacement.id }).update({ is_active: true });
+        }
+      }
+      return deleted;
+    });
   },
 
   async hasActivity(userId: string): Promise<boolean> {
@@ -531,9 +602,13 @@ export const Users = {
 
   async getAll(): Promise<UserRecord[]> {
     const db = getDatabase();
-    return db('users').orderBy('created_at', 'asc');
+    return db('users').orderBy('created_at', 'asc').orderBy('id', 'asc');
   },
 };
+
+async function lockUid(trx: Knex.Transaction, uid: string): Promise<void> {
+  await trx.raw('select pg_advisory_xact_lock(hashtext(?))', [`users-active:${uid}`]);
+}
 
 /**
  * Address-based linked wallets.

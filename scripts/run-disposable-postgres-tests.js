@@ -1,8 +1,9 @@
 /*
- * Run the opt-in PostgreSQL Jest suites against a disposable local container.
- * This runner refuses to use the dashboard database by construction: it creates
- * a unique nvf_award_test_* database name and passes that URL only through the
- * explicit test-only environment variables.
+ * Run the opt-in PostgreSQL Jest suites against a disposable local database.
+ * By default this runner creates a unique database in a local PostgreSQL
+ * container. DISPOSABLE_POSTGRES_URL is also accepted for environments where
+ * Docker is unavailable, but only for a loopback nvf_award_test_* or
+ * nvf_award_check_* database supplied by the caller.
  */
 'use strict';
 
@@ -11,6 +12,7 @@ const net = require('node:net');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { Pool } = require('pg');
+const { parseDisposableDatabaseUrl } = require('./disposableDatabaseUrl');
 
 const APP_ROOT = path.resolve(__dirname, '..');
 const OUTPUT_DIR = path.join(APP_ROOT, 'outputs');
@@ -135,6 +137,8 @@ async function removeContainer() {
 }
 
 async function main() {
+  const suppliedDatabaseUrl = process.env.DISPOSABLE_POSTGRES_URL?.trim() || '';
+  let usesDocker = false;
   const evidence = {
     status: 'failed',
     command: 'node scripts/run-disposable-postgres-tests.js',
@@ -142,29 +146,62 @@ async function main() {
     suites: [
       'src/database/tokenOperationSchema.test.ts',
       'src/config/policyPersistence.postgres.test.ts',
+      'src/database/walletSelection.postgres.test.ts',
     ],
+    compiledMigrationProof: 'scripts/verify-compiled-migration-entrypoint.js',
   };
   try {
-    dbPort = await getFreePort();
-    const databaseUrl = `postgres://${DB_USER}:${DB_PASSWORD}@127.0.0.1:${dbPort}/${DB_NAME}`;
-    if (!/^postgres:\/\/[^@]+@127\.0\.0\.1:\d+\/nvf_award_test_[a-z0-9_-]+$/i.test(databaseUrl)) {
-      throw new Error('refusing to start a non-disposable database target');
-    }
+    let databaseUrl;
+    if (suppliedDatabaseUrl) {
+      const supplied = parseDisposableDatabaseUrl(suppliedDatabaseUrl);
+      dbPort = supplied.port;
+      databaseUrl = suppliedDatabaseUrl;
+      evidence.database = {
+        host: '127.0.0.1',
+        name: supplied.databaseName,
+        container: null,
+        managedBy: 'caller',
+      };
+    } else {
+      dbPort = await getFreePort();
+      databaseUrl = `postgres://${DB_USER}:${DB_PASSWORD}@127.0.0.1:${dbPort}/${DB_NAME}`;
+      if (!/^postgres:\/\/[^@]+@127\.0\.0\.1:\d+\/nvf_award_test_[a-z0-9_-]+$/i.test(databaseUrl)) {
+        throw new Error('refusing to start a non-disposable database target');
+      }
+      evidence.database = {
+        host: '127.0.0.1',
+        name: DB_NAME,
+        container: DB_CONTAINER,
+        managedBy: 'docker',
+      };
 
-    await runCommand('docker', [
-      'run', '--rm', '--name', DB_CONTAINER, '-d',
-      '-e', `POSTGRES_USER=${DB_USER}`,
-      '-e', `POSTGRES_PASSWORD=${DB_PASSWORD}`,
-      '-e', `POSTGRES_DB=${DB_NAME}`,
-      '-p', `127.0.0.1:${dbPort}:5432`,
-      'postgres:16-alpine',
-    ], { timeoutMs: 60_000 });
+      usesDocker = true;
+      await runCommand('docker', [
+        'run', '--rm', '--name', DB_CONTAINER, '-d',
+        '-e', `POSTGRES_USER=${DB_USER}`,
+        '-e', `POSTGRES_PASSWORD=${DB_PASSWORD}`,
+        '-e', `POSTGRES_DB=${DB_NAME}`,
+        '-p', `127.0.0.1:${dbPort}:5432`,
+        'postgres:16-alpine',
+      ], { timeoutMs: 60_000 });
+    }
     await waitForDatabase(databaseUrl);
     const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+    const migration = await runCommand(npmCommand, ['run', 'db:migrate'], {
+      env: { ...process.env, DATABASE_URL: databaseUrl },
+      timeoutMs: 120_000,
+    });
+    const compiledMigrationProof = await runCommand(process.execPath, [
+      'scripts/verify-compiled-migration-entrypoint.js',
+    ], {
+      env: { ...process.env, DATABASE_URL: databaseUrl },
+      timeoutMs: 300_000,
+    });
     const test = await runCommand(npmCommand, [
       'test', '--', '--runInBand',
       'src/database/tokenOperationSchema.test.ts',
       'src/config/policyPersistence.postgres.test.ts',
+      'src/database/walletSelection.postgres.test.ts',
     ], {
       env: {
         ...process.env,
@@ -172,6 +209,8 @@ async function main() {
         RUN_LOCAL_POLICY_TESTS: '1',
         SCHEMA_DATABASE_URL: databaseUrl,
         POLICY_DATABASE_URL: databaseUrl,
+        WALLET_DATABASE_URL: databaseUrl,
+        RUN_LOCAL_WALLET_TESTS: '1',
         // Keep these suites explicit about their target; the normal .env
         // DATABASE_URL is not used by either disposable suite.
         DATABASE_URL: '',
@@ -179,6 +218,16 @@ async function main() {
       timeoutMs: 120_000,
     });
     evidence.status = 'passed';
+    evidence.migration = {
+      stdout: migration.stdout,
+      stderr: migration.stderr,
+      exitCode: migration.code,
+    };
+    evidence.compiledMigrationProof = {
+      stdout: compiledMigrationProof.stdout,
+      stderr: compiledMigrationProof.stderr,
+      exitCode: compiledMigrationProof.code,
+    };
     evidence.test = {
       stdout: test.stdout,
       stderr: test.stderr,
@@ -193,7 +242,7 @@ async function main() {
   } finally {
     // Keep cleanup outside the startup/test try block so a failed or timed-out
     // docker run cannot leave a partially-created disposable container behind.
-    await removeContainer();
+    if (usesDocker) await removeContainer();
     for (const child of [...children]) await stopChild(child);
     fs.mkdirSync(OUTPUT_DIR, { recursive: true });
     fs.writeFileSync(

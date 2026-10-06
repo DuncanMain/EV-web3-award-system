@@ -1,5 +1,5 @@
 # Node.js Docker image for NVF Award Core
-FROM node:20-alpine AS build
+FROM node:22-alpine AS build
 
 WORKDIR /usr/src/app
 
@@ -17,7 +17,7 @@ RUN npm --prefix frontend ci
 COPY frontend ./frontend
 RUN npm --prefix frontend run build
 
-FROM node:20-alpine AS runtime
+FROM node:22-alpine AS runtime
 WORKDIR /usr/src/app
 
 COPY package.json package-lock.json ./

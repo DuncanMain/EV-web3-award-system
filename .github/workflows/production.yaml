@@ -5,13 +5,18 @@ on:
     branches:
       - main
 
+concurrency:
+  group: neverflat-production
+  cancel-in-progress: false
+
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  IMAGE_NAME: ghcr.io/zentrixlab/neverflat
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build-and-deploy:
+    if: github.repository == 'ZentrixLab/neverflat'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -21,9 +26,6 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v5
 
-      - name: Lowercase image name
-        run: echo "IMAGE_NAME=${IMAGE_NAME,,}" >> $GITHUB_ENV
-
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -31,65 +33,76 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Build and push Docker image
+      - name: Build and push immutable Docker image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
           push: true
           no-cache: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
 
-      - name: Copy production compose file to server
+      - name: Preflight existing target
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: root
           key: ${{ secrets.SERVER_SSH_KEY }}
-          source: compose.production.yaml
-          target: /root/neverflat
-          strip_components: 0
+          source: scripts/preflight_production.py
+          target: /tmp/neverflat-preflight-${{ github.sha }}
+          strip_components: 1
 
-      - name: Deploy to server
+      - name: Run preflight before staging the release
         uses: appleboy/ssh-action@v1.2.0
         env:
-          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
-          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
-          BEIA_API_KEY: ${{ secrets.BEIA_API_KEY }}
-          BEIA_ADMIN_EMAIL: ${{ secrets.BEIA_ADMIN_EMAIL }}
-          BEIA_ADMIN_PASSWORD: ${{ secrets.BEIA_ADMIN_PASSWORD }}
+          IMAGE_REFERENCE: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: root
           key: ${{ secrets.SERVER_SSH_KEY }}
           command_timeout: 10m
-          envs: ADMIN_EMAIL,ADMIN_PASSWORD,BEIA_API_KEY,BEIA_ADMIN_EMAIL,BEIA_ADMIN_PASSWORD
+          envs: IMAGE_REFERENCE
           script: |
             set -euo pipefail
-            cd /root/neverflat
-            rm -f docker-compose.yaml docker-compose.yml docker-compose.dev.yaml \
-              docker-compose.local.yml docker-compose.override.yml docker-stack.yml
-            echo ${{ github.token }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-            docker network create shared-proxy || true
-            touch .env
-            python3 - <<'PY'
-            import os
-            from pathlib import Path
+            python3 /tmp/neverflat-preflight-${{ github.sha }}/preflight_production.py \
+              --deploy-dir /root/neverflat \
+              --env-file /root/neverflat/.env \
+              --image-reference "$IMAGE_REFERENCE"
+            mkdir -p /root/neverflat/releases/${{ github.sha }}
+            rm -f /tmp/neverflat-preflight-${{ github.sha }}/preflight_production.py
 
-            path = Path('.env')
-            updates = {
-                'ADMIN_EMAIL': os.environ['ADMIN_EMAIL'],
-                'ADMIN_PASSWORD': os.environ['ADMIN_PASSWORD'],
-                'BEIA_API_KEY': os.environ['BEIA_API_KEY'],
-                'BEIA_ADMIN_EMAIL': os.environ['BEIA_ADMIN_EMAIL'],
-                'BEIA_ADMIN_PASSWORD': os.environ['BEIA_ADMIN_PASSWORD'],
-            }
-            lines = path.read_text().splitlines() if path.exists() else []
-            kept = [line for line in lines if not any(line.startswith(f'{key}=') for key in updates)]
-            kept.extend(f'{key}={value}' for key, value in updates.items())
-            path.write_text('\n'.join(kept) + '\n')
-            PY
-            docker compose -f compose.production.yaml pull app
-            docker compose -f compose.production.yaml up -d --remove-orphans
+      - name: Stage release files
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: root
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          source: compose.production.yaml,scripts/deploy_production.sh,scripts/preflight_production.py,scripts/check_production_acceptance.py
+          target: /root/neverflat/releases/${{ github.sha }}
+          strip_components: 0
+
+      - name: Validate and deploy staged release
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          IMAGE_REFERENCE: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ github.token }}
+          DEPLOY_DIR: /root/neverflat
+          RELEASE_DIR: /root/neverflat/releases/${{ github.sha }}
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: root
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          command_timeout: 10m
+          envs: IMAGE_REFERENCE,GHCR_USER,GHCR_TOKEN,DEPLOY_DIR,RELEASE_DIR
+          script: |
+            set -euo pipefail
+            chmod 700 "$RELEASE_DIR/scripts/deploy_production.sh"
+            chmod 600 "$RELEASE_DIR/scripts/preflight_production.py" "$RELEASE_DIR/scripts/check_production_acceptance.py"
+            IMAGE_REFERENCE="$IMAGE_REFERENCE" \
+              GHCR_USER="$GHCR_USER" \
+              GHCR_TOKEN="$GHCR_TOKEN" \
+              DEPLOY_DIR="$DEPLOY_DIR" \
+              RELEASE_DIR="$RELEASE_DIR" \
+              "$RELEASE_DIR/scripts/deploy_production.sh"

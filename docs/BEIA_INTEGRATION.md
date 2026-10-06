@@ -1,43 +1,44 @@
 # BEIA SPARKZ Integration Guide
 
-This guide describes the current local release candidate for integrating the
-NEVERFLAT SPARKZ charging flow into the BEIA end-user app. It is an integration
-contract, not evidence that a target release has been published or deployed.
+This guide describes the `@neverflat/sparkz-charging-card` integration for the
+deployed main backend baseline and the follow-up package prepared for Zentrix
+`development`. It is an integration contract; it does not claim registry or
+partner publication or live target acceptance.
 
 ## Candidate and deployment status
 
-The package and examples in this repository are a **local candidate** for
-review. They have not been published, pushed, or deployed. The existing
-`neverflat-sparkz-charging-card-0.1.0.tgz` and
-`neverflat-sparkz-charging-card-0.2.0.tgz` files are historical artifacts and
-must not be overwritten.
+The deployed backend baseline is merge commit
+`87b35bdf4e0d9bde7b4d8c4cbb93ab459b0f321a` (PR #6, 6 October 2026). The
+follow-up package is prepared for Zentrix `development` and awaits Dejan's
+promotion to `main`; package publication and partner handoff are not claimed.
+The tracked 0.2.0 archive is historical and must not be overwritten.
 
-The current npm-pack candidate is `@neverflat/sparkz-charging-card@0.2.1-rc.1`.
-Its source-tree filename and SHA-256 are recorded in the local release
-verification record:
+The current workspace artifact is
+`@neverflat/sparkz-charging-card@0.2.1-rc.1`. Its source-tree filename and
+SHA-256 are:
 
 ```text
 packages/sparkz-charging-card/neverflat-sparkz-charging-card-0.2.1-rc.1.tgz
-CBE128B3AB3AD0E17F0DA84B7B64497008D0552FAEE87BF2E797776A6C2FA401
+1E7B4666445AC129FA00299F1F5BA9A784DD61DDD3565527AC962784B3AD4AFE
 ```
 
-The old local handoff archives are preserved for audit history but are
-superseded by the 30 September tarball manifest and must not be treated as the
-current artifact. The current package test and browser scope are summarised in
-the [local release verification record](RELEASE_VERIFICATION_2026-10-01.md).
+The package is reproducibly generated from the workspace with `npm ci`,
+`npm run build`, and `npm pack`. The package test scope is summarised in the
+[local release verification record](RELEASE_VERIFICATION_2026-10-01.md); its
+dated results remain historical evidence.
 
-Install the current tarball from the extracted candidate workspace or handoff:
+Install the current tarball from this package workspace:
 
 ```bash
 npm install ./neverflat-sparkz-charging-card-0.2.1-rc.1.tgz
 ```
 
-The command above is intentionally a local artifact install; it is not a
-release, publish, or deployment command. Confirm the manifest and checksum
-before handing a copy to a partner.
+The commands above are local artifact build/install steps; they are not release,
+publish, or deployment commands. Confirm the manifest and checksum before any
+future partner handoff.
 
 Target API documentation is a separate reference and may describe a different
-build. It has not been verified as part of this local candidate. Check it only
+build. It has not been verified as part of this package handoff. Check it only
 when an environment owner provides the target environment and release
 identifier:
 
@@ -117,8 +118,7 @@ node docs/examples/beia-integration-contract.mjs
 ```
 
 The superseded 24 September handoff archive contained a copied helper under a
-different path; use the repository `docs/examples` path above for this current
-candidate.
+different path; use the repository `docs/examples` path above.
 
 ## Identity
 
@@ -166,8 +166,8 @@ do not substitute the CDR ID for the physical session ID.
 
 ## Install
 
-Until the package is published to a registry, install the reviewed local
-candidate recorded in the handoff manifest or use the package workspace.
+Install the reviewed local artifact from the package workspace after running
+the build and pack commands in the status section above.
 
 ```bash
 npm install ./neverflat-sparkz-charging-card-0.2.1-rc.1.tgz
@@ -681,7 +681,7 @@ Run the API locally, then run the package demo:
 
 ```bash
 cd packages/sparkz-charging-card
-npm install
+npm ci
 export NVF_DEMO_API_ORIGIN=http://127.0.0.1:3005
 export NVF_DEMO_API_KEY='<isolated-local-api-key>'
 export NVF_DEMO_EMAID='<isolated-local-emaid>'

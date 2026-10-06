@@ -1,17 +1,18 @@
 # Deployment handoff for Dejan
 
-**Review handoff only — not a deployment approval.** The reviewed source
-candidate is not deployed. Do not send this document as evidence that a
-production release exists.
+**Review handoff only — not a deployment approval.** The deployed main
+baseline is merge commit `87b35bdf4e0d9bde7b4d8c4cbb93ab459b0f321a` (PR #6,
+6 October 2026). The follow-up fixes in this handoff are prepared for
+Zentrix `development` and await Dejan's review and promotion to `main`.
 
 ## Branch and automation boundary
 
-The reviewed candidate is prepared for the existing ZentrixLab/neverflat
-`development` branch. Keep Zentrix `main` unchanged until the target release
-has passed the backup, migration, preservation, and acceptance gates. The
-production workflow is attached to pushes to `main`; do not merge or push to
-`main`, invoke that workflow, or rely on a `:latest` image as a release
-identifier during this handoff.
+The reviewed fixes are prepared for the existing ZentrixLab/neverflat
+`development` branch. Keep the deployed baseline and Zentrix `main` unchanged
+until the target release has passed the backup, migration, preservation, and
+acceptance gates. Dejan promotes the reviewed development result to `main`;
+the production workflow is attached to pushes to `main`. The workflow uses an
+immutable Docker digest, not a `:latest` release identifier.
 
 This handoff does not push, publish, start, restart, or reconfigure any
 service.
@@ -20,6 +21,10 @@ service.
 
 The exact command results are consolidated in
 [RELEASE_VERIFICATION_2026-10-01.md](RELEASE_VERIFICATION_2026-10-01.md):
+
+These results are the dated historical local candidate record; they predate the
+follow-up fixes in this handoff and are not acceptance evidence for that
+follow-up.
 
 - backend build passed;
 - 17 Jest suites passed with 321 tests passed and 6 opt-in tests skipped;
@@ -30,8 +35,20 @@ The exact command results are consolidated in
 - the BEIA package checks passed 12 tests with no publication.
 
 These are local/disposable results. They do not verify target credentials,
-target data, target restore, live RPC/provider behavior, or partner webhook
-delivery.
+target data, target restore, live RPC/provider behavior, post-start health or
+readiness, or partner webhook delivery. Package publication and partner
+handoff remain unclaimed.
+
+The current follow-up workspace artifact was repacked after the reproducible
+build instructions were changed to `npm ci`. Its SHA-256 is
+`1E7B4666445AC129FA00299F1F5BA9A784DD61DDD3565527AC962784B3AD4AFE`.
+Node 22 backend verification passed 19 Jest suites with 327 tests and 12
+opt-in tests skipped, plus 21 real PostgreSQL integration checks. The current
+deployment helper suite passed 16 focused tests and the charging-card package
+passed 12 tests; the frontend build and package/frontend audits passed, and a
+portable Node 22 probe returned `v22.23.3`. The combined Node 22.23.3
+root/frontend/Sparkz `npm run ci:check` passed with all audits at zero
+vulnerabilities. The target acceptance record remains pending.
 
 ## Required target gate before deployment
 
@@ -45,9 +62,12 @@ delivery.
    an isolated copy, and capture before row counts and content digests for
    users, balances, awards, spends, receipts, operations, approvals,
    reservations, policy, reconciliation, and linked-wallet tables.
-5. Inspect target history for migration 005 duplicate contract IDs and
-   migration 015 duplicate transaction hashes. Approve a target-specific
-   additive migration procedure for policy 016 and session guard 017.
+5. Inspect target history for duplicate `(uid, lower(wallet_address))` pairs,
+   confirm migration 008's scoped uniqueness and removal of the obsolete global
+   UID constraint, and review migration 015 duplicate transaction hashes.
+   Approve a target-specific additive migration procedure for policy 016,
+   session guard 017, and standalone active-wallet migration 022. Campaign
+   migrations 018–021 remain outside this branch.
 6. Apply the reviewed migration with the API stopped, verify schema/index
    readiness, and compare the preservation snapshot. Do not use local
    loopback migration runners against a target.
@@ -65,6 +85,18 @@ balances, awards, spends, receipts, reservations, operation rows, signer,
 token contract, and chain identity. Do not relink wallets, rotate keys, reset
 the database, or clean historical duplicate rows as part of this handoff.
 
+Migration 022 retains historical wallet rows while persisting the explicitly
+active wallet. A rollback to an older image must review active-wallet selection
+and pending financial operations; it must not automatically drop the selection
+or rewrite mappings or financial rows.
+
+The deployed baseline's startup chain can restore migration 005's global UID
+uniqueness rule. With multiple wallets for one UID, an older rollback image may
+fail on duplicate data or ignore `is_active` and select the oldest row. Use an
+image with reviewed schema/data compatibility; never delete or deduplicate
+wallet/history rows to make an older image start. Any data restore remains an
+explicit operator decision with pending token-operation reconciliation.
+
 If a rollout fails, stop writers and follow the approved application rollback
 plan. Do not roll back the database over chain activity and do not replay or
 compensate a token transfer merely because an application image was reverted.
@@ -73,7 +105,9 @@ resolved.
 
 ## Open release facts
 
-The immutable release SHA, image digest, target database/backup record,
-restore result, migration decision, maintenance window, target secret owners,
-and final approval are still pending. No live deployment claim should be
-made until those fields are filled from verified target evidence.
+The production workflow and mirror results for the deployed baseline are
+recorded in the root deployment documentation. The built image digest and
+target post-start acceptance response for that run are not captured here. The
+follow-up release SHA, image digest, target database/backup record, restore
+result, migration decision, maintenance window, target secret owners, and
+final approval remain target-specific handoff fields.

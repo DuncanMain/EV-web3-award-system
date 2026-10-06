@@ -142,13 +142,13 @@ export async function setUserWalletMode(uid: string, mode: WalletMode, walletAdd
   }
 
   const checksumWalletAddress = ethers.getAddress(nextWalletAddress);
-  await Users.linkContractId(uid, checksumWalletAddress);
+  const activeUser = await Users.activateWallet(uid, checksumWalletAddress);
 
   userRegistry.setAddress(uid, checksumWalletAddress);
 
   return {
     uid,
-    walletAddress: checksumWalletAddress,
+    walletAddress: activeUser.wallet_address,
     managedWalletAddress,
     walletMode: mode,
   };

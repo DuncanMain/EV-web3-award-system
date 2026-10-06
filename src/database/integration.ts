@@ -585,6 +585,7 @@ export async function recordAward(
   if (!canonicalAmount) throw new Error('UNSUPPORTED_TOKEN_PRECISION');
   const walletForLock = (intendedWalletAddress || resolveUidToAddress(normalised.uid)).toLowerCase();
   return db.transaction(async trx => {
+    await trx.raw('select pg_advisory_xact_lock(hashtext(?))', [`users-active:${normalised.uid}`]);
     await trx.raw('select pg_advisory_xact_lock(hashtext(?))', [`award-tx:${normalizedHash}`]);
     await trx.raw('select pg_advisory_xact_lock(hashtext(?))', [`award-dedup:${dedupKey}`]);
     await trx.raw('select pg_advisory_xact_lock(hashtext(?))', [`balance-user:${normalised.uid}:${walletForLock}`]);
@@ -632,13 +633,15 @@ export async function recordAward(
         .where({ uid: normalised.uid })
         .whereRaw('lower(wallet_address) = lower(?)', [intendedWalletAddress])
         .first()
-      : await trx('users').where({ uid: normalised.uid }).orderBy('created_at', 'asc').first();
+      : await trx('users').where({ uid: normalised.uid, is_active: true }).first();
     const walletAddress = user?.wallet_address || intendedWalletAddress || resolveUidToAddress(normalised.uid);
     if (!user) {
+      const hasExistingUid = await trx('users').where({ uid: normalised.uid }).first('id');
       const [created] = await trx('users').insert({
         uid: normalised.uid,
         wallet_address: walletAddress,
         wallet_name: null,
+        is_active: !hasExistingUid,
       }).returning('*');
       user = created;
     }
@@ -698,6 +701,9 @@ export async function recordSpend(
   const canonicalAmount = canonicalTokenAmount(amount);
   if (!canonicalAmount) throw new Error('UNSUPPORTED_TOKEN_PRECISION');
   return db.transaction(async trx => {
+    if (uid) {
+      await trx.raw('select pg_advisory_xact_lock(hashtext(?))', [`users-active:${uid}`]);
+    }
     await trx.raw('select pg_advisory_xact_lock(hashtext(?))', [`spend-tx:${normalizedHash}`]);
     await trx.raw('select pg_advisory_xact_lock(hashtext(?))', [`balance-user:${uid || ''}:${userWallet.toLowerCase()}`]);
     const spendHashMatches = await trx('spends')
@@ -721,7 +727,6 @@ export async function recordSpend(
       ? await trx('users')
         .where({ uid })
         .whereRaw('lower(wallet_address) = lower(?)', [userWallet])
-        .orderBy('created_at', 'asc')
         .first()
       : undefined;
     if (!user && !uid) {
@@ -731,10 +736,14 @@ export async function recordSpend(
         .first();
     }
     if (!user) {
+      const hasExistingUid = uid
+        ? await trx('users').where({ uid }).first('id')
+        : undefined;
       const [created] = await trx('users').insert({
         uid: uid || `wallet-${userWallet}`,
         wallet_address: userWallet,
         wallet_name: null,
+        is_active: !hasExistingUid,
       }).returning('*');
       user = created;
     }

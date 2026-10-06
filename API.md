@@ -1,9 +1,12 @@
 # NEVERFLAT SPARKZ API
 
-**Documentation status:** local release candidate, reviewed 30 September 2026,
-**not yet pushed or deployed**. This file describes the API in the current
-`NVF-award-core` source tree. It does not confirm target-environment keys,
-database contents, RPC availability, or a live release.
+**Documentation status:** the deployed main baseline is merge commit
+`87b35bdf4e0d9bde7b4d8c4cbb93ab459b0f321a` (PR #6, 6 October 2026). This
+release-fixes branch contains follow-up deployment, package, migration, and
+active-wallet changes prepared for Zentrix `development` and awaiting Dejan's
+promotion to `main`; those changes are outside the verified baseline until a
+separate deployment acceptance record. This file does not confirm target
+credentials, database contents, RPC availability, or live post-start checks.
 
 The machine-readable contract is served by the same build at `GET /openapi.json`
 and by the `/docs` and `/api-docs` aliases. Keep this document and the embedded
@@ -16,7 +19,8 @@ made 178 requests with 178 passing cases; the separate admin matrix passed
 the disposable PostgreSQL checks passed 15 tests, and the local
 award-flow/reliability harness passed. The [local release verification
 record](docs/RELEASE_VERIFICATION_2026-10-01.md) consolidates the safe result
-summary. These are local evidence, not deployment approval.
+summary. These are dated historical local evidence for the earlier candidate,
+not deployment approval or acceptance evidence for the development follow-up.
 
 ## 1. Identity and authentication
 
@@ -462,8 +466,12 @@ returns `404` when it is absent. Writes are revisioned and durable.
 - `GET /admin/pilot-metrics?hours=24` returns bounded audit-derived activity
   metrics for 1–168 hours.
 - `GET /admin/readiness` returns `ready`, `ready_with_warnings`, or
-  `not_ready`, counts, and checks. Missing API/ingest keys or alert webhook
-  configuration can be warnings in a local candidate.
+  `not_ready`, counts, and checks. A `ready` response has zero failed and
+  warning checks; `ready_with_warnings` has at least one matching warning and
+  no failed checks. Missing `API_KEY` or alert webhook configuration can be
+  warnings while the target is being reviewed; missing `INGEST_API_KEY`, admin
+  credentials, token/signer configuration, or durable persistence checks is a
+  failure.
 - `POST /admin/alerts/test` returns `202` for sent/queued or audited skipped
   delivery, and `502` when an attempted alert delivery fails. The response
   reflects the delivery result, not merely configuration presence.
@@ -560,11 +568,13 @@ ADMIN_ALERT_WEBHOOK_URL=https://...
 ```
 
 Keep existing wallet derivation, database column names, and standards wire names
-unchanged. The additive policy and charging-session schema work requires a
-target-specific reviewed migration/backup procedure. Local activation used
-loopback disposable/controlled resources and does not authorize a production
-migration. No backend release version or commit is assigned by this document;
-the current candidate is still **not deployed**.
+unchanged. The additive policy, charging-session, and active-wallet schema work
+requires a target-specific reviewed migration/backup procedure. Local
+activation used loopback disposable/controlled resources and does not authorize
+a production migration. The successful production workflow recorded for the
+deployed baseline is [Deploy Neverflat #45](https://github.com/ZentrixLab/neverflat/actions/runs/37457660589);
+its image digest and post-start target acceptance response are not recorded
+here.
 
 For BEIA component integration, use the [BEIA guide](docs/BEIA_INTEGRATION.md).
 For rationale and system architecture, see

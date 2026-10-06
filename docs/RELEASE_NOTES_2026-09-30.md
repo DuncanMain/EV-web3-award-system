@@ -1,15 +1,18 @@
 # NEVERFLAT predeployment release notes — 2026-09-30
 
-**Status:** local candidate and review draft for `NVF-award-core`. This note is
-not a deployment approval or a live-server comparison. No backend release
-version or commit is assigned here. Fresh local backend checks were rerun on
-30 September; the remaining package/browser evidence is identified by its
-individual report and scope below.
+**Status:** dated local evidence and review notes for `NVF-award-core`. The
+deployed main baseline is merge commit
+`87b35bdf4e0d9bde7b4d8c4cbb93ab459b0f321a` (PR #6, 6 October 2026), with
+successful [production run #45](https://github.com/ZentrixLab/neverflat/actions/runs/37457660589)
+and [mirror run #33](https://github.com/ZentrixLab/neverflat/actions/runs/37457660702).
+The follow-up fixes are prepared for Zentrix `development` and await Dejan's
+promotion to `main`. This dated note remains historical local evidence and is
+not a substitute for target acceptance.
 
-The operator rollout procedure is [`DEPLOYMENT.md`](../DEPLOYMENT.md). Target
-commit, immutable image digest, database facts, backup/restore rehearsal,
-migration procedure, and rollback decision remain pending and are intentionally
-not fabricated in these notes.
+The operator rollout procedure is [`DEPLOYMENT.md`](../DEPLOYMENT.md). The
+successful workflow results do not capture the built image digest or
+post-start target health/readiness, backup, or migration acceptance evidence.
+Those target facts are intentionally not fabricated in these notes.
 
 ## Included in this candidate
 
@@ -101,25 +104,26 @@ names remain where required, but their ownership value must be the provisioned
 eMAID. No automatic wallet relinking is performed. Partners adding direct
 manual spends must adopt stable idempotency keys; OCPI/OICP senders must supply
 an agreeing eMAID-bearing identity. The package must be aligned with the
-matching backend/API version. This candidate is local and undeployed.
+matching backend/API version. The documented baseline is deployed; the
+development follow-up remains subject to review and promotion.
 
 The local schema work is additive. The strict historical migration path still
 encounters legacy duplicate data. Local activation used reviewed scoped runners
 for token-operation safeguards, reward policy migration 016, and charging-
 session guard migration 017; those runners are local review tools, not
-production deployment commands. Production needs a target-specific reviewed
-migration procedure, fresh physical backup, verified backup evidence,
-before/after financial and wallet/eMAID digests, and a tested rollback plan. No
-schema or database change was made by this release-note task.
+production deployment commands. Standalone migration 022 adds explicit
+active-wallet selection; campaign migrations 018–021 remain outside this
+branch. Production needs a target-specific reviewed migration procedure,
+fresh physical backup, verified backup evidence, before/after financial and
+wallet/eMAID digests, and a tested rollback plan.
 
 The checked-in container entrypoint runs the full migration chain before the
-API starts, and the production compose file still references `:latest` and a
-literal PostgreSQL connection value. That is repository behaviour, not a safe
-production gate. Do not copy the local loopback-only 015/016/017 runners into a
-target; use the reviewed target migration and preservation sequence in
-[`DEPLOYMENT.md`](../DEPLOYMENT.md). The push-to-`main` workflow can build and
-deploy automatically ([`.github/workflows/production.yaml`](../.github/workflows/production.yaml)),
-but it was not invoked for this candidate.
+API starts. The production workflow now stages a release, validates operator
+database/volume settings before service changes, and deploys the exact Docker
+build digest. Use the reviewed target migration and preservation sequence in
+[`DEPLOYMENT.md`](../DEPLOYMENT.md). The successful baseline workflow run is
+recorded above; its image digest and post-start target acceptance evidence are
+not captured in this dated record.
 
 The earlier local catalog-index issue was repaired and verified against local
 resources: the repaired database retained counts/digests, passed logical dump
@@ -136,7 +140,7 @@ Fresh backend verification on 30 September passed `npm.cmd run build`, the
 full Jest suite (**321 tests passed, 6 skipped**), and the isolated PostgreSQL
 runner (**2 suites, 15 tests passed** against a unique disposable database).
 The final API contract matrix passed **178/178** disposable HTTP cases across
-42 routes, and the admin-owned matrix passed **199/199** cases with no
+41 routes, and the admin-owned matrix passed **199/199** cases with no
 findings. The disposable Hardhat/API flow passed migration 017 activation,
 protocol identity, persisted-policy reload, backup/restore digest comparison,
 receipt/recovery failure drills, linked/custodial paths, and replacement-session
@@ -149,9 +153,8 @@ React 18.3.1 lifecycle consumer passed as well. The authenticated browser
 report records policy save/reload, reconciliation, alert feedback, evidence
 export initiation, saved-spend recovery, and the completed saved-snapshot
 award recovery/idempotent repeat; the award without a snapshot remains safely
-blocked. These results are local candidate evidence, not a live release gate.
-This release-note edit made no runtime, database, package, or deployment
-change.
+blocked. These results are local historical evidence, not a live release gate
+or acceptance of the deployed baseline.
 
 The frontend and charging-card checks are recorded against the same current
 source lineage, with their individual run dates and scope retained in the
@@ -160,8 +163,9 @@ changes after its recorded check, rerun the affected check before assigning a
 release record.
 
 The final combined local backend, frontend, package, schema, and local EVM
-checks are complete on the current working tree. Before deployment, assign and
-freeze the backend version/commit; rerun affected checks if source,
+checks were complete for the source lineage recorded by this dated note.
+Before a follow-up deployment, assign and freeze the backend version/commit;
+rerun affected checks if source,
 dependencies, or configuration changes after this evidence, rather than
 repeating the full suite solely to name the commit. Then validate
 target admin, API, ingestion, RPC, signer, alert, and database configuration;
@@ -174,12 +178,13 @@ manual-spend keys, reservation resume, reconciliation, alerts, and rollback.
 These are post-deployment acceptance checks, not a request to add speculative
 features before the API is available.
 
-The deployment record is still pending: candidate commit, immutable image
-digest, target host/proxy, database and TLS facts, verified backup manifest,
-restore result, writer-quiescence window, target migration result, before/after
-financial and wallet/eMAID digests, RPC/token/signer identity, health/readiness
-result, smoke evidence, rollback decision, approver, and UTC timestamp. See
-the record template in [`DEPLOYMENT.md`](../DEPLOYMENT.md).
+The target acceptance record for the development follow-up remains pending:
+candidate commit, immutable image digest, target host/proxy, database and TLS
+facts, verified backup manifest, restore result, writer-quiescence window,
+target migration result, before/after financial and wallet/eMAID digests,
+RPC/token/signer identity, health/readiness result, smoke evidence, rollback
+decision, approver, and UTC timestamp. See the record template in
+[`DEPLOYMENT.md`](../DEPLOYMENT.md).
 
 Known local review items remain operator-visible: historical missing-CDR or
 hashless recovery, unbound session records, external provider/EMP behaviour,
