@@ -8,6 +8,8 @@
     "test": "jest",
     "api": "tsc && node dist/api.js",
     "db:migrate": "tsc && node dist/database/migrate.js",
+    "db:stage-token-operations": "tsc && node dist/database/stageTokenOperationSchema.js",
+    "db:apply-reward-policy": "tsc && node dist/database/applyRewardPolicyMigration.js",
     "db:reset": "tsc && npm run db:migrate",
     "evidence:pilot": "node scripts/capture-pilot-evidence.js",
     "evidence:load-preview": "node scripts/load-test-ingest-preview.js",
@@ -31,6 +33,16 @@
     "jest": "^29.0.0",
     "ts-jest": "^29.0.0",
     "typescript": "^5.0.0"
+  },
+  "overrides": {
+    "js-yaml": "3.15.2",
+    "minimatch@3.1.5": {
+      "brace-expansion": "1.1.21"
+    },
+    "minimatch@10.2.5": {
+      "brace-expansion": "5.0.12"
+    },
+    "qs": "6.16.0"
   },
   "jest": {
     "preset": "ts-jest",

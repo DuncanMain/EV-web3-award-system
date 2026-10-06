@@ -1,1110 +1,571 @@
-# NVF Award System - REST API Documentation
+# NEVERFLAT SPARKZ API
 
-## Overview
+**Documentation status:** local release candidate, reviewed 30 September 2026,
+**not yet pushed or deployed**. This file describes the API in the current
+`NVF-award-core` source tree. It does not confirm target-environment keys,
+database contents, RPC availability, or a live release.
 
-The REST API exposes the core award and spend functionality through HTTP endpoints. All on-chain transactions are executed on Polygon Amoy testnet.
+The machine-readable contract is served by the same build at `GET /openapi.json`
+and by the `/docs` and `/api-docs` aliases. Keep this document and the embedded
+OpenAPI document in `src/api.ts` together when an endpoint changes.
 
-Identifier terminology: this project treats contract ID as the primary external user identifier. Some request/response fields and routes still use `UID` or `uid` naming for backward compatibility. In this API, those values represent contract ID.
+The local candidate was exercised with a disposable PostgreSQL database,
+Hardhat chain 31337, and a child API process. The finite HTTP contract matrix
+made 178 requests with 178 passing cases; the separate admin matrix passed
+199/199. Full Jest finished with 321 passing tests and 6 opt-in tests skipped,
+the disposable PostgreSQL checks passed 15 tests, and the local
+award-flow/reliability harness passed. The [local release verification
+record](docs/RELEASE_VERIFICATION_2026-10-01.md) consolidates the safe result
+summary. These are local evidence, not deployment approval.
 
-User identity integration: EMP-ready endpoints are available via `GET /wallet/me` and `POST /spend/me`, which resolve contract ID from request header `x-contract-id` (configurable via `USER_IDENTITY_HEADER`).
+## 1. Identity and authentication
 
-**Status**: ✅ Core endpoints working | ⏳ Database logging (requires PostgreSQL)
+### eMAID is the owner identity
 
-## Getting Started
+The canonical internal ownership identifier is **eMAID**. Existing wire,
+database, and route names are retained for compatibility:
 
-### Prerequisites
-- Node.js 18+
-- TREASURY_SIGNER_KEY configured in .env
-- Optional: API_KEY configured in .env for authentication
-- Optional: PostgreSQL for transaction history logging
+| Wire or route name | Meaning in this API |
+| --- | --- |
+| `contract_id` | OCPI token contract identity; becomes eMAID. |
+| `EvcoID` | OICP contract identity; becomes eMAID. |
+| `contractId`, `x-contract-id`, `uid` | Existing API compatibility names whose value must be the eMAID. |
+| token `uid` or RFID `UID` | Non-owning protocol metadata only. It never derives a wallet or award owner. |
 
-### Start API Server
+OCPI ownership is read from `cdr_token.contract_id`. OICP ownership is read
+from every present supported identity field:
 
-```bash
-npm run api
+```text
+Identification.RemoteIdentification.EvcoID
+Identification.QRCodeIdentification.EvcoID
+Identification.PlugAndChargeIdentification.EvcoID
+Identification.RFIDIdentification.EvcoID
 ```
 
-Server starts on `http://localhost:3000`
+All present OICP identity fields must agree. A payload containing only a UID,
+missing eMAID, or conflicting identity values is rejected or quarantined with
+a structured error. Protocol detection is automatic from payload shape; there
+is no request or admin switch between eMAID and ContractID.
 
-### Authentication
+The normaliser metadata returned by preview and ingestion is shaped like this:
 
-All protected endpoints require the `X-API-Key` header (if API_KEY is configured in .env):
-
-```bash
-curl -H "X-API-Key: your_api_key_here" http://localhost:3000/wallet/user123
-```
-
-**Public endpoints** (no authentication required):
-- `GET /ingest/health`
-
-Leave `API_KEY` empty in .env for development (authentication disabled).
-
-For pilot deployments, set a dedicated `INGEST_API_KEY` for AU/provider CDR
-submission. When `INGEST_API_KEY` is configured, `POST /ingest/cdr` requires
-`X-Ingest-API-Key` or `X-API-Key` to match that dedicated value. Other protected
-endpoints continue to use `API_KEY`.
-
-Admin login requires `ADMIN_EMAIL` and `ADMIN_PASSWORD`. There is no
-hardcoded fallback password; if these variables are not set, `/admin/login`
-returns a configuration error.
-
----
-
-## API Endpoints
-
-### Health Check
-
-**GET** `/ingest/health`
-
-Check if the service is operational.
-
-**Response:**
 ```json
 {
-  "status": "ok",
-  "timestamp": "2026-04-16T10:30:00.000Z"
+  "eMAID": "DE*EMP*E123456",
+  "emaid": "DE*EMP*E123456",
+  "protocol": "OCPI",
+  "sourceField": "cdr_token.contract_id",
+  "chargingSessionId": "physical-session-123",
+  "tokenMetadata": { "uid": "rfid-or-token-value", "type": "RFID" }
 }
 ```
 
----
+`tokenMetadata` is optional and non-owning. `chargingSessionId` is present only
+when an explicit OCPI `id` plus standard `session_id` pair supplies physical
+session provenance. A later CDR with a different CDR id for the same provider
+and physical session fails closed with a review-required collision; it cannot
+create a replacement award. Legacy records without that explicit pair retain
+their original CDR-key behaviour.
 
-### Preview CDR
+Validation failures expose a safe, useful shape:
 
-**POST** `/ingest/cdr/preview`
+```json
+{
+  "status": "error",
+  "code": "INVALID_CDR",
+  "message": "eMAID is required for ownership; UID-only CDRs are rejected and may only be quarantined as non-owning token metadata",
+  "normalisationError": {
+    "code": "UID_ONLY",
+    "protocol": "OICP",
+    "sourceFields": ["Identification.RFIDIdentification.UID"]
+  }
+}
+```
 
-Validate a CDR payload, normalise it, and apply reward rules without database
-writes or on-chain token settlement. Use this for AU payload checks and safe
-ingestion/rule performance evidence.
+The `sourceFields` and `protocol` values are diagnostic provenance. They do not
+turn a UID into an owner. The other normalisation codes are
+`INVALID_PAYLOAD`, `MISSING_EMAID`, `CONFLICTING_IDENTIFIERS`, and
+`INVALID_EMAID`.
 
-Requires the same ingest authentication as `/ingest/cdr`.
+### Authentication boundaries
 
-**Request:** use either complete request format documented for `/ingest/cdr`.
-The canonical NEVERFLAT format is recommended. The preview endpoint is safe for
-payload validation because it has no database or blockchain side effects.
+| Boundary | Header or credential | Applies to |
+| --- | --- | --- |
+| General API | `X-API-Key` matching `API_KEY` or `BEIA_API_KEY`, or a valid admin bearer session | Wallet, spend, receipt, and transaction routes. |
+| CDR ingestion | `X-Ingest-API-Key` or `X-API-Key` matching `INGEST_API_KEY`; configured `BEIA_API_KEY` is also accepted. A valid admin bearer session is accepted. If no dedicated ingest key is configured, the configured `API_KEY`/`BEIA_API_KEY` is used. | CDR preview and ingestion. |
+| Identity context | `x-contract-id` (or `USER_IDENTITY_HEADER`) | `/wallet/me`, `/spend/session`, `/spend/me`, reservation approval/status. The value is an eMAID, not a credential. |
+| Admin | `Authorization: Bearer <token>` returned by `POST /admin/login` | `/admin/*`, including the mounted operations router. |
+| Public | No credential | Health, OpenAPI, and documentation aliases; admin login itself is public. |
 
-**Response:**
+In a non-production local process with no API key configured, the source allows
+the general API-key guard to be bypassed for local development. A deployed
+environment must configure its keys. Admin login has no hardcoded password and
+returns a configuration error if its registered email/password variables are
+missing. Never put API keys, treasury keys, or receipt-signing material in a
+browser bundle; a trusted BEIA server proxy should add the upstream key.
+
+Every protected response must be checked for both HTTP status and the safe JSON
+error shape. Raw SQL, stack traces, provider/RPC messages, URLs, keys, and
+database credentials stay in server diagnostics, not responses.
+
+## 2. Route inventory
+
+The current source has 41 concrete method/path combinations. Express also
+provides generated `HEAD` behaviour for GET routes and CORS `OPTIONS` handling;
+the frontend build conditionally adds `GET *` as an HTML fallback. The table is
+the contract inventory used by the local matrix.
+
+| Method | Path | Auth | Purpose |
+| --- | --- | --- | --- |
+| GET | `/openapi.json` | Public | Machine-readable OpenAPI contract. |
+| GET | `/api-docs` | Public | Documentation alias. |
+| GET | `/docs` | Public | Documentation alias. |
+| GET | `/ingest/health` | Public | Liveness response. |
+| POST | `/spend-receipts/verify` | API key | Verify a signed spend receipt under the configured signer. |
+| POST | `/ingest/cdr/preview` | Ingest key | Validate, normalise, and calculate without writes or chain settlement. |
+| POST | `/ingest/cdr` | Ingest key | Process a final CDR and award if eligible. |
+| POST | `/spend/session` | API key + eMAID | Read-only session spend prompt and persisted policy rates. |
+| POST | `/spend` | API key | Direct managed-wallet spend with a stable idempotency key or existing recovery key. |
+| POST | `/spend/reservation-approval-intent` | API key + eMAID | Build an external-wallet approval intent for a reservation. |
+| POST | `/spend/me` | API key + eMAID | Create or replay an eMAID-scoped charging reservation. |
+| GET | `/spend/reservations/:reservationId` | API key + eMAID | Read reservation and final receipt/settlement state. |
+| POST | `/wallet/:uid/mode` | API key | Switch managed/custodial wallet mode. |
+| PATCH | `/wallet/:uid/profile` | API key | Save the active wallet display name/address association. |
+| POST | `/wallet/:uid/contract-ids` | API key | Link another eMAID to the same wallet. |
+| POST | `/wallet/:uid/linked-wallets` | API key | Link an external wallet after signature proof. |
+| PATCH | `/wallet/:uid/linked-wallets/:walletAddress/profile` | API key | Name or clear a linked wallet. |
+| DELETE | `/wallet/:uid/linked-wallets/:walletAddress` | API key | Unlink an external wallet after signature proof. |
+| POST | `/wallet/:uid/move-funds` | API key | Move managed-wallet funds to a validated target address. |
+| POST | `/spend/custodial-intent` | API key | Build a user-signed custodial spend intent. |
+| POST | `/spend/custodial-failure` | API key | Record a user-wallet failure and preserve/rebuild intent context. |
+| POST | `/spend/custodial-record` | API key | Record a confirmed custodial transfer after evidence validation. |
+| GET | `/wallet/me` | API key + eMAID | Identity-context wallet response. |
+| GET | `/wallet/:uid` | API key + local lookup gate | Legacy/manual wallet lookup; disable `ENABLE_TEST_UID_LOOKUP` in a locked-down deployment. |
+| GET | `/transactions` | API key | Recent transaction history. |
+| POST | `/admin/login` | Public | Create an admin bearer session. |
+| POST | `/admin/logout` | Admin bearer | Record admin logout. |
+| GET | `/admin/rules` | Admin bearer | Load durable reward policy and revision. |
+| PUT | `/admin/rules` | Admin bearer | Update supported reward rates/enablement. |
+| GET | `/admin/off-peak` | Admin bearer | Load durable country windows and revision. |
+| GET | `/admin/audit` | Admin bearer | Safe allowlisted operational audit events. |
+| GET | `/admin/pilot-metrics` | Admin bearer | Audit-derived pilot metrics. |
+| GET | `/admin/readiness` | Admin bearer | Readiness checks and warnings. |
+| POST | `/admin/alerts/test` | Admin bearer | Exercise configured alert delivery and record result. |
+| GET | `/admin/evidence-pack` | Admin bearer | Export a point-in-time evidence snapshot. |
+| POST | `/admin/reconciliation/run` | Admin bearer | Run DB-versus-chain reconciliation. |
+| GET | `/admin/reconciliation` | Admin bearer | List stored reconciliation reports. |
+| PUT | `/admin/off-peak` | Admin bearer | Replace country windows. |
+| DELETE | `/admin/off-peak/:countryCode` | Admin bearer | Remove one country window. |
+| GET | `/admin/operations` | Admin bearer | List durable operation recovery eligibility. |
+| POST | `/admin/operations/recover` | Admin bearer | Recover/project one existing operation by server-resolved key. |
+
+Unknown API methods and paths return a structured not-found/method error. When
+the frontend build is present, an unknown **GET** can instead be served by the
+conditional frontend `GET *` fallback as HTML; API clients should use the
+documented JSON routes and inspect the response content type. Public
+documentation routes do not establish API authentication.
+
+## 3. CDR ingestion and normalisation
+
+### `POST /ingest/cdr/preview`
+
+The request accepts the canonical NEVERFLAT shape, standard OCPI CDR shape, or
+supported native OICP shape. Preview runs the same validation, protocol
+detection, identity normalisation, timezone/rule calculation, and reward
+calculation as ingestion, but returns `sideEffects: false` on success and does
+not create a financial row, reservation, or token transfer. A validation
+failure may still create an allowlisted audit event. Preview does not claim an
+ingestion deduplication claim; use `/ingest/cdr` for the full durable ingest
+path.
+
+Canonical example:
+
+```json
+{
+  "SessionID": "session-001",
+  "ProviderID": "provider-de",
+  "cdr_token": { "contract_id": "DE*EMP*E123456", "uid": "non-owning-token" },
+  "EVSEID": "DE*ABC*E001",
+  "StartTime": "2026-09-30T05:00:00.000Z",
+  "EndTime": "2026-09-30T06:00:00.000Z",
+  "Energy": "12",
+  "EnergyDirection": "CHARGE"
+}
+```
+
+OCPI example:
+
+```json
+{
+  "id": "cdr-001",
+  "session_id": "physical-session-001",
+  "country_code": "DE",
+  "party_id": "NF",
+  "cdr_token": { "contract_id": "DE*EMP*E123456", "uid": "token-only-metadata" },
+  "cdr_location": { "evse_id": "DE*ABC*E001" },
+  "start_date_time": "2026-09-30T05:00:00.000Z",
+  "end_date_time": "2026-09-30T06:00:00.000Z",
+  "total_energy": 12,
+  "energyDirection": "CHARGE"
+}
+```
+
+Native OICP identity is carried under `Identification`, for example:
+
+```json
+{
+  "CPOPartnerSessionID": "oicp-session-001",
+  "ProviderID": "provider-de",
+  "Identification": {
+    "RemoteIdentification": { "EvcoID": "DE*EMP*E123456" }
+  },
+  "EvseID": "DE*ABC*E001",
+  "ChargingStart": "2026-09-30T05:00:00.000Z",
+  "ChargingEnd": "2026-09-30T06:00:00.000Z",
+  "ConsumedEnergy": "12"
+}
+```
+
+The normalised success section contains `eMAID`/`emaid`, `protocol`,
+`sourceField`, optional non-owning `tokenMetadata`, canonical session/provider
+values, energy and direction. A preview success has this illustrative shape;
+reward and policy values depend on the persisted policy and session-start
+timezone:
+
 ```json
 {
   "status": "preview",
   "sideEffects": false,
   "eligible": true,
   "tokensAwarded": 3,
-  "uid": "user-123",
-  "dedupKey": "sess-12345-prov-DE",
+  "uid": "DE*EMP*E123456",
+  "dedupKey": "cdr-001-provider-de",
+  "normalisation": {
+    "eMAID": "DE*EMP*E123456",
+    "emaid": "DE*EMP*E123456",
+    "protocol": "OCPI",
+    "sourceField": "cdr_token.contract_id"
+  },
   "normalised": {
-    "sessionId": "sess-12345",
-    "providerId": "prov-DE",
-    "uid": "user-123",
-    "evseId": "DE*ABC*E12345",
-    "energyKWh": 40,
+    "sessionId": "cdr-001",
+    "providerId": "provider-de",
+    "eMAID": "DE*EMP*E123456",
+    "emaid": "DE*EMP*E123456",
+    "protocol": "OCPI",
+    "sourceField": "cdr_token.contract_id",
+    "uid": "DE*EMP*E123456",
+    "energyKWh": 12,
     "energyDirection": "CHARGE"
+  },
+  "policy": { "revision": 1, "updatedAt": "2026-09-30T00:00:00.000Z" }
+}
+```
+
+### `POST /ingest/cdr`
+
+The request and identity rules are the same as preview. A successful response
+can be `accepted`, `duplicate`, or accepted but not eligible. It can be `202`
+when an existing movement or receipt is pending and the identical CDR remains
+the retry input. `requiresReview: true` stops automatic retry/replacement.
+Responses include the normalisation metadata, `sessionId`, `providerId`,
+legacy `uid` alias, eligibility, `tokensAwarded`, operation/status fields,
+transaction hashes when known, policy revision, and safe `message` text. A
+normalisation or validation failure is `400` with the structured error above;
+authentication failures are `401`/`403`.
+
+Reward rules are persisted by policy revision. Each calculation uses one
+request-local snapshot. Charging eligibility uses the session start instant in
+the configured country IANA timezone; a session that crosses a window is not
+prorated. Eligible token amounts are whole tokens calculated with flooring.
+V2G discharge is selected independently of off-peak windows; negative partner
+energy means discharge. Countries without configured charging windows are not
+charging-eligible. The preview route is the integration-safe way to test rules
+without financial side effects.
+
+## 4. Spending, reservations, and receipts
+
+### Session spend prompt: `POST /spend/session`
+
+Requires `x-contract-id` and body fields `sessionId`, `providerId`, `chargerId`,
+and `status` (`CHARGER_OPENED`, `PLUGGED_IN`, or `SESSION_STARTED`). Optional
+`countryCode`, `estimatedKwh`, and `estimatedCost` must have the documented
+types. It loads the durable reward-policy snapshot and returns wallet balances,
+`spend.eligible`, `maxSpendable`, `suggestedAmount`, reward rates, recent
+activity, and `policy { revision, updatedAt }`. It never reserves or spends
+tokens, although the wallet lookup may provision or refresh a durable wallet
+identity record.
+
+### Direct managed spend: `POST /spend`
+
+New requests require a stable, non-empty string `idempotencyKey` and a positive
+two-decimal-compatible `amount`. The existing wire `uid` field carries the
+eMAID. Optional `sessionId`, `providerId`, and `label` are persisted with the
+intent. The server derives an `operationKey` and keeps the original owner,
+amount, wallet, session, provider, and fingerprint.
+
+An `operationKey` may be supplied only to recover an existing manual operation;
+the server resolves all intent from the durable row. It cannot create a new
+spend, change its owner/amount/session/provider, or trigger a replacement
+transfer. Missing, empty, or non-string keys are rejected before wallet
+creation, funding, reservation work, or broadcast with
+`IDEMPOTENCY_KEY_REQUIRED`/`INVALID_OPERATION_KEY`.
+
+Success and pending responses include `status`, eMAID-compatible `uid`, amount,
+`tokensSpent`, `txHash` when known, `operationKey`, `operationStatus`,
+`movementOutcome`, `pending`, `retryable`, `requiresReview`, `financialStatus`,
+`receiptStatus`, and (when available) `spendReceipt`. `movementOutcome` is
+durable and must not be inferred from a generic failed operation:
+
+| Outcome | Meaning |
+| --- | --- |
+| `confirmed` | The token movement is proven and may have a receipt/projection stage pending. |
+| `no_movement` | Correctly identified chain evidence proves no transfer. |
+| `unknown` | The result cannot prove movement or no movement; keep the original key/hash and review. |
+| `review` | A conflict or validation issue requires an operator. |
+
+A `202` keeps the original operation/key/hash for retry. A receipt persistence
+failure after confirmed movement is not permission to transfer again.
+
+### Reservation flow
+
+`POST /spend/me` requires `x-contract-id`, `amount`, `sessionId`, and
+`providerId`; `label`, `walletAddress`, and `authorizationTxHash` are optional
+where the wallet mode requires them. It reserves SPARKZ and returns:
+
+```json
+{
+  "status": "success",
+  "uid": "DE*EMP*E123456",
+  "sessionId": "session-001",
+  "providerId": "provider-de",
+  "reservation": {
+    "id": "00000000-0000-4000-8000-000000000001",
+    "status": "reserved",
+    "amount": "5.00",
+    "kWhEntitlement": "5.00",
+    "availableBalance": 12
   }
 }
 ```
 
----
+The reservation identity is the eMAID plus exact session/provider pair. Repeating
+the same request is idempotent; do not add a random manual idempotency key. One
+non-terminal reservation is supported per card integration. `POST
+/spend/reservation-approval-intent` builds a capped ERC-20 approval intent for
+an external wallet; the user signs it, and the confirmed hash is passed to
+`/spend/me`. It does not itself spend tokens.
 
-### Ingest CDR
+`GET /spend/reservations/:reservationId` is read-only and owner-scoped. It
+returns `reserved`, `settling`, `settled`, or `released`, the original
+session/provider, reserved/settled/released amounts, delivered kWh, token hash,
+`spendReceipt`, and `receiptStatus` (`not_created`, `pending`, `settled`, or
+`none`). A confirmed movement can remain `pending` until receipt persistence;
+polling does not create a new movement. Invalid UUIDs are `400`, another
+eMAID's reservation is not disclosed, and a missing reservation is `404`.
 
-**POST** `/ingest/cdr`
+### Signed receipt verification: `POST /spend-receipts/verify`
 
-Accept raw CDR data from charging network and process award if eligible.
+Requires an API key and body `{ payload: object, signature: string,
+signerAddress?: string }`. The configured NEVERFLAT receipt signer is
+authoritative. A supplied signer address is only a claim and must match the
+configured signer; the receiver must still verify the signature and compare the
+canonical payload with its expected eMAID, wallet, amount, provider/session,
+transaction hash, token contract, and chain. The response is `valid` or
+`invalid` with safe failure details.
 
-Use `X-Ingest-API-Key` with the dedicated ingest credential. `X-API-Key` is
-also accepted for compatibility. Each `SessionID` must be unique.
+### User-managed/custodial routes
 
-**Canonical request (recommended):**
+These routes preserve the user-wallet integration boundary:
+
+| Route | Request contract | Result |
+| --- | --- | --- |
+| `POST /spend/custodial-intent` | `uid`/eMAID, `walletAddress`, positive `amount`, optional session/provider | Returns a user-signable transfer intent and durable operation context. |
+| `POST /spend/custodial-failure` | Original intent/operation context and failure details | Records a failed signature/submission without treating it as a confirmed movement. |
+| `POST /spend/custodial-record` | `uid`, `walletAddress`, `amount`, `txHash`, optional session/provider and receipt context | Verifies chain evidence and records the confirmed external-wallet spend; pending receipt/projection remains retryable. |
+
+If a user wallet request may already have been accepted, retain its original
+hash and resolve it. Never submit a replacement solely because a response was
+lost. Mismatched wallet, amount, owner, asset, chain, or transfer evidence is
+rejected or requires review.
+
+## 5. Wallet and transaction routes
+
+`GET /wallet/me` requires the identity header and returns the eMAID-scoped
+wallet payload: legacy `uid` alias, wallet/managed addresses, wallet mode,
+linked wallets, contract IDs, balances and balance status/source, totals, recent
+history, token/treasury addresses, and a safe message. A chain balance that is
+temporarily unavailable is reported as unavailable; it is not silently shown as
+zero. It performs no token movement, but a first lookup may provision or
+refresh the durable wallet/user record.
+
+`GET /wallet/:uid` is the legacy/manual lookup and is subject to
+`ENABLE_TEST_UID_LOOKUP`. It uses the path value as an eMAID compatibility
+value, not as an arbitrary user UID. A first lookup may provision or refresh a
+durable wallet/user record but does not move tokens. Disable this branch for a
+locked-down deployment and prefer `/wallet/me`.
+
+The wallet mutation routes are:
+
+- `POST /wallet/:uid/mode`: `{ mode: "managed" | "custodial", walletAddress?, allowSplit? }`.
+  Switching with a non-zero source balance returns `409 SOURCE_WALLET_HAS_BALANCE`
+  unless `allowSplit` is explicitly used.
+- `PATCH /wallet/:uid/profile`: optional `{ walletName?: string | null,
+  walletAddress?: string }`.
+- `POST /wallet/:uid/contract-ids`: `{ contractId: eMAID }` (the legacy `uid`
+  alias remains accepted) and optional wallet address.
+- `POST /wallet/:uid/linked-wallets`: `{ walletAddress, signature }`; signature
+  proves link ownership.
+- `PATCH /wallet/:uid/linked-wallets/:walletAddress/profile`: `{ walletName? }`.
+- `DELETE /wallet/:uid/linked-wallets/:walletAddress`: `{ signature }`; signature
+  proves unlink ownership.
+- `POST /wallet/:uid/move-funds`: `{ targetAddress }`; target must be a valid
+  address and the response includes the confirmed transfer hash/amount.
+
+These routes return a wallet payload on success and safe English validation
+messages on failure. They do not accept a token UID as an ownership substitute.
+
+`GET /transactions?limit=50` returns `{ status: "ok", transactionCount,
+transactions }` for the recent award/spend history visible to the trusted API
+client; the limit is capped at 500 by the current handler. This is a global
+operational history, not a caller-scoped user feed; a BEIA proxy must not
+expose it to an end user without its own authorization and filtering.
+
+## 6. Admin and operational API
+
+### Login and policy
+
+`POST /admin/login` accepts `{ email, password }` or `{ username, password }`
+and returns `{ status: "ok", token, adminEmail }`. Wrong credentials are `401`;
+missing admin configuration is a visible `503`. `POST /admin/logout` requires
+the bearer token, invalidates that admin session, and records the logout.
+
+`GET /admin/rules` and `PUT /admin/rules` expose the durable reward policy.
+The PUT body is a non-empty object containing only any of:
+`offPeakChargingTokensPerKWh`, `v2gDischargeTokensPerKWh`,
+`offPeakChargingEnabled`, and `v2gDischargeEnabled`. Rates are finite
+non-negative numbers; enablement values are booleans. The response includes
+`rules`, `policy: { revision, updatedAt }`, and compatibility top-level
+`revision`/`updatedAt`. Empty, array, unknown, nonfinite, or invalid fields are
+`400`; persistence errors do not claim success or replace the previous policy.
+
+`GET /admin/off-peak` returns `windows` and policy metadata. `PUT /admin/off-peak`
+accepts a complete `{ windows: { "DE": [{ "start": "22:00", "end": "06:00" }] } }`
+document. Country keys are valid ISO alpha-2 values, each country has 1–6
+`HH:MM` slots. `DELETE /admin/off-peak/:countryCode` removes one country or
+returns `404` when it is absent. Writes are revisioned and durable.
+
+### Audit, health, and evidence
+
+- `GET /admin/audit?limit=100&status=error&eventType=spend.failed` returns an
+  allowlisted safe projection of append-only events. Raw metadata, provider
+  errors, intent snapshots, and CDR payloads are omitted.
+- `GET /admin/pilot-metrics?hours=24` returns bounded audit-derived activity
+  metrics for 1–168 hours.
+- `GET /admin/readiness` returns `ready`, `ready_with_warnings`, or
+  `not_ready`, counts, and checks. Missing API/ingest keys or alert webhook
+  configuration can be warnings in a local candidate.
+- `POST /admin/alerts/test` returns `202` for sent/queued or audited skipped
+  delivery, and `502` when an attempted alert delivery fails. The response
+  reflects the delivery result, not merely configuration presence.
+- `GET /admin/evidence-pack` returns a point-in-time readiness, configuration,
+  reconciliation, metrics, retry/warning/error, and alert evidence snapshot.
+  If a dependency is unavailable it returns `EVIDENCE_PACK_UNAVAILABLE` with a
+  safe retry message.
+
+### Reconciliation
+
+`POST /admin/reconciliation/run` accepts an optional JSON object `{ "limit": N }`
+where `N` is a number/integer from 1 through 1000. `GET /admin/reconciliation`
+accepts a scalar `limit` query from 1 through 100. Arrays, booleans, malformed
+values, and repeated query values are rejected. A successful report compares
+database wallet state with chain `balanceOf` values and stores the report;
+dependency failures return `RECONCILIATION_UNAVAILABLE` without raw SQL/RPC
+details.
+
+### Durable operation visibility and recovery
+
+`GET /admin/operations` accepts bounded `scope`, `limit`, `offset`, and `emaid`
+filters. It returns server-derived operation fields, movement outcome, and a
+safe recovery decision/reason code; it never returns raw intent, CDR snapshots,
+provider errors, or sensitive fingerprints. A `uid` filter is not an alternate
+ownership selector.
+
+`POST /admin/operations/recover` accepts exactly:
+
 ```json
-{
-  "SessionID": "session-20260914-001",
-  "ProviderID": "nvf-demo",
-  "cdr_token": {
-    "contract_id": "demo-user-001"
-  },
-  "EVSEID": "DE*ABC*E*001",
-  "StartTime": "2026-09-14T05:00:00.000Z",
-  "EndTime": "2026-09-14T06:00:00.000Z",
-  "Energy": "12",
-  "EnergyDirection": "CHARGE"
-}
+{ "operationKey": "award:..." }
 ```
 
-The country prefix in `EVSEID` drives the country-specific reward rules.
-`EnergyDirection` must be `CHARGE` or `DISCHARGE`.
-
-**Supported OCPI-style request:**
-```json
-{
-  "id": "cdr-session-20260914-001",
-  "country_code": "DE",
-  "party_id": "NF",
-  "cdr_token": {
-    "contract_id": "demo-user-001"
-  },
-  "cdr_location": {
-    "evse_id": "DE*ABC*E*001"
-  },
-  "start_date_time": "2026-09-14T05:00:00.000Z",
-  "end_date_time": "2026-09-14T06:00:00.000Z",
-  "total_energy": 12,
-  "energyDirection": "CHARGE"
-}
-```
-
-Do not combine fields from the two request formats. In the OCPI-style request,
-`energyDirection` is optional and otherwise inferred from the sign of
-`total_energy`.
-
-**Response (Accepted & Eligible):**
-```json
-{
-  "status": "accepted",
-  "sessionId": "session-20260914-001",
-  "providerId": "nvf-demo",
-  "uid": "demo-user-001",
-  "eligible": true,
-  "tokensAwarded": 10,
-  "txHash": "0x...",
-  "message": "10 SPARKZ awarded"
-}
-```
-
-**Response (Duplicate):**
-```json
-{
-  "status": "duplicate",
-  "sessionId": "session-20260914-001",
-  "providerId": "nvf-demo",
-  "message": "CDR already processed"
-}
-```
-
-**Response (Not Eligible):**
-```json
-{
-  "status": "accepted",
-  "sessionId": "session-20260914-001",
-  "providerId": "nvf-demo",
-  "eligible": false,
-  "message": "CDR accepted but not eligible for reward"
-}
-```
-
----
-
-### Session Spend Prompt
-
-**POST** `/spend/session`
-
-Returns SPARKZ wallet/session spend eligibility for a charging-session prompt.
-This endpoint **does not spend tokens** and does not create a spend receipt.
-
-Required header:
-- `x-contract-id: <contract-id>` (or the header name configured in `USER_IDENTITY_HEADER`)
-
-**Request:**
-```json
-{
-  "sessionId": "spend-001",
-  "providerId": "NF",
-  "chargerId": "charger-001",
-  "status": "PLUGGED_IN",
-  "countryCode": "GB",
-  "estimatedKwh": 12.5,
-  "estimatedCost": 8.4
-}
-```
-
-`status` must be one of:
-- `CHARGER_OPENED`
-- `PLUGGED_IN`
-- `SESSION_STARTED`
-
-**Response:**
-```json
-{
-  "status": "success",
-  "contractId": "000",
-  "sessionId": "spend-001",
-  "providerId": "NF",
-  "chargerId": "charger-001",
-  "sessionStatus": "PLUGGED_IN",
-  "countryCode": "GB",
-  "estimatedKwh": 12.5,
-  "estimatedCost": 8.4,
-  "wallet": {
-    "availableBalance": 12.4,
-    "totalEarned": 20,
-    "totalSpent": 7.6,
-    "mode": "managed"
-  },
-  "spend": {
-    "eligible": true,
-    "maxSpendable": 12.4,
-    "suggestedAmount": 8.4,
-    "label": "Charging discount",
-    "message": "You have 12.40 SPARKZ available"
-  },
-  "recentActivity": [],
-  "rewardRates": [
-    {
-      "key": "offPeakCharging",
-      "label": "Off-peak charging",
-      "enabled": true,
-      "tokensPerKWh": 0.25,
-      "kWhPerSparkz": 4,
-      "description": "1 SPARKZ per 4 kWh"
-    },
-    {
-      "key": "v2gDischarge",
-      "label": "V2G discharge",
-      "enabled": true,
-      "tokensPerKWh": 1,
-      "kWhPerSparkz": 1,
-      "description": "1 SPARKZ per 1 kWh"
-    }
-  ]
-}
-```
-
-Validation errors include `MISSING_REQUIRED_FIELDS`, `INVALID_SESSION_STATUS`,
-`INVALID_ESTIMATED_KWH`, and `INVALID_ESTIMATED_COST`.
-
----
-
-### Spend Tokens
-
-**POST** `/spend`
-
-Spend tokens from user's wallet. Treasury pays gas fees.
-If settlement fails, the response uses a user-safe `error` message. Technical
-chain/provider details are retained in admin audit metadata rather than being
-shown to the user.
-
-Note: request field `uid` is a legacy key name and should contain contract ID.
-
-**Request:**
-```json
-{
-  "uid": "user-123",
-  "amount": 5,
-  "sessionId": "spend-001",
-  "providerId": "prov-DE",
-  "label": "Charging discount"
-}
-```
-
-**Response:**
-```json
-{
-  "status": "success",
-  "uid": "user-123",
-  "sessionId": "spend-001",
-  "providerId": "prov-DE",
-  "tokensSpent": 5,
-  "txHash": "0x...",
-  "timestamp": "2026-04-16T10:30:00.000Z",
-  "label": "Charging discount",
-  "spendReceipt": {
-    "payload": {
-      "version": "1.0",
-      "receiptId": "spr_...",
-      "status": "settled",
-      "contractId": "user-123",
-      "walletAddress": "0x...",
-      "amount": "5",
-      "sessionId": "spend-001",
-      "providerId": "prov-DE",
-      "tokenTxHash": "0x...",
-      "tokenContractAddress": "0x...",
-      "chainId": 80002,
-      "issuedAt": "2026-04-16T10:30:00.000Z"
-    },
-    "signature": "0x...",
-    "signerAddress": "0x...",
-    "canonicalPayload": "{\"amount\":\"5\",...}",
-    "dbStored": true
-  }
-}
-```
-
-The `spendReceipt` is a backend-signed settlement proof for the frontend,
-EMP, or settlement receiver. Receivers should verify `signature` over
-`canonicalPayload` using `signerAddress`, then check that the receipt fields
-match the expected charging session, token transaction, contract ID, amount,
-token contract, and chain ID. The receipt is persisted in the
-`spend_receipts` table when PostgreSQL is available.
-
-Frontend integration note:
-- The frontend does not create the NEVERFLAT signature.
-- The frontend must keep the `spendReceipt` unchanged when forwarding it to the EMP/front-end owner system.
-- If the frontend verifies the receipt, it must verify `signature` against `canonicalPayload` and `signerAddress`.
-- If verification is handled by the receiver backend, the frontend should forward the full `spendReceipt` object exactly as returned.
-
----
-
-### Verify Spend Receipt
-
-**POST** `/spend-receipts/verify`
-
-Verifies a backend-signed spend receipt. Requires `X-API-Key` when API key
-authentication is enabled.
-
-Request:
-```json
-{
-  "payload": { "receiptId": "spr_...", "status": "settled" },
-  "signature": "0x...",
-  "signerAddress": "0x..."
-}
-```
-
-Response:
-```json
-{
-  "status": "valid",
-  "valid": true,
-  "signerAddress": "0x...",
-  "receiptId": "spr_..."
-}
-```
-
----
-
-### Custodial/User-Managed Wallet Spend Intent
-
-**POST** `/spend/custodial-intent`
-
-Builds the token transfer transaction that a user-managed wallet must sign. The
-frontend should send `spendIntent.transaction` to the connected wallet. If the
-wallet signing or submission fails, call `/spend/custodial-failure` with the
-same amount/session details so the API records the failed attempt and returns
-the same retryable intent.
-
-Request:
-```json
-{
-  "uid": "user-123",
-  "walletAddress": "0x...",
-  "amount": 5,
-  "sessionId": "spend-001",
-  "providerId": "prov-DE"
-}
-```
-
-Response:
-```json
-{
-  "status": "requires_signature",
-  "uid": "user-123",
-  "message": "Confirm this SPARKZ spend in your wallet.",
-  "spendIntent": {
-    "intentId": "csi_...",
-    "contractId": "user-123",
-    "walletAddress": "0x...",
-    "amount": "5",
-    "sessionId": "spend-001",
-    "providerId": "prov-DE",
-    "chainId": 80002,
-    "tokenContractAddress": "0x...",
-    "treasuryAddress": "0x...",
-    "retryable": true,
-    "transaction": {
-      "from": "0x...",
-      "to": "0x...",
-      "value": "0",
-      "data": "0x..."
-    }
-  }
-}
-```
-
-**POST** `/spend/custodial-failure`
-
-Records a failed custodial wallet signing/submission attempt and returns the
-same deterministic `spendIntent` so the frontend can prompt the user to retry.
-The user only needs to sign again; the frontend should not change amount,
-session ID, provider ID, treasury address, token address, chain ID, or calldata.
-
----
-
-### Get Wallet
-
-**GET** `/wallet/:uid`
-
-Query wallet balance and transaction history (last 10 transactions).
-
-Note: route parameter `:uid` is a legacy name and should be populated with contract ID.
-
-**Response:**
-```json
-{
-  "uid": "user-123",
-  "address": "0x1234567890123456789012345678901234567890",
-  "balance": "50.00",
-  "totalAwarded": "100.00",
-  "totalSpent": "50.00",
-  "history": [
-    {
-      "type": "spend",
-      "label": "spend-001",
-      "amount": "5.00",
-      "txHash": "0x...",
-      "timestamp": "2026-04-16T10:30:00.000Z",
-      "status": "confirmed"
-    },
-    {
-      "type": "award",
-      "label": "sess-12345-prov-DE",
-      "amount": "10.00",
-      "txHash": "0x...",
-      "timestamp": "2026-04-16T05:30:00.000Z",
-      "status": "confirmed",
-      "isOffPeak": true,
-      "countryCode": "DE"
-    }
-  ]
-}
-```
-
----
-
-### Get Recent Transactions
-
-**GET** `/transactions?limit=10`
-
-Get recent transactions across all users (default: 50, max: 500).
-
-**Response:**
-```json
-{
-  "status": "ok",
-  "transactionCount": 10,
-  "transactions": [
-    {
-      "type": "spend",
-      "uid": "user-123",
-      "walletAddress": "0x1234567890123456789012345678901234567890",
-      "amount": "5.00",
-      "txHash": "0x...",
-      "sessionId": "spend-001",
-      "timestamp": "2026-04-16T10:30:00.000Z",
-      "status": "confirmed"
-    }
-  ]
-}
-```
-
----
-
-### Get My Wallet (Identity Context)
-
-**GET** `/wallet/me`
-
-Returns wallet details for the authenticated/forwarded user identity.
-
-Required header:
-- `x-contract-id: <contract-id>` (or the header name configured in `USER_IDENTITY_HEADER`)
-
-Response:
-```json
-{
-  "status": "success",
-  "uid": "user-123",
-  "contractIds": ["user-123"],
-  "linkedWalletAddresses": [],
-  "linkedWallets": [],
-  "walletName": null,
-  "walletAddress": "0x...",
-  "managedWalletAddress": "0x...",
-  "walletMode": "managed",
-  "isRegistered": true,
-  "balance": "12.40",
-  "totalAwarded": "20.00",
-  "totalSpent": "7.60",
-  "treasuryAddress": "0x...",
-  "tokenContractAddress": "0x...",
-  "history": []
-}
-```
-
-BEIA should call this with the logged-in app user's UID as `x-contract-id`.
-The SPARKZ React package uses this endpoint for the unplugged/account view.
-
----
-
-### Spend Tokens (Identity Context)
-
-**POST** `/spend/me`
-
-Reserves SPARKZ for the authenticated user's charging session without passing
-`uid` in the body. This does not transfer tokens. When the matching final CDR is
-ingested, NEVERFLAT settles `min(reserved SPARKZ, delivered kWh)` at `1 SPARKZ =
-1 kWh` and releases the remainder.
-
-The EMP supplies CDR data through the Aarhus database, while settlement data
-must travel from NEVERFLAT through BEIA to the EMP. The CDR-processing response
-is therefore not the delivery channel. A BEIA-facing reservation-status API is
-required so BEIA can retrieve and forward the final settlement. That read API
-is not yet implemented.
-
-For an external wallet, call `POST /spend/reservation-approval-intent` first,
-submit the returned ERC-20 approval transaction through the connected wallet,
-wait for confirmation, then include `walletAddress` and `authorizationTxHash`
-in this request. NEVERFLAT verifies the on-chain allowance before reserving.
-
-### External Wallet Reservation Approval
-
-**POST** `/spend/reservation-approval-intent`
-
-Returns a capped ERC-20 `approve` transaction for the active linked wallet. The
-approval covers active reservations for that wallet plus the requested amount.
-The user submits it once at reservation time; delayed CDR settlement then uses
-`transferFrom` without another signature.
-
-A partial settlement may leave residual allowance. Settlement output flags
-`authorizationCleanupRequired` so the integration can ask the wallet to revoke
-or replace that allowance.
-
-Required header:
-- `x-contract-id: <contract-id>` (or the header name configured in `USER_IDENTITY_HEADER`)
-
-Request example:
-```json
-{
-  "amount": 5,
-  "sessionId": "spend-001",
-  "providerId": "prov-DE",
-  "label": "Charging discount"
-}
-```
-
----
-
-### Link Browser Wallet For Custodial Mode
-
-**POST** `/wallet/:uid/linked-wallets`
-
-Links an external blockchain wallet to the contract ID after the user signs a
-message in an installed wallet such as MetaMask or Rabby.
-
-Route parameter:
-- `:uid` is the contract ID value.
-
-Request:
-```json
-{
-  "walletAddress": "0x...",
-  "signature": "0x..."
-}
-```
-
-The signature must recover to `walletAddress` over this exact message:
+The server resolves owner, amount, asset, hash, receipt, and saved snapshot
+from that existing operation. It may verify a known submitted hash and finish a
+missing database projection/receipt, or report an already projected operation
+idempotently. It never broadcasts, funds, approves, reclaims, creates a new
+transfer, accepts caller amount/eMAID/hash/CDR overrides, or settles a
+reservation without the saved context supported by the operation. Unknown or
+hashless operations, missing/invalid award snapshots, mismatched assets,
+fingerprints, owners, receipts, or unsupported reservation states remain
+blocked with a review-required result.
+
+Typical statuses are `200` for completed or already-completed projection, `202`
+for pending evidence/receipt, `409` for a blocked review result, `400` for a
+malformed body/key, and `401` for missing/invalid admin authentication. Every
+request is audited before mutation; an audit persistence failure is reported as
+an audit failure rather than falsely claiming an unaudited success.
+
+## 7. Errors and safe retries
+
+JSON parsing and request-size middleware return `INVALID_JSON` (`400`) and
+`REQUEST_BODY_TOO_LARGE` (`413`). Other common stable codes include:
+
+| Code | Typical meaning |
+| --- | --- |
+| `MISSING_EMAID`, `UID_ONLY`, `CONFLICTING_IDENTIFIERS`, `INVALID_EMAID` | CDR ownership cannot be safely normalised. |
+| `INVALID_PAYLOAD` | CDR shape or required fields are invalid. |
+| `IDEMPOTENCY_KEY_REQUIRED`, `INVALID_OPERATION_KEY` | Direct manual spend key contract is not satisfied. |
+| `TOKEN_OPERATION_INTENT_MISMATCH`, `OPERATION_NOT_FOUND` | A recovery key does not match the saved operation. |
+| `INVALID_RESERVATION_ID` | Reservation path is not a UUID. |
+| `SOURCE_WALLET_HAS_BALANCE` | Mode change would strand funds without explicit split behaviour. |
+| `AUDIT_LOG_UNAVAILABLE`, `EVIDENCE_PACK_UNAVAILABLE`, `RECONCILIATION_UNAVAILABLE` | Operational dependency failed; retry safely. |
+| `TOKEN_OPERATION_RECOVERY_UNAVAILABLE` | Durable operation lookup cannot be completed; no new movement was attempted. |
+| `AWARD_CHARGING_SESSION_COLLISION_REVIEW` | A distinct CDR claimed a protected provider/physical-session tuple. |
+| `SPEND_RECEIPT_CONTEXT_MISMATCH` | Receipt evidence does not match the saved spend intent. |
+| `SPEND_RECEIPT_RECOVERY_PENDING` / `SPEND_RECEIPT_RECOVERY_BLOCKED` | Movement/projection is known but receipt recovery is pending or requires review. |
+
+For a timeout or connection loss, retry only the identical saved CDR, stable
+manual idempotency key, operation key, custodial hash, or reservation poll. RPC
+receipt reads use a bounded read-only retry budget; broadcasts and approvals
+are never retried blindly. A response with `requiresReview`, `movementOutcome:
+"unknown"`, or an identity/session conflict must stop automated retries.
+
+## 8. Configuration and release boundary
+
+The source reads configuration from `.env`; values must be supplied by the
+target environment owner. Relevant names are:
 
 ```text
-NEVERFLAT link wallet address
-EMP contract: <contractId>
-Wallet address: <checksumWalletAddress>
-```
-
-Response is the wallet payload from `/wallet/me`, focused on the linked wallet.
-
----
-
-### Switch Wallet Mode
-
-**POST** `/wallet/:uid/mode`
-
-Switches the active wallet mode between the deterministic NEVERFLAT managed
-wallet and a signed/linked custodial wallet.
-
-Route parameter:
-- `:uid` is the contract ID value.
-
-Request for managed mode:
-```json
-{
-  "mode": "managed"
-}
-```
-
-Request for custodial mode:
-```json
-{
-  "mode": "custodial",
-  "walletAddress": "0x...",
-  "allowSplit": true
-}
-```
-
-Important: BEIA/frontends must not switch to custodial mode based on a typed
-address alone. First request a wallet signature and link the address using
-`POST /wallet/:uid/linked-wallets`, then call this endpoint.
-
-If `allowSplit` is omitted and the source wallet has a balance, the endpoint can
-return `409 SOURCE_WALLET_HAS_BALANCE` so the UI can ask whether to move funds
-or continue with balances split across wallets.
-
----
-
-## Database Logging
-
-### Current Status
-- ✅ On-chain transactions work
-- ⏳ Database logging requires PostgreSQL setup
-
-### Enable Database Logging
-
-1. **Start PostgreSQL** (via Docker or local installation):
-   ```bash
-   docker compose up -d postgres
-   ```
-
-2. **Run migrations**:
-   ```bash
-   npm run db:migrate
-   ```
-
-3. **Verify connection**:
-   ```bash
-   psql $DATABASE_URL -c "SELECT version();"
-   ```
-
-### Verify Logging
-
-After processing awards/spends with a working database:
-
-```bash
-# Query awards
-psql $DATABASE_URL -c "SELECT * FROM awards ORDER BY created_at DESC LIMIT 10;"
-
-# Query spends
-psql $DATABASE_URL -c "SELECT * FROM spends ORDER BY created_at DESC LIMIT 10;"
-
-# Query user balances
-psql $DATABASE_URL -c "SELECT uid, balance, total_awarded, total_spent FROM users JOIN balances ON users.id = balances.user_id;"
-# `uid` column is the contract ID value (legacy column name)
-```
-
----
-
-## Award Rules
-
-Tokens are awarded based on:
-
-1. **Off-Peak Charging** (22:00-06:00)
-   - 0.25 tokens per kWh (= 1 token per 4 kWh)
-   - Only awarded during off-peak hours in the charging location's country
-
-2. **V2G Discharge** (Vehicle-to-Grid)
-   - 1 token per kWh
-   - No time restriction
-
-### Supported Countries
-- **DE** (Germany): 22:00-06:00
-- **ES** (Spain): 22:00-06:00
-- **RO** (Romania): 22:00-06:00
-
-To add more countries, edit [src/config/offPeakWindows.ts](./src/config/offPeakWindows.ts)
-
----
-
-## Error Handling
-
-All endpoints return structured error responses:
-
-```json
-{
-  "status": "error",
-  "error": "Error message describing what went wrong"
-}
-```
-
-### Common Errors
-
-| Error | Cause | Solution |
-|-------|-------|----------|
-| `INVALID_CDR` | CDR is missing its session, provider, contract, EVSE, time, or energy data | Send one complete documented CDR format, or validate it with `/ingest/cdr/preview` |
-| `invalid signature` | Treasury key doesn't match address | Check TREASURY_SIGNER_KEY config |
-| `insufficient allowance` | User hasn't approved treasury for spend | Requires on-chain approval first |
-| `Database not available` | PostgreSQL not running | Start DB: `docker compose up -d postgres` |
-
----
-
-## Example Flow: Award & Spend
-
-### 1. Award tokens (via CDR ingestion)
-```bash
-curl -X POST http://localhost:3000/ingest/cdr \
-  -H "Content-Type: application/json" \
-  -H "X-Ingest-API-Key: your_ingest_api_key" \
-  -d '{
-    "SessionID": "sess-001",
-    "ProviderID": "prov-DE",
-    "cdr_token": { "contract_id": "user-flow-test" },
-    "EVSEID": "DE*ABC*E12345",
-    "StartTime": "2026-04-15T23:00:00Z",
-    "EndTime": "2026-04-15T23:30:00Z",
-    "Energy": "40",
-    "EnergyDirection": "CHARGE"
-  }'
-```
-
-Response:
-```json
-{
-  "status": "accepted",
-  "tokensAwarded": 10,
-  "txHash": "0x..."
-}
-```
-
-### 2. Check wallet balance
-```bash
-curl http://localhost:3000/wallet/user-flow-test
-```
-
-Response shows 10 tokens awarded.
-
-### 3. Spend tokens
-```bash
-curl -X POST http://localhost:3000/spend \
-  -H "Content-Type: application/json" \
-  -d '{
-    "uid": "user-flow-test",
-    "amount": 5,
-    "label": "Discount"
-  }'
-```
-
-Response:
-```json
-{
-  "status": "success",
-  "tokensSpent": 5,
-  "txHash": "0x..."
-}
-```
-
-### 4. Verify final balance
-```bash
-curl http://localhost:3000/wallet/user-flow-test
-```
-
-Response shows balance: 5 SPARKZ (10 awarded - 5 spent).
-
-The spend response also includes a signed `spendReceipt` that can be forwarded
-to the EMP/front-end owner system as proof of settlement.
-
----
-
-## Admin Audit Events
-
-**GET** `/admin/audit?limit=100&status=error&eventType=spend.failed`
-
-Returns recent append-only audit events. Requires an admin bearer token from
-`POST /admin/login`.
-
-Audit events are written for spend completion, signed spend receipt creation
-or persistence failure, custodial spend recording, wallet mode changes, admin
-login/logout attempts, admin reward-rule/off-peak-window changes, and treasury
-gas warnings.
-
-Optional filters:
-- `status` - for example `success`, `error`, `retry_required`, or `duplicate`.
-- `eventType` - for example `award.failed`, `spend.failed`, or `spend_receipt.created`.
-
-Operational failure events include:
-- `award.validation_failed`
-- `award.failed`
-- `award.unhandled_error`
-- `spend.validation_failed`
-- `spend.auto_approval_failed`
-- `spend.failed`
-- `spend.unhandled_error`
-- `spend.custodial_validation_failed`
-- `spend.custodial_unhandled_error`
-- `treasury.gas_low`
-- `treasury.gas_check_failed`
-
-Treasury MATIC warnings are admin/operator issues. Configure
-`TREASURY_GAS_WARNING_THRESHOLD_MATIC` to set the warning threshold, then query
-`GET /admin/audit?eventType=treasury.gas_low` to see low-gas warnings. All
-other award/spend failures should be surfaced to users with the API response's
-user-safe `error` or `message` text.
-
-Admin alert delivery:
-- Set `ADMIN_EMAIL` as the registered admin login and alert recipient.
-- Set `ADMIN_ALERT_WEBHOOK_URL` to an email/notification service endpoint.
-- The API sends alert JSON for `warning`, `retry_required`, and selected `error`
-  audit events, and writes `admin_alert.delivered`, `admin_alert.delivery_failed`,
-  or `admin_alert.delivery_skipped` audit events as delivery evidence.
-- Use `POST /admin/alerts/test` to send a manual test alert and create audit
-  evidence that the alert path was delivered or skipped.
-
-**Response:**
-```json
-{
-  "status": "ok",
-  "count": 1,
-  "events": [
-    {
-      "event_type": "spend_receipt.created",
-      "actor_type": "system",
-      "actor_id": "api",
-      "target_type": "spend_receipt",
-      "target_id": "spr_...",
-      "status": "success",
-      "metadata": {
-        "uid": "user-123",
-        "amount": "5",
-        "sessionId": "spend-001",
-        "providerId": "prov-DE",
-        "tokenTxHash": "0x..."
-      },
-      "created_at": "2026-04-16T10:30:00.000Z"
-    }
-  ]
-}
-```
-
-Validation errors include:
-- `MISSING_SESSION_ID`
-- `MISSING_PROVIDER_ID`
-- `INVALID_AMOUNT`
-- `INSUFFICIENT_SPARKZ`
-
-Successful response:
-```json
-{
-  "status": "success",
-  "uid": "user-123",
-  "sessionId": "spend-001",
-  "providerId": "prov-DE",
-  "tokensSpent": 5,
-  "txHash": "0x...",
-  "timestamp": "2026-04-16T10:30:00.000Z",
-  "label": "Charging discount",
-  "spendReceipt": {
-    "payload": {
-      "receiptId": "spr_...",
-      "status": "settled",
-      "contractId": "user-123",
-      "amount": "5",
-      "tokenTxHash": "0x..."
-    },
-    "signature": "0x...",
-    "signerAddress": "0x...",
-    "canonicalPayload": "{\"amount\":\"5\",...}",
-    "dbStored": true
-  }
-}
-```
-
-OpenAPI/Swagger note: the live Swagger spec is embedded in `src/api.ts` and is
-served by the API at `/openapi.json`, `/api-docs`, and `/docs`. Keep this
-document and the embedded spec in sync when endpoints change. The documented
-CDR examples are exercised through the side-effect-free preview endpoint by the
-API integration test suite.
-
----
-
-## Admin Reconciliation
-
-**GET** `/admin/pilot-metrics?hours=24`
-
-Returns audit-derived pilot activity metrics for the requested rolling window
-between 1 and 168 hours. Requires an admin bearer token from `POST
-/admin/login`. The admin dashboard displays the default 24-hour view.
-
-Response:
-```json
-{
-  "status": "ok",
-  "metrics": {
-    "windowHours": 24,
-    "totalEvents": 42,
-    "awards": {
-      "completed": 18,
-      "notEligible": 3,
-      "duplicates": 1,
-      "failures": 0
-    },
-    "spends": {
-      "completed": 6,
-      "custodialRecorded": 2,
-      "custodialIntentsCreated": 2,
-      "retryRequired": 1,
-      "failures": 0
-    },
-    "operations": {
-      "warnings": 1,
-      "errors": 0,
-      "retryRequired": 1,
-      "deliveredAlerts": 1,
-      "skippedAlerts": 0,
-      "reconciliationRuns": 1
-    }
-  }
-}
-```
-
-**GET** `/admin/readiness`
-
-Returns pilot readiness checks for deployment evidence. Requires an admin bearer
-token from `POST /admin/login`.
-
-Response:
-```json
-{
-  "status": "ready_with_warnings",
-  "failedCount": 0,
-  "warningCount": 1,
-  "checks": [
-    {
-      "key": "admin_alerts",
-      "label": "Admin alert delivery",
-      "status": "warn",
-      "message": "ADMIN_ALERT_WEBHOOK_URL is not configured; alerts will be audited but not sent"
-    }
-  ]
-}
-```
-
-**POST** `/admin/alerts/test`
-
-Sends a manual test alert through the configured admin alert path. Requires an
-admin bearer token from `POST /admin/login`.
-
-Response:
-```json
-{
-  "status": "sent_or_queued",
-  "message": "Test alert sent to configured admin alert webhook.",
-  "adminEmailConfigured": true,
-  "webhookConfigured": true
-}
-```
-
-**GET** `/admin/evidence-pack`
-
-Exports a point-in-time TRL7 evidence snapshot as JSON. Requires an admin bearer
-token from `POST /admin/login`. The admin dashboard also exposes this as
-**Export Evidence**.
-
-The export includes readiness checks, pilot configuration flags, token/treasury
-identifiers, latest reconciliation report, 24-hour pilot metrics,
-retry-required audit events, warnings, errors, and delivered-alert audit events.
-
-**POST** `/admin/reconciliation/run`
-
-Runs a DB-vs-chain wallet balance reconciliation. Requires an admin bearer
-token from `POST /admin/login`. The endpoint reads registered users, compares
-the database balance with `balanceOf(walletAddress)` on the configured token
-contract, stores a report, and writes an audit event.
-
-Request:
-```json
-{
-  "limit": 500
-}
-```
-
-Response:
-```json
-{
-  "status": "ok",
-  "report": {
-    "status": "matched",
-    "checked_count": 25,
-    "matched_count": 25,
-    "mismatch_count": 0,
-    "items": [
-      {
-        "uid": "user-123",
-        "walletAddress": "0x...",
-        "dbBalance": "5.00",
-        "chainBalance": "5.000000",
-        "difference": "0.000000",
-        "status": "matched"
-      }
-    ]
-  }
-}
-```
-
-**GET** `/admin/reconciliation?limit=20`
-
-Returns recent reconciliation reports, including the latest report.
-
----
-
-## Transaction Lifecycle States
-
-Award and spend history records include a `status` field. Existing successful
-records are treated as `confirmed`.
-
-Current states:
-- `confirmed` - on-chain transaction succeeded and the database mirror was written.
-
-Reserved future states for retry/recovery work:
-- `accepted` - request accepted before chain submission.
-- `submitted` - transaction submitted but not yet confirmed.
-- `failed` - transaction or persistence failed.
-- `retry_required` - operator or worker should retry settlement/reconciliation.
-
-The database also stores `confirmed_at` and `error_message` on award and spend
-records so later retry/reconciliation workers can use the same schema.
-
----
-
-## On-Chain Details
-
-All transactions execute on **Polygon Amoy Testnet**:
-
-- **Network**: Polygon Amoy
-- **RPC**: https://polygon-amoy.drpc.org
-- **SPARKZ Token**: 0x605871D30DC278a036F09e2ace771df8a224624B
-- **Explorer**: https://amoy.polygonscan.com/
-
-View transactions:
-```
-https://amoy.polygonscan.com/tx/{txHash}
-```
-
----
-
-## Configuration
-
-All settings in `.env`:
-
-```env
-# Treasury wallet for signing transactions
-TREASURY_ADDRESS=0x...
-TREASURY_SIGNER_KEY=...
-TREASURY_GAS_WARNING_THRESHOLD_MATIC=0.05
-ADMIN_EMAIL=admin@example.com
-ADMIN_ALERT_WEBHOOK_URL=https://alerts.example.com/neverflat
-
-# Database (optional, for transaction history)
-DATABASE_URL=postgres://...
-
-# API server port
 PORT=3000
-
-# Identity header name used by /wallet/me and /spend/me
+API_KEY=...
+BEIA_API_KEY=...
+INGEST_API_KEY=...
 USER_IDENTITY_HEADER=x-contract-id
-
-# Keep manual /wallet/:uid lookup for testing (set false in locked-down prod)
-ENABLE_TEST_UID_LOOKUP=true
+ADMIN_EMAIL=...
+ADMIN_PASSWORD=...
+BEIA_ADMIN_EMAIL=...
+BEIA_ADMIN_PASSWORD=...
+DATABASE_URL=...
+ENABLE_TEST_UID_LOOKUP=false
+TREASURY_ADDRESS=0x...
+TREASURY_SIGNER_KEY_FILE=...
+ADMIN_ALERT_WEBHOOK_URL=https://...
 ```
 
-See [.env.example](./.env.example) for full reference.
+Keep existing wallet derivation, database column names, and standards wire names
+unchanged. The additive policy and charging-session schema work requires a
+target-specific reviewed migration/backup procedure. Local activation used
+loopback disposable/controlled resources and does not authorize a production
+migration. No backend release version or commit is assigned by this document;
+the current candidate is still **not deployed**.
 
----
-
-## Support
-
-- **Issues**: Check [GitHub](./README.md) for open issues
-- **Logs**: Enable debug mode: `DEBUG=* npm run api`
-- **Tests**: `npm test`
+For BEIA component integration, use the [BEIA guide](docs/BEIA_INTEGRATION.md).
+For rationale and system architecture, see
+[NEVERFLAT Award System Documentation](NEVERFLAT_Award_System_Documentation.md).

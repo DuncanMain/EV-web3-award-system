@@ -35,6 +35,9 @@ logs/
 # Database
 *.db
 *.sqlite
+outputs/nvf-award-*.dump
+outputs/nvf-award-physical-*/
+outputs/nvf-award-token-schema-*.json
 
 # Test coverage
 coverage/

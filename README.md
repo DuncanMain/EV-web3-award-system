@@ -13,13 +13,22 @@ This module provides internal functions for:
 
 Built for Polygon Amoy network integration with the NVF contract.
 
+## Deployment status
+
+The current 30 September 2026 tree is a local, reviewable candidate. It has
+not been pushed or deployed, and no immutable backend commit or container
+digest has been assigned. Local disposable PostgreSQL, Hardhat, and API
+verification does not establish production readiness. See
+[`DEPLOYMENT.md`](DEPLOYMENT.md) for the target preflight, backup/restore,
+migration, rollout, and rollback gates.
+
 ## Identifier Terminology
 
-This project uses **contract ID** as the primary external identifier for a user.
+This project uses the charging contract's **eMAID** as the primary external identifier for ownership.
 
-For backward compatibility, parts of the codebase and schema still use the name `uid` (for example, helper names like `resolveUidToAddress` and the `users.uid` column). In this project, treat `uid` as the contract ID value.
+For backward compatibility, API fields and headers retain `contractId`, `x-contract-id` and `uid` (including helper names like `resolveUidToAddress` and the `users.uid` column). These carry the same eMAID value as the final CDR. An app account ID or RFID UID is not a substitute.
 
-If integrating with another platform, this identifier mapping can be reconfigured to match that system's canonical user key.
+Preserve the eMAID spelling used by the existing integration. Changing identity values or wallet-derivation configuration can change wallet addresses and requires an explicit migration.
 
 ## Implementation Status
 
@@ -32,7 +41,7 @@ If integrating with another platform, this identifier mapping can be reconfigure
 - ✅ **Contract Integration**: ethers.js setup with token calls
 - ✅ **User Accounts**: Deterministic contract ID → Polygon address mapping with auto-enrollment
 - ✅ **PostgreSQL Database**: Mirrors blockchain state for API queries
-- ✅ **Event Listeners**: Real-time sync from contract to database
+- **Event listener scaffolding**: Not started by the current API; ordinary ERC20 transfers are tracked through the request processing paths.
 - ✅ **Comprehensive Tests**: Automated unit and API-integration coverage across core modules
 - ✅ **REST API**: Identity-context and test-mode endpoints for CDR ingestion, spend processing, and wallet queries
 
@@ -50,15 +59,20 @@ npm run build
 
 ## Docker
 
-Build the container image and start the application with PostgreSQL:
+For local development only, build the container image and start PostgreSQL and
+the API with:
 
 ```bash
 docker compose up --build -d
 ```
 
 This uses `compose.yaml`, the single local-development Compose configuration,
-for both the API and PostgreSQL. Production uses the separate
-`compose.production.yaml` file explicitly through the deployment workflow.
+for both the API and PostgreSQL. The image entrypoint runs the complete
+`dist/database/migrate.js` chain before `dist/api.js`; use a fresh or known
+compatible local database and expect the process to stop if historical
+migration checks find duplicate data. Do not use this command as a production
+rollout procedure. Production uses the separate `compose.production.yaml`
+definition and the review gates in [`DEPLOYMENT.md`](DEPLOYMENT.md).
 
 ### Docker Secrets
 
@@ -121,7 +135,7 @@ For local development, the admin UI remembers the API URL used at login. When se
 The backend supports two access modes:
 
 - **Identity mode (EMP-ready)**: Uses API identity endpoints and resolves contract ID from request header (default `x-contract-id`)
-- **Test mode (current integration fallback)**: Allows manual contract ID lookup for testing transactions and wallet flows before EMP is complete
+- **Test mode (local integration fallback)**: Allows manual contract ID lookup for disposable testing before EMP is complete. Keep `ENABLE_TEST_UID_LOOKUP=false` for a pilot or production target and use `/wallet/me` and `/spend/me` with the forwarded eMAID.
 
 ### User Endpoints
 
@@ -129,7 +143,7 @@ The backend supports two access modes:
 - `POST /spend/session` - Non-spending BEAI charging-session SPARKZ prompt
 - `POST /spend/me` - Spend for authenticated/forwarded identity context
 - `GET /wallet/:uid` - Manual contract ID wallet lookup (legacy/test flow)
-- `POST /spend` - Manual contract ID spend (legacy/test flow)
+- `POST /spend` - Manual contract ID spend (legacy/test flow; every new request requires a stable non-empty `idempotencyKey`)
 
 The BEIA charging flow first calls `POST /spend/session` with `x-contract-id`,
 then calls `POST /spend/me` only after the user confirms an amount. This creates
@@ -147,11 +161,12 @@ console bundle.
 
 The BEIA package exports `SparkzChargingCard`.
 
-- BEIA passes the logged-in app user UID as `contractId`
+- BEIA passes the logged-in user's charging-contract eMAID as `contractId`
 - `UNPLUGGED` mode shows the user's SPARKZ account view via `GET /wallet/me`
 - Active session modes call `POST /spend/session` and show the spend prompt
 - `POST /spend/me` reserves SPARKZ only after the user confirms an amount
-- BEIA must use the same contract, session, and EMP provider identifiers that
+- Manual `POST /spend` callers must create one stable `idempotencyKey` per intended spend and reuse it for pending or network-failure recovery. A new key represents a genuinely new spend; `/spend/me` reservations are unchanged.
+- BEIA must use the same contract, session, and provider identifiers that
   appear in the final Aarhus CDR
 - BEIA will retrieve the final settlement from NEVERFLAT and forward it to the EMP
 - Custodial wallet mode requires an installed EVM wallet signature before mode switch
@@ -187,6 +202,10 @@ Award logic is defined in a JSON configuration file (`src/config/awardRules.json
 }
 ```
 
+Charging and discharge calculations floor the resulting award to whole SPARKZ
+tokens. A 10 kWh off-peak charge at 0.25 tokens/kWh therefore awards 2 SPARKZ;
+the remaining fractional token is not carried into a later event.
+
 ## User Account System
 
 Each contract ID automatically maps to a Polygon wallet address on first use.
@@ -216,14 +235,14 @@ const isKnown = isUserRegistered('contract-456');
 Create a `.env` file based on `.env.example`:
 
 ```bash
-# Treasury wallet address (holds SPARKZ tokens)
-TREASURY_ADDRESS=0x605871D30DC278a036F09e2ace771df8a224624B
+# Existing treasury wallet address (preserve the target value)
+TREASURY_ADDRESS=your_existing_treasury_address
 TREASURY_GAS_WARNING_THRESHOLD_MATIC=0.05
 
-# Optional API key (recommended outside local development)
+# Required for a pilot or production target; may be omitted only for local development
 API_KEY=your_api_key_here
 
-# Dedicated CDR ingestion key for AU/provider systems
+# Dedicated CDR ingestion key for AU/provider systems (required for a target)
 INGEST_API_KEY=your_ingest_only_secret_here
 
 # Admin login credentials and alert target
@@ -237,8 +256,8 @@ USER_ADDRESS_DERIVATION_SALT=nvf-award-core-v1
 # Identity header name used by /wallet/me and /spend/me
 USER_IDENTITY_HEADER=x-contract-id
 
-# Keep manual /wallet/:uid lookup enabled for testing
-# Set to false when EMP identity integration is fully live or in pilot mode
+# Local-only manual /wallet/:uid lookup for testing
+# Set explicitly to false in a pilot or production target
 ENABLE_TEST_UID_LOOKUP=true
 
 # PostgreSQL connection (database that mirrors blockchain)
@@ -260,6 +279,14 @@ The system uses PostgreSQL to mirror blockchain state for efficient API queries.
    ```bash
    npm run db:migrate
    ```
+
+   This runs the full migration chain locally. It is suitable for a fresh or
+   known-compatible disposable database only. Migration 005 rejects duplicate
+   historical contract IDs and migration 015 rejects duplicate transaction
+   hashes for review; the container entrypoint invokes the same chain. Use the
+   target-specific backup and migration gate in [`DEPLOYMENT.md`](DEPLOYMENT.md)
+   before any production database change. The scoped 015/016/017 runners are
+   loopback-only local review tools and must not be copied to production.
 
 3. **Stop Docker database when finished:**
    ```bash
@@ -331,19 +358,16 @@ The system uses PostgreSQL to mirror blockchain state for efficient API queries.
 - `metadata` - Token contract, run limit, and run source
 - `created_at` - Report timestamp
 
-### Real-time Sync
+### Database Synchronisation
 
-Event listeners automatically sync blockchain state to the database:
+The API records token transfers through its request-processing paths. The event
+listener scaffolding is not started by API startup, and its custom `Award` and
+`Spend` events are not part of the configured ERC20 interface. Do not rely on it
+to repair missed database writes or to import arbitrary wallet transactions.
 
-```typescript
-import { startEventListener } from 'nvf-award-core';
-import { ethers } from 'ethers';
-
-const provider = new ethers.JsonRpcProvider(process.env.POLYGON_RPC_URL);
-await startEventListener(provider);
-
-// Now all Award and Spend events are synced to the database in real-time
-```
+Use operation recovery and the existing reconciliation checks to investigate
+differences between recorded and on-chain balances. A balance comparison alone
+does not establish which session or eMAID owns an unrecorded transfer.
 
 ### Database Queries
 
@@ -376,7 +400,7 @@ import { processAwardFromCDR } from 'nvf-award-core';
 const neverflatCDR = {
   SessionID: 'a1b09f5b-b75d-4c9e-aef2-4f0c74cc7623',
   ProviderID: 'DE-NWQ',
-  cdr_token: { contract_id: '0475804AA47330' },
+  cdr_token: { contract_id: 'DE8ACC12E46L89' }, // eMAID, not RFID UID
   EVSEID: 'DE*GUC*E*EZO*0877',
   StartTime: '2026-02-16T02:00:00Z',  // Off-peak in DE
   EndTime: '2026-02-16T03:00:00Z',
@@ -399,7 +423,7 @@ console.log(result);
 //   success: true,
 //   eligible: true,
 //   amount: 10,                  // 40 kWh / 4 = 10 SPARKZ
-//   uid: '0475804AA47330',        // Contract ID (legacy field name)
+//   uid: 'DE8ACC12E46L89',        // eMAID in the legacy field name
 //   dedupKey: 'a1b09f5b-...-DE-NWQ',
 //   txHash: '0x123...',          // User received SPARKZ on-chain
 //   stage: 'complete'
@@ -408,7 +432,10 @@ console.log(result);
 
 ### With Idempotency Checking
 
-Prevent double-processing by checking if the session was already awarded:
+The durable token-operation claim protects concurrent processing and retries.
+Apply migration 015 before using this local implementation. The optional legacy
+callback remains available as an additional check; it does not replace the
+database claim or the executor's award projection.
 
 ```typescript
 const treasurySigner = await getTreasurySigner();
@@ -422,9 +449,10 @@ const result = await processAwardFromCDR(
   }
 );
 
-if (result.success && result.eligible) {
-  // Mark as processed in your database
-  await db.awards.create({ dedupKey: result.dedupKey, amount: result.amount });
+if (result.requiresReview) {
+  // Retain the original CDR and recovery details for operator review.
+} else if (result.pending) {
+  // Retry the identical CDR to resume confirmation or database projection.
 }
 ```
 
@@ -437,7 +465,11 @@ if (result.success && result.eligible) {
   amount: number;                // SPARKZ tokens
   uid: string;                   // Contract ID (legacy field name)
   dedupKey: string;              // For database lookup
-  txHash: string;                // On-chain transaction hash (always present if settled)
+  txHash?: string;               // Absent for a zero-award decision or unknown submission
+  operationStatus?: string;
+  pending?: boolean;            // Processing is incomplete; not financial success
+  requiresReview?: boolean;     // Do not automatically replace the transfer
+  duplicate?: boolean;
   error?: string;                // Error message if failed
   stage: 'normalisation' | 'calculation' | 'validation' | 'execution' | 'complete'
 }
@@ -497,6 +529,16 @@ Energy direction is automatically detected from the sign:
 ### Idempotency
 
 Deduplication uses `(sessionId, providerId)` tuple to prevent double-awarding. The `getDeduplicationKey()` function generates this key for database lookups.
+
+Manual `POST /spend` requests require a non-empty string `idempotencyKey` for
+new spends. Keep that key unchanged across retries, including a lost HTTP
+response or a pending token operation; the returned `operationKey` can be used
+to recover an existing operation. Missing, empty, or non-string keys fail with
+HTTP 400 before any wallet lookup or token movement. Generate a new key only
+when the user intentionally starts a new spend. This is a breaking
+compatibility requirement for manual callers and must be adopted before the
+backend contract is deployed. The identity-context reservation route
+`POST /spend/me` retains its existing session/provider-based behaviour.
 
 ## Contract Details
 

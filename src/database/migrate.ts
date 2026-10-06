@@ -184,6 +184,37 @@ async function runMigrations() {
       console.log('[Migration] 014: Reservation wallet authorization already exists');
     }
 
+    // Migration 015: durable token movement claims and unique transaction
+    // projection keys.  This migration intentionally fails on historical
+    // duplicate hashes so they can be reviewed rather than auto-assigned.
+    const hasTokenOperations = await db.schema.hasTable('token_operations');
+    const { up: migrateTokenOperations } = await import('./migrations/015_add_token_operations');
+    await migrateTokenOperations(db);
+    if (!hasTokenOperations) {
+      console.log('[Migration] 015: Added durable token operations');
+    } else {
+      console.log('[Migration] 015: Durable token operations already exist or were repaired');
+    }
+
+    // Migration 016: persist reward rules and off-peak windows together.
+    // This is additive and seeds only an absent singleton row, so an existing
+    // operator policy survives an idempotent migration run.
+    const hasRewardPolicy = await db.schema.hasTable('reward_policy');
+    const { up: migrateRewardPolicy } = await import('./migrations/016_add_reward_policy');
+    await migrateRewardPolicy(db);
+    if (!hasRewardPolicy) {
+      console.log('[Migration] 016: Added durable reward policy');
+    } else {
+      console.log('[Migration] 016: Durable reward policy already exists');
+    }
+
+    // Migration 017: protect future OCPI replacement CDRs that carry the
+    // same provider and explicit physical charging session. Historical
+    // token-operation rows remain unbound and untouched.
+    const { up: migrateChargingSessionGuard } = await import('./migrations/017_add_charging_session_guard');
+    await migrateChargingSessionGuard(db);
+    console.log('[Migration] 017: Charging-session replacement guard is present');
+
     console.log('[Migration] All migrations completed successfully');
   } catch (err) {
     console.error('[Migration] Error:', err);

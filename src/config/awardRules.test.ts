@@ -1,4 +1,12 @@
-import { calculateAwardTokens, getDeduplicationKey, getAwardRules } from './awardRules';
+import {
+  calculateAwardTokens,
+  getAwardCalculationContext,
+  getAwardRules,
+  getDeduplicationKey,
+  isOffPeakForCountry,
+  setRules,
+} from './awardRules';
+import { getOffPeakWindows, setOffPeakWindows } from './offPeakWindows';
 import { NormalisedSession } from '../types';
 
 describe('Award Rules', () => {
@@ -25,6 +33,160 @@ describe('Award Rules', () => {
   };
 
   describe('calculateAwardTokens', () => {
+    it('uses pilot IANA zones for equivalent instants independent of host timezone', () => {
+      const utcSession: NormalisedSession = {
+        ...mockChargingSession,
+        startTime: new Date('2024-01-15T21:00:00Z'), // 22:00 in Europe/Berlin
+      };
+      const offsetSession: NormalisedSession = {
+        ...mockChargingSession,
+        startTime: new Date('2024-01-15T22:00:00+01:00'), // Same instant
+      };
+      expect(calculateAwardTokens(utcSession)).toBe(10);
+      expect(calculateAwardTokens(offsetSession)).toBe(10);
+
+      const originalTimezone = process.env.TZ;
+      process.env.TZ = 'Pacific/Honolulu';
+      try {
+        expect(calculateAwardTokens(utcSession)).toBe(10);
+      } finally {
+        if (originalTimezone === undefined) delete process.env.TZ;
+        else process.env.TZ = originalTimezone;
+      }
+    });
+
+    it('uses the configured pilot zones for ES and RO', () => {
+      const spainSession: NormalisedSession = {
+        ...mockChargingSession,
+        evseId: 'ES*ABC*E12345',
+        startTime: new Date('2024-01-15T21:00:00Z'), // 22:00 in Europe/Madrid
+      };
+      const romaniaSession: NormalisedSession = {
+        ...mockChargingSession,
+        evseId: 'RO*ABC*E12345',
+        startTime: new Date('2024-01-15T20:00:00Z'), // 22:00 in Europe/Bucharest
+      };
+
+      expect(calculateAwardTokens(spainSession)).toBe(10);
+      expect(calculateAwardTokens(romaniaSession)).toBe(10);
+    });
+
+    it('handles DST start and repeated local time at DST end', () => {
+      const springSession: NormalisedSession = {
+        ...mockChargingSession,
+        startTime: new Date('2024-03-31T20:00:00Z'), // 22:00 CEST
+      };
+      expect(calculateAwardTokens(springSession)).toBe(10);
+      expect(getAwardCalculationContext(springSession).localStartTime)
+        .toBe('2024-03-31T22:00:00');
+
+      const firstRepeatedHour: NormalisedSession = {
+        ...mockChargingSession,
+        startTime: new Date('2024-10-27T00:30:00Z'), // 02:30 CEST
+      };
+      const secondRepeatedHour: NormalisedSession = {
+        ...mockChargingSession,
+        startTime: new Date('2024-10-27T01:30:00Z'), // 02:30 CET
+      };
+      expect(calculateAwardTokens(firstRepeatedHour)).toBe(10);
+      expect(calculateAwardTokens(secondRepeatedHour)).toBe(10);
+      expect(getAwardCalculationContext(firstRepeatedHour).localStartTime)
+        .toBe('2024-10-27T02:30:00');
+      expect(getAwardCalculationContext(secondRepeatedHour).localStartTime)
+        .toBe('2024-10-27T02:30:00');
+    });
+
+    it('keeps an overnight session on the session-start policy', () => {
+      const peakStartCrossingIntoWindow: NormalisedSession = {
+        ...mockChargingSession,
+        startTime: new Date('2024-01-01T20:30:00Z'), // 21:30 local, peak
+        endTime: new Date('2024-01-02T07:30:00Z'), // 08:30 local, peak
+      };
+      const offPeakStartCrossingOutOfWindow: NormalisedSession = {
+        ...mockChargingSession,
+        startTime: new Date('2024-01-01T21:30:00Z'), // 22:30 local, off-peak
+        endTime: new Date('2024-01-02T07:30:00Z'), // 08:30 local, peak
+      };
+
+      expect(calculateAwardTokens(peakStartCrossingIntoWindow)).toBe(0);
+      expect(calculateAwardTokens(offPeakStartCrossingOutOfWindow)).toBe(10);
+      expect(isOffPeakForCountry('DE', new Date('2024-01-02T04:59:00Z'))).toBe(true);
+      expect(isOffPeakForCountry('DE', new Date('2024-01-02T05:00:00Z'))).toBe(false);
+    });
+
+    it('allows an explicit Atlantic/Canary override for an ES session', () => {
+      const madridSession: NormalisedSession = {
+        ...mockChargingSession,
+        evseId: 'ES*ABC*E12345',
+        startTime: new Date('2024-01-01T21:00:00Z'), // 22:00 in Madrid
+      };
+      const canarySession: NormalisedSession = {
+        ...madridSession,
+        timeZone: 'Atlantic/Canary',
+        timeZoneSource: 'timeZone',
+      };
+
+      expect(calculateAwardTokens(madridSession)).toBe(10);
+      expect(calculateAwardTokens(canarySession)).toBe(0); // 21:00 in Canary
+      expect(getAwardCalculationContext(canarySession)).toMatchObject({
+        timeZone: 'Atlantic/Canary',
+        timeZoneSource: 'timeZone',
+        localStartTime: '2024-01-01T21:00:00',
+        eligibilityBasis: 'session_start',
+      });
+    });
+
+    it('requires a timezone for configured non-pilot charging windows but keeps V2G independent', () => {
+      const originalWindows = getOffPeakWindows();
+      try {
+        setOffPeakWindows({
+          ...originalWindows,
+          GB: [{ start: '22:00', end: '06:00' }],
+        });
+
+        const gbCharge: NormalisedSession = {
+          ...mockChargingSession,
+          evseId: 'GB*ABC*E12345',
+          startTime: new Date('2024-01-01T22:00:00Z'),
+        };
+        expect(() => calculateAwardTokens(gbCharge)).toThrow(/No IANA timezone configured/);
+        expect(calculateAwardTokens({
+          ...gbCharge,
+          timeZone: 'Europe/London',
+          timeZoneSource: 'timeZone',
+        })).toBe(10);
+
+        const gbDischarge: NormalisedSession = {
+          ...gbCharge,
+          energyDirection: 'DISCHARGE',
+        };
+        expect(calculateAwardTokens(gbDischarge)).toBe(40);
+      } finally {
+        setOffPeakWindows(originalWindows);
+      }
+    });
+
+    it('keeps non-pilot countries without windows charging-ineligible and rewards V2G discharge', () => {
+      const unknownCharge: NormalisedSession = {
+        ...mockChargingSession,
+        evseId: 'XX*ABC*E12345',
+      };
+      const unknownDischarge: NormalisedSession = {
+        ...unknownCharge,
+        energyDirection: 'DISCHARGE',
+      };
+
+      expect(calculateAwardTokens(unknownCharge)).toBe(0);
+      expect(calculateAwardTokens(unknownDischarge)).toBe(40);
+      expect(getAwardCalculationContext(unknownDischarge)).toMatchObject({
+        countryCode: 'XX',
+        timeZone: null,
+        timeZoneSource: 'unconfigured',
+        localStartTime: null,
+        eligibilityBasis: 'discharge',
+      });
+    });
+
     it('should calculate off-peak charging rewards (1 token per 4 kWh)', () => {
       const tokens = calculateAwardTokens(mockChargingSession);
       expect(tokens).toBe(10); // 40 kWh / 4 = 10 tokens
@@ -132,6 +294,38 @@ describe('Award Rules', () => {
       const rules = getAwardRules();
       expect(rules.idempotency.deduplicationKey).toContain('sessionId');
       expect(rules.idempotency.deduplicationKey).toContain('providerId');
+    });
+
+    it('should reflect the current runtime rule override', () => {
+      const original = getAwardRules();
+      const runtimeOverride = { ...original, version: 'runtime-test' };
+      setRules(runtimeOverride);
+      try {
+        expect(getAwardRules()).toBe(runtimeOverride);
+      } finally {
+        setRules(original);
+      }
+    });
+
+    it('should expose a deterministic calculation snapshot and fingerprint', () => {
+      const first = getAwardCalculationContext(mockChargingSession);
+      const second = getAwardCalculationContext(mockChargingSession);
+      expect(first.configurationSnapshot).toContain('Europe/Berlin');
+      expect(first.configurationFingerprint).toMatch(/^[a-f0-9]{64}$/);
+      expect(first.configurationFingerprint).toBe(second.configurationFingerprint);
+
+      const changedRules = {
+        ...getAwardRules(),
+        rules: {
+          ...getAwardRules().rules,
+          offPeakCharging: {
+            ...getAwardRules().rules.offPeakCharging,
+            tokensPerKWh: 0.5,
+          },
+        },
+      };
+      expect(getAwardCalculationContext(mockChargingSession, changedRules).configurationFingerprint)
+        .not.toBe(first.configurationFingerprint);
     });
   });
 

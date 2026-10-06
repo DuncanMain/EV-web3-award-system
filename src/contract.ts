@@ -1,7 +1,7 @@
 import { ethers } from 'ethers';
+import { createRpcProvider } from './rpcProvider';
 
-const contractAddress = '0x605871D30DC278a036F09e2ace771df8a224624B';
-const rpcUrl = process.env.POLYGON_RPC_URL || 'https://polygon-amoy.drpc.org'; // Polygon Amoy RPC
+export const contractAddress = process.env.TOKEN_CONTRACT_ADDRESS || '0x605871D30DC278a036F09e2ace771df8a224624B';
 
 // ERC20 ABI for award and spend operations
 const abi = [
@@ -79,7 +79,7 @@ const abi = [
   }
 ];
 
-export const provider = new ethers.JsonRpcProvider(rpcUrl);
+export const provider = createRpcProvider();
 
 export function getContract(signerOrProvider: ethers.Signer | ethers.Provider = provider) {
   return new ethers.Contract(contractAddress, abi, signerOrProvider);
