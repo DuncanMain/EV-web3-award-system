@@ -153,5 +153,6 @@ deduplication and response compatibility. The frontend reservation must use
 the same eMAID, provider and actual session identifier as the final CDR.
 The award's saved financial intent is validated before reservation settlement;
 a duplicate CDR can recover an incomplete settlement or receipt without
-another award. See [the local review notes](local-hardening-review.md) for
-compatibility flags and the remaining OCPI replacement-CDR limitation.
+another award. See the [API contract](../API.md) and [local release
+verification](RELEASE_VERIFICATION_2026-10-01.md) for the recorded compatibility
+checks and remaining OCPI replacement-CDR limitation.

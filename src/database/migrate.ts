@@ -64,18 +64,6 @@ async function runMigrations() {
       console.log('[Migration] ✓ 004: Wallet profile fields already exist');
     }
 
-    // Migration 005: EMP contract IDs are globally unique.
-    const hasGlobalContractIdUniqueness = await db('pg_constraint')
-      .where({ conname: 'users_uid_unique' })
-      .first();
-    if (!hasGlobalContractIdUniqueness) {
-      const { up } = await import('./migrations/005_scope_wallet_ids_to_wallet_address');
-      await up(db);
-      console.log('[Migration] ✓ 005: Enforced global EMP contract ID uniqueness');
-    } else {
-      console.log('[Migration] ✓ 005: EMP contract IDs already globally unique');
-    }
-
     // Migration 006: add address-based linked wallets.
     const hasLinkedWalletAddresses = await db.schema.hasTable('linked_wallet_links');
     if (!hasLinkedWalletAddresses) {
@@ -108,20 +96,12 @@ async function runMigrations() {
       console.log('[Migration] 007: Linked wallet addresses already unique');
     }
 
-    // Migration 008: allow an EMP contract to be associated with multiple wallet addresses.
-    const hasUidWalletUniqueness = await db.raw(`
-      select 1
-      from pg_indexes
-      where indexname = 'users_uid_wallet_lower_unique'
-      limit 1
-    `);
-    if (!hasUidWalletUniqueness.rows.length) {
-      const { up } = await import('./migrations/008_allow_uid_per_wallet');
-      await up(db);
-      console.log('[Migration] 008: Scoped EMP contract uniqueness to wallet address');
-    } else {
-      console.log('[Migration] 008: EMP contract plus wallet uniqueness already enforced');
-    }
+    // Migration 005's global UID rule was superseded by 008.  Run the
+    // canonical migration on every startup so a restored global constraint
+    // cannot silently disable multiple-wallet UIDs.
+    const { up: migrateUidWalletUniqueness } = await import('./migrations/008_allow_uid_per_wallet');
+    await migrateUidWalletUniqueness(db);
+    console.log('[Migration] 008: Scoped EMP contract uniqueness to wallet address');
 
     // Migration 009: add durable signed spend receipts.
     const hasSpendReceipts = await db.schema.hasTable('spend_receipts');
@@ -214,6 +194,13 @@ async function runMigrations() {
     const { up: migrateChargingSessionGuard } = await import('./migrations/017_add_charging_session_guard');
     await migrateChargingSessionGuard(db);
     console.log('[Migration] 017: Charging-session replacement guard is present');
+
+    // Migration 022: persist and repair the explicitly selected wallet for
+    // each UID.  This is standalone and deliberately does not depend on the
+    // reserved campaign migration range 018-021.
+    const { up: migrateActiveWalletSelection } = await import('./migrations/022_add_active_wallet_selection');
+    await migrateActiveWalletSelection(db);
+    console.log('[Migration] 022: Active wallet selection is present');
 
     console.log('[Migration] All migrations completed successfully');
   } catch (err) {

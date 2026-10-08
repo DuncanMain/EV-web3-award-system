@@ -13,14 +13,12 @@ This module provides internal functions for:
 
 Built for Polygon Amoy network integration with the NVF contract.
 
-## Deployment status
+## Production deployment
 
-The current 30 September 2026 tree is a local, reviewable candidate. It has
-not been pushed or deployed, and no immutable backend commit or container
-digest has been assigned. Local disposable PostgreSQL, Hardhat, and API
-verification does not establish production readiness. See
-[`DEPLOYMENT.md`](DEPLOYMENT.md) for the target preflight, backup/restore,
-migration, rollout, and rollback gates.
+Updating `main` in `ZentrixLab/neverflat` publishes an immutable image. A
+separate production dispatch consumes that image only after the target-owned
+release gate has been recorded. See [`DEPLOYMENT.md`](DEPLOYMENT.md) for
+configuration, preflight, backup, migration, rollout, and rollback procedures.
 
 ## Identifier Terminology
 
@@ -72,7 +70,8 @@ for both the API and PostgreSQL. The image entrypoint runs the complete
 compatible local database and expect the process to stop if historical
 migration checks find duplicate data. Do not use this command as a production
 rollout procedure. Production uses the separate `compose.production.yaml`
-definition and the review gates in [`DEPLOYMENT.md`](DEPLOYMENT.md).
+definition, which starts `node dist/api.js` after the target migration gate in
+[`DEPLOYMENT.md`](DEPLOYMENT.md) has been completed.
 
 ### Docker Secrets
 
@@ -140,7 +139,7 @@ The backend supports two access modes:
 ### User Endpoints
 
 - `GET /wallet/me` - Wallet for authenticated/forwarded identity context
-- `POST /spend/session` - Non-spending BEAI charging-session SPARKZ prompt
+- `POST /spend/session` - Non-spending BEIA charging-session SPARKZ prompt
 - `POST /spend/me` - Spend for authenticated/forwarded identity context
 - `GET /wallet/:uid` - Manual contract ID wallet lookup (legacy/test flow)
 - `POST /spend` - Manual contract ID spend (legacy/test flow; every new request requires a stable non-empty `idempotencyKey`)
@@ -150,10 +149,11 @@ then calls `POST /spend/me` only after the user confirms an amount. This creates
 a reservation rather than an immediate spend. The EMP's final CDR reaches
 NEVERFLAT through the Aarhus database. NEVERFLAT has no direct outbound EMP
 connection, so BEIA must retrieve the completed reservation settlement and
-forward it to the EMP. The required BEIA-facing reservation-status endpoint is
-not yet implemented.
+forward it to the EMP. The BEIA-facing reservation-status endpoint is
+`GET /spend/reservations/:reservationId` and returns the saved reservation
+state for settlement polling.
 
-The reusable BEAI React component package lives in
+The reusable BEIA React component package lives in
 `packages/sparkz-charging-card/`. It is separate from the `frontend/` admin
 console bundle.
 
@@ -281,12 +281,14 @@ The system uses PostgreSQL to mirror blockchain state for efficient API queries.
    ```
 
    This runs the full migration chain locally. It is suitable for a fresh or
-   known-compatible disposable database only. Migration 005 rejects duplicate
-   historical contract IDs and migration 015 rejects duplicate transaction
-   hashes for review; the container entrypoint invokes the same chain. Use the
-   target-specific backup and migration gate in [`DEPLOYMENT.md`](DEPLOYMENT.md)
-   before any production database change. The scoped 015/016/017 runners are
-   loopback-only local review tools and must not be copied to production.
+   known-compatible disposable database only. Migration 008 permits multiple
+   wallets for one UID, rejects duplicate `(uid, lower(wallet_address))` pairs,
+   and removes the obsolete global UID constraint; migration 015 rejects
+   duplicate transaction hashes for review. The container entrypoint invokes
+   the same chain. Use the target-specific backup and migration gate in
+   [`DEPLOYMENT.md`](DEPLOYMENT.md) before any production database change. The
+   scoped 015/016/017 runners are loopback-only local review tools and must not
+   be copied to production.
 
 3. **Stop Docker database when finished:**
    ```bash
@@ -522,7 +524,8 @@ Energy direction is automatically detected from the sign:
 ### Reward Calculation Rules
 
 1. **Off-peak Charging**: 1 SPARKZ per 4 kWh (only during off-peak hours)
-   - Off-peak windows are country-specific and static
+   - Off-peak windows are country-specific and configurable through the durable
+     admin policy
    - Example DE: 22:00 - 06:00
 2. **V2G Discharge**: 1 SPARKZ per 1 kWh (always)
 
@@ -536,8 +539,7 @@ response or a pending token operation; the returned `operationKey` can be used
 to recover an existing operation. Missing, empty, or non-string keys fail with
 HTTP 400 before any wallet lookup or token movement. Generate a new key only
 when the user intentionally starts a new spend. This is a breaking
-compatibility requirement for manual callers and must be adopted before the
-backend contract is deployed. The identity-context reservation route
+compatibility requirement for manual callers. The identity-context reservation route
 `POST /spend/me` retains its existing session/provider-based behaviour.
 
 ## Contract Details
@@ -546,7 +548,9 @@ backend contract is deployed. The identity-context reservation route
 - Contract: NVF
 - Token: SPARKZ
 - Address: 0x605871D30DC278a036F09e2ace771df8a224624B
-- Functions: `award(address to, uint256 amount)`, `spend(uint256 amount)`
+- Functions: ERC-20 `transfer(address to, uint256 amount)` for treasury awards
+  and `transferFrom(address from, address to, uint256 amount)` for approved
+  spends. The treasury signer submits a spend only after the user's approval.
 
 ## Testing
 

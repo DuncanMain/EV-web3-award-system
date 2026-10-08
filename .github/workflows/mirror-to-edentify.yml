@@ -8,6 +8,7 @@ on:
 
 jobs:
   mirror:
+    if: github.repository == 'ZentrixLab/neverflat'
     name: Mirror main to code-only repositories
     runs-on: ubuntu-latest
     env:

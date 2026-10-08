@@ -1,4 +1,16 @@
-import { resolveUidToAddress, isUserRegistered, getUserAddress, clearUserRegistry } from './userService';
+jest.mock('../database/service', () => ({
+  Users: { findByUid: jest.fn() },
+}));
+
+import {
+  clearUserRegistry,
+  getManagedWalletAddress,
+  getUserAddress,
+  isUserRegistered,
+  resolveActiveUidAddress,
+  resolveUidToAddress,
+} from './userService';
+import { userRegistry } from './userRegistry';
 
 describe('User Service', () => {
   beforeEach(() => {
@@ -85,5 +97,19 @@ describe('User Service', () => {
       expect(isUserRegistered(uid1)).toBe(false);
       expect(isUserRegistered(uid2)).toBe(false);
     });
+  });
+
+  it('replaces a stale cached external wallet with managed when no active DB row exists', async () => {
+    const uid = 'stale-external-cache';
+    const staleExternalWallet = '0x1111111111111111111111111111111111111111';
+    const managedWallet = getManagedWalletAddress(uid);
+    userRegistry.setAddress(uid, staleExternalWallet);
+
+    const mockedUsers = (jest.requireMock('../database/service') as { Users: { findByUid: jest.Mock } }).Users;
+    mockedUsers.findByUid.mockResolvedValueOnce(undefined);
+
+    await expect(resolveActiveUidAddress(uid)).resolves.toBe(managedWallet);
+    expect(getUserAddress(uid)).toBe(managedWallet);
+    expect(getUserAddress(uid)).not.toBe(staleExternalWallet);
   });
 });

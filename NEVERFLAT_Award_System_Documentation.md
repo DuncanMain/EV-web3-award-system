@@ -1,18 +1,15 @@
 ---
 source_document: NEVERFLAT_Award_System_Documentation.docx
-status: local release-candidate reference; not deployed
-updated: 2026-09-30
+status: system documentation
+updated: 2026-10-06
 ---
 
 # NEVERFLAT Award and Wallet System
 
-This document describes the current local `NVF-award-core` implementation and
-the evidence available before a target deployment. It is intended to be the
-release-candidate reference for the award, wallet, spend, receipt, admin, and
-BEIA integration work. **The candidate has not been pushed or deployed.** No
-target-environment API key, database, RPC provider, webhook, or live wallet has
-been verified by this document. No backend release version or commit is
-assigned yet.
+This document describes the NEVERFLAT award and wallet system, its API
+contracts, and its operational invariants. Deployment procedures and dated
+release evidence are maintained in [DEPLOYMENT.md](DEPLOYMENT.md), the API
+contract in [API.md](API.md), and the linked release records.
 
 The complete HTTP contract is in [API.md](API.md). The BEIA component contract
 is in [docs/BEIA_INTEGRATION.md](docs/BEIA_INTEGRATION.md). The safe local
@@ -20,7 +17,7 @@ verification summary is in [docs/RELEASE_VERIFICATION_2026-10-01.md](docs/RELEAS
 
 ## System position
 
-| Area | Current local candidate |
+| Area | System behavior and contract |
 | --- | --- |
 | Ownership | eMAID is the canonical internal owner. Existing `contract_id`, `EvcoID`, `contractId`, `x-contract-id`, `uid`, and database column names remain wire/compatibility names where required. |
 | Award input | One normaliser detects OCPI or OICP from payload structure. OCPI uses `cdr_token.contract_id`; OICP uses all present supported `Identification.*.EvcoID` values, which must agree. |
@@ -31,7 +28,6 @@ verification summary is in [docs/RELEASE_VERIFICATION_2026-10-01.md](docs/RELEAS
 | Receipts | Backend-signed spend receipts carry canonical settlement context. A receiver must independently verify the signature and expected eMAID/wallet/amount/session/transaction context. |
 | Operations | Durable token operations retain original intent, hashes, movement outcome, and recovery context. Read-only evidence retries are bounded; unknown movement remains review-only. |
 | Admin | Six operational tabs: Overview, eMAIDs & balances, Transactions, Token rules, Audit log, and System health. |
-| Release state | Local release candidate only; not pushed, published, or deployed. |
 
 ## 1. Functional flows
 
@@ -175,7 +171,18 @@ audit events, and reconciliation reports. Existing columns and historical
 records are retained. Migration 016 adds durable policy state. Migration 017
 adds `token_operations.charging_session_id` and the provider-plus-physical-
 session uniqueness guard for new explicit OCPI sessions; it does not rewrite
-old records.
+old records. The standalone migration 022 adds an explicit active-wallet
+selection while retaining historical wallet rows. A rollback to an older image
+must review active-wallet selection and pending financial operations; it must
+not drop those preferences or rewrite wallet mappings or financial rows.
+
+Wallet-link behavior preserves those rows as well: a signed unlink atomically
+removes the link while retaining every award, spend, and balance row,
+including zero balances. If the removed link was the active external wallet,
+the service selects the deterministic managed wallet; unlinking an inactive
+link leaves the current selection unchanged. Ordinary linking does not replace
+an existing active selection, and explicit authenticated mode selection keeps
+its existing behavior.
 
 The local activation path was backup-gated and used loopback disposable or
 controlled resources. A target environment needs its own reviewed backup,
@@ -209,6 +216,19 @@ test-database discrepancy and blocked records were preserved and handled as
 review evidence; they are not silently corrected or presented as production
 facts.
 
+### Current follow-up checks
+
+The current source verification has separate focused evidence: Node 22 backend
+verification passed 19 Jest suites with 327 tests and 12 opt-in tests skipped,
+plus 21 real PostgreSQL integration checks; the offline deployment helper suite
+passed 16 tests, the charging-card package passed 12 tests, the
+frontend build and package/frontend audits passed, and a portable Node 22 probe
+returned `v22.23.3`. The combined Node 22.23.3 root/frontend/Sparkz
+`npm run ci:check` passed with all audits at zero vulnerabilities. These checks
+are distinct from the historical local record above. Target post-start
+acceptance remains a separate operational record; neither result is inferred
+from the historical 321-test result.
+
 ## 5. Predeployment responsibilities
 
 Before deployment, the environment owner must assign the release version and
@@ -222,13 +242,13 @@ and deduplicate delivery.
 
 After an API exists in the target environment, run the appropriate partner
 smoke tests and capture health, preview, representative CDR, reservation,
-receipt verification, reconciliation, alert, and evidence-pack results. Those
-target checks remain outstanding; this local candidate is **not yet deployed**.
+receipt verification, reconciliation, alert, and evidence-pack results. See
+[DEPLOYMENT.md](DEPLOYMENT.md) for the operational acceptance procedure and
+record; post-start target acceptance is not recorded in this system overview.
 
 ## Appendix: source references
 
 - [REST/API contract](API.md)
 - [BEIA integration guide](docs/BEIA_INTEGRATION.md)
-- [Local hardening review](docs/local-hardening-review.md)
 - [Local release verification](docs/RELEASE_VERIFICATION_2026-10-01.md)
 - [Release notes draft](docs/RELEASE_NOTES_2026-09-30.md)

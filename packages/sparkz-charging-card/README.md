@@ -12,12 +12,21 @@ that value through the existing `x-contract-id` identity header.
 
 ## Install
 
-Until this package is published to a registry, install from a packed tarball or
-from this folder in a workspace.
+The reviewable artifact is built from this workspace. No registry or partner
+publication is claimed. From this directory, reproduce and install the current
+release candidate with:
 
 ```bash
+npm ci
+npm run build
+npm pack
 npm install ./neverflat-sparkz-charging-card-0.2.1-rc.1.tgz
 ```
+
+The checked-in `neverflat-sparkz-charging-card-0.2.0.tgz` archive is the
+historical 0.2.0 artifact and remains unchanged. The current 0.2.1-rc.1
+artifact's SHA-256 is recorded in the external release handoff documents
+after packing.
 
 Import the component and styles:
 
@@ -246,7 +255,7 @@ type SparkzChargingCardProps = {
 
 ```bash
 cd packages/sparkz-charging-card
-npm install
+npm ci
 $env:NVF_DEMO_API_ORIGIN = 'http://127.0.0.1:3005' # isolated local API only
 $env:NVF_DEMO_API_KEY = '<isolated-local-api-key>'
 $env:NVF_DEMO_EMAID = '<isolated-local-emaid>'
