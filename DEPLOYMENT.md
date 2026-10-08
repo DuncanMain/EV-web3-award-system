@@ -29,17 +29,18 @@ target-specific facts listed below.
 ## What the checked-in deployment actually does
 
 The checked-in `Dockerfile` builds the backend with Node 22 Alpine, builds the
-frontend, installs production dependencies in a runtime image, and starts the
-container with:
+frontend, installs production dependencies in a runtime image, and has this
+default local image command:
 
 ```text
 node dist/database/migrate.js && node dist/api.js
 ```
 
-That entrypoint runs the complete migration chain before the API listens. It
-is not a separate, reviewed production migration phase. A target with existing
-data must therefore have a reviewed migration plan before this image is
-started. Do not assume that a container restart is a safe schema upgrade.
+That command runs the complete migration chain before the API listens. It is
+the normal local Docker behavior and is not the production rollout path.
+Production Compose overrides it with `node dist/api.js`, so the target
+migration is a separately reviewed operator phase before the API is started.
+Do not assume that a container restart is a safe schema upgrade.
 
 `compose.production.yaml` receives an immutable
 `ghcr.io/zentrixlab/neverflat@sha256:...` reference from the workflow. It runs
@@ -51,13 +52,20 @@ The app healthcheck validates the actual `{status: "ok", timestamp}` response
 from `/ingest/health`.
 
 The [production GitHub Actions workflow](.github/workflows/production.yaml) is
-restricted to `ZentrixLab/neverflat`, triggers on `main`, builds the commit tag,
-and records the Docker build digest as the deployment image reference. It
-stages the Compose and helper files under a release directory, runs preflight
-against the existing target environment and volume, then invokes the bounded
-rollout helper. GitHub Actions and the remote helper both serialize rollouts;
-an active rollout is allowed to finish. The workflow does not write GitHub
-secrets into the operator `.env`.
+restricted to `ZentrixLab/neverflat`. A `main` push builds and publishes the
+immutable image only. A separate `workflow_dispatch` from `main` uses the
+`production` environment reference and consumes an already-built source
+commit and exact digest, stages the Compose and helper files, and invokes the
+bounded rollout helper. Required environment reviewers and branch protections
+are repository settings that must be configured and verified separately. The
+dispatch requires the source commit to equal the current `main` revision and
+the target-owned release record described below is required. Older-image
+rollback is a separate, schema-reviewed runbook decision. Any environment
+approval is an additional control, not evidence that the database backup,
+restore, quiescence, migration, or preservation work occurred.
+GitHub Actions and the remote helper both serialize rollouts; an active rollout
+is allowed to finish. The workflow does not write GitHub secrets into the
+operator `.env` or create the target release record.
 
 ## Target facts that must be resolved before deployment
 
@@ -100,6 +108,65 @@ remote shell with the operator file before rendering the staged configuration.
 A stale host override fails before registry login, network creation, pull, or
 service start, so the configuration rendered by preflight is the one the
 rollout uses.
+
+## Target-owned release gate
+
+Before a rollout, the target operator must create a per-release JSON record at
+`/root/neverflat/approvals/<source-commit>.json`. Keep it on the target outside
+the checkout and do not have GitHub Actions or the checkout create it. The
+preflight reads the record before registry login, network creation, image pull,
+or service start and compares it with the existing database container and the
+rendered Compose configuration. A GitHub `production` environment review, where
+configured, does not replace this record.
+
+The record has this shape; the values are examples and must be replaced with
+the actual target identity:
+
+```json
+{
+  "schemaVersion": 1,
+  "sourceCommit": "<40-character-source-sha>",
+  "imageReference": "ghcr.io/zentrixlab/neverflat@sha256:<64-hex-digest>",
+  "target": {
+    "composeProjectName": "neverflat",
+    "postgresContainerName": "neverflat-db",
+    "postgresVolumeName": "<existing-volume-name>",
+    "databaseHost": "postgres",
+    "databasePort": 5432,
+    "databaseName": "<existing-database>",
+    "databaseUser": "<existing-role>"
+  },
+  "evidence": {
+    "backupVerified": true,
+    "restoreVerified": true,
+    "writersQuiesced": true,
+    "migrationReviewed": true,
+    "migrationApplied": true,
+    "preservationVerified": true
+  },
+  "approvedBy": "<target-operator>",
+  "approvedAt": "2026-10-08T12:00:00Z",
+  "expiresAt": "2026-10-08T20:00:00Z"
+}
+```
+
+The helper validates the full source SHA, exact image digest, project and
+database identity, all six boolean attestations, and a UTC approval window that
+has not expired and is no longer than 24 hours. These fields record the
+operator's backup, restore, quiescence, migration, and preservation sign-offs;
+the helper does not claim to repeat a physical backup or restore. The target
+database container must already be running and healthy. The helper then runs
+read-only checks for migration 008's scoped UID/wallet uniqueness and absent
+global UID constraint, migration 017's charging-session column and unique
+index, migration 016's reward-policy table and row, and migration 022's active
+wallet column and unique index. Missing, malformed, stale, mismatched, or
+incomplete records fail closed without printing their contents.
+
+The existing `neverflat-app` container must already be absent or stopped before
+preflight. A running or restarting app is rejected before registry login,
+network creation, pull, or service start; preflight never stops it
+automatically. This makes the API-stop part of the reviewed migration and
+writer-quiescence phase an enforced rollout precondition.
 
 Do not invent a target value from the local defaults. In particular, preserve
 the existing eMAID-to-wallet derivation salt, treasury identity, token
@@ -163,23 +230,28 @@ npm.cmd pack --dry-run
 Pop-Location
 ```
 
-The final local evidence recorded 321 backend tests passed with 6 opt-in tests
-skipped, 15 isolated PostgreSQL tests passed, 178 shared HTTP contract cases
-passed, and 199 admin HTTP cases passed. Frontend and charging-card results
+The 1 October 2026 local evidence recorded 321 backend tests passed with 6
+opt-in tests skipped, 15 isolated PostgreSQL tests passed, 178 shared HTTP
+contract cases passed, and 199 admin HTTP cases passed. Frontend and charging-card results
 are summarised in the [local release verification record](docs/RELEASE_VERIFICATION_2026-10-01.md).
 The package remains an artifact handoff with no registry publication claim. If
 source, dependencies, or configuration change after that evidence, rerun the
 affected checks before assigning a release record.
 
-The current source verification has separate focused evidence: Node 22 backend
-verification passed 19 Jest suites with 327 tests and 12 opt-in tests skipped,
-plus 21 real PostgreSQL integration checks; the offline deployment helper suite
-passed 16 tests, the charging-card package passed 12 tests, the
-frontend build and package/frontend audits passed, and a portable Node 22 probe
-returned `v22.23.3`. The combined Node 22.23.3 root/frontend/Sparkz
-`npm run ci:check` passed with all audits at zero vulnerabilities. These checks
-do not replace the historical backend evidence above; target post-start
-acceptance remains a separate operational record.
+The 6 October 2026 source-verification record reported Node 22 backend
+verification with 19 Jest suites, 327 tests, 12 opt-in tests skipped, and 21
+real PostgreSQL integration checks. It also recorded 12 charging-card tests,
+frontend/package audits, a portable Node 22 `v22.23.3` probe, and a combined
+Node 22.23.3 root/frontend/Sparkz `npm run ci:check` with zero audit findings.
+The 8 October 2026 verification used the official portable Node `v22.23.3`.
+The full `npm.cmd run ci:check` passed: root, frontend, and Sparkz audits
+reported 0 vulnerabilities, the backend had 19 suites pass with 3 skipped and
+329 tests pass with 20 opt-in tests skipped, and the frontend and Sparkz builds
+passed. A fresh maintained PostgreSQL 16.15 runner passed the full migrations
+and compiled migration-entrypoint proof, plus 29 schema, policy, and wallet
+tests, including 14 wallet tests. The offline deployment helper suite passed
+25 tests, including offline Compose checks. These results do not provide live
+post-start acceptance evidence.
 
 The isolated deployment helper checks are run with:
 
@@ -229,10 +301,11 @@ catalog edits on a target database.
 
 The normal `npm run db:migrate` command compiles the source and runs
 `dist/database/migrate.js`, which attempts migrations 001 through 017 and the
-standalone active-wallet migration 022. The container entrypoint does the same
-automatically. A target with historical rows must not be placed behind that
-startup command until the target-specific plan has been reviewed and tested
-against a restored copy.
+standalone active-wallet migration 022. The default Dockerfile entrypoint does
+the same automatically for local use. Production Compose overrides that
+entrypoint with `node dist/api.js`; a target with historical rows must complete
+the target-specific plan against a restored copy before the production API is
+started.
 
 The repository contains three scoped runners used for local evidence:
 
@@ -272,8 +345,8 @@ The safe release boundary is therefore:
 3. apply only the reviewed target migration steps while the API is stopped;
 4. verify schema/index readiness and compare the database preservation
    snapshot;
-5. start the approved image, knowing that its current entrypoint will run the
-   full migration command before the API; and
+5. start the approved image with the production Compose API-only command after
+   the reviewed migration and read-only schema checks; and
 6. perform health, readiness, identity, and reconciliation checks before
    reopening writes. `GET` reconciliation reads are read-only. A new
    `POST /admin/reconciliation/run` writes a reconciliation report and audit
@@ -281,7 +354,7 @@ The safe release boundary is therefore:
    controlled operational check after the read-only checks.
 
 If step 3 is not available, stop. Do not deploy the current image and hope that
-the automatic startup migration resolves historical data.
+an implicit startup migration resolves historical data.
 
 ## Source-supported container rollout
 
@@ -290,25 +363,39 @@ uses the following shape. Run it only with an approved target, immutable image
 selection, and change record; the commands were not run against a live target
 by this review:
 
+The `main` build job writes the source SHA and exact image digest to its GitHub
+Actions step summary under **Immutable production image**. Copy that digest into
+the manual dispatch `image_reference` input; do not substitute a tag or
+`:latest`.
+
 ```bash
 python3 /root/neverflat/releases/<commit>/scripts/preflight_production.py \
   --deploy-dir /root/neverflat \
   --env-file /root/neverflat/.env \
   --compose-file /root/neverflat/releases/<commit>/compose.production.yaml \
-  --image-reference ghcr.io/zentrixlab/neverflat@sha256:<64-hex-digest>
+  --image-reference ghcr.io/zentrixlab/neverflat@sha256:<64-hex-digest> \
+  --source-commit <40-character-source-sha> \
+  --approval-record /root/neverflat/approvals/<commit>.json
 IMAGE_REFERENCE=ghcr.io/zentrixlab/neverflat@sha256:<64-hex-digest> \
+  SOURCE_COMMIT=<40-character-source-sha> \
+  APPROVAL_RECORD=/root/neverflat/approvals/<commit>.json \
   DEPLOY_DIR=/root/neverflat \
   RELEASE_DIR=/root/neverflat/releases/<commit> \
   /root/neverflat/releases/<commit>/scripts/deploy_production.sh
 ```
 
 The helper takes a blocking deployment lock, revalidates the staged Compose
-file and existing PostgreSQL volume, pulls the exact digest, verifies the
-running container image, and waits for both the healthcheck and the actual
-health/readiness response. It records only the immutable image reference in
-`.deployed-image` and `.previous-image`; credentials remain in the operator
-environment and are never written to those records. Do not use PM2, an
-untracked process manager, or speculative queues as part of this release.
+file and existing PostgreSQL volume, pulls the exact digest, and runs
+`docker compose ... up -d --no-deps app`. It never recreates or starts
+PostgreSQL as part of an application rollout. It verifies the running app image
+and checks the pulled image's `org.opencontainers.image.revision` label against
+the source commit before startup, then repeats the read-only gate and stopped-app
+preflight immediately before `up`. It then waits for both the healthcheck and
+the actual health/readiness response. It records only the immutable image
+reference in `.deployed-image` and
+`.previous-image`; credentials remain in the operator environment and are never
+written to those records. Do not use PM2, an untracked process manager, or
+speculative queues as part of this release.
 Durable operation claims and database locking are part of the application
 contract and were exercised in single-instance local evidence. Multi-replica
 deployment, in-memory admin session behavior across replicas, rate limiting,
@@ -321,6 +408,16 @@ protected process environment by the approved secret manager before running
 the deploy script. Do not type the token into shell history or pass it as a
 command-line argument; the script supplies it to `docker login` through
 standard input and never records it.
+
+A cleanup trap is installed before the first attempted app start. A pull or
+other pre-launch failure leaves the existing app untouched. If startup, image
+verification, health, readiness, or an interrupt rejects the app started or
+restarted by this rollout, the helper stops that app by its container ID,
+including when Compose reused the prior container ID. It never runs `docker
+compose down`, stops PostgreSQL, removes a volume, or rewrites the accepted
+image records/current pointer. If the bounded 10-second cleanup stop itself
+fails, the helper reports cleanup as incomplete and returns failure so the
+target can be handled explicitly.
 
 The acceptance helper uses the actual service responses:
 
@@ -429,8 +526,8 @@ the target-specific recovery decision before reopening writers.
       is used.
 - [ ] Post-start health, readiness, read-only admin, preview, reconciliation,
       and preservation checks are recorded.
-- [ ] No push or automatic GitHub deployment was used without an explicit
-      release approval.
+- [ ] A `main` push only published the immutable image; production was started
+      by an explicit dispatch with the target-owned release gate.
 
 ## Deployment record template
 
@@ -441,6 +538,7 @@ until verified:
 Candidate commit:
 Image reference and immutable digest:
 Production workflow run / mirror run:
+Target-owned release gate path and expiry:
 BEIA package version/checksum (if shipped):
 Target host/proxy:
 Database/server/version/TLS:

@@ -13,7 +13,9 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -48,6 +50,28 @@ VALID_ENV = {
     "ADMIN_EMAIL": "admin@example.com",
     "ADMIN_PASSWORD": "admin-secret",
 }
+SOURCE_COMMIT = "1" * 40
+IMAGE_REFERENCE = "ghcr.io/zentrixlab/neverflat@sha256:" + "a" * 64
+
+
+def valid_release_record(values: dict[str, str], source_commit: str = SOURCE_COMMIT, image_reference: str = IMAGE_REFERENCE) -> dict:
+    return {
+        "schemaVersion": 1,
+        "sourceCommit": source_commit,
+        "imageReference": image_reference,
+        "target": preflight._expected_target_identity(values),
+        "evidence": {
+            "backupVerified": True,
+            "restoreVerified": True,
+            "writersQuiesced": True,
+            "migrationReviewed": True,
+            "migrationApplied": True,
+            "preservationVerified": True,
+        },
+        "approvedBy": "target-operator",
+        "approvedAt": "2026-10-08T12:00:00Z",
+        "expiresAt": "2026-10-08T20:00:00Z",
+    }
 
 
 class FakeResponse:
@@ -112,6 +136,14 @@ class DeploymentHelperTests(unittest.TestCase):
             with self.assertRaises(preflight.PreflightError):
                 preflight.validate_release_pointer(temp)
 
+    def test_preflight_requires_prior_app_to_be_stopped(self):
+        preflight.validate_existing_app_stopped(None)
+        preflight.validate_existing_app_stopped({"State": {"Status": "exited"}})
+        with self.assertRaises(preflight.PreflightError):
+            preflight.validate_existing_app_stopped({"State": {"Status": "running"}})
+        with self.assertRaises(preflight.PreflightError):
+            preflight.validate_existing_app_stopped({"State": {"Status": "restarting"}})
+
     def test_preflight_rejects_database_url_overrides_and_stale_host_environment(self):
         image = "ghcr.io/zentrixlab/neverflat@sha256:" + "a" * 64
         with self.assertRaises(preflight.PreflightError):
@@ -139,6 +171,7 @@ class DeploymentHelperTests(unittest.TestCase):
             "services": {
                 "app": {
                     "image": image,
+                    "command": ["node", "dist/api.js"],
                     "environment": {"DATABASE_URL": VALID_ENV["DATABASE_URL"]},
                 },
                 "postgres": {
@@ -171,6 +204,8 @@ class DeploymentHelperTests(unittest.TestCase):
     def test_preflight_rejects_changed_volume_or_credentials(self):
         values = dict(VALID_ENV)
         snapshot = {
+            "Name": "/neverflat-db",
+            "State": {"Status": "running", "Health": {"Status": "healthy"}},
             "Config": {
                 "Labels": {"com.docker.compose.project": "neverflat"},
                 "Env": ["POSTGRES_DB=nvf_award", "POSTGRES_USER=postgres", "POSTGRES_PASSWORD=other"],
@@ -179,6 +214,83 @@ class DeploymentHelperTests(unittest.TestCase):
         }
         with self.assertRaises(preflight.PreflightError):
             preflight.validate_database_snapshot(snapshot, values)
+
+    def test_target_release_gate_is_exact_bounded_and_complete(self):
+        values = dict(VALID_ENV)
+        now = datetime(2026, 10, 8, 16, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as temp:
+            record_path = Path(temp) / "approval.json"
+            record = valid_release_record(values)
+            record_path.write_text(json.dumps(record), encoding="utf-8")
+            accepted = preflight.validate_release_record(
+                record_path,
+                source_commit=SOURCE_COMMIT,
+                image_reference=IMAGE_REFERENCE,
+                values=values,
+                now=now,
+            )
+            self.assertEqual(accepted["target"]["postgresVolumeName"], values["POSTGRES_VOLUME_NAME"])
+
+            invalid_records = []
+            mismatched_source = copy.deepcopy(record)
+            mismatched_source["sourceCommit"] = "2" * 40
+            invalid_records.append(mismatched_source)
+            stale = copy.deepcopy(record)
+            stale["expiresAt"] = "2026-10-08T15:00:00Z"
+            invalid_records.append(stale)
+            future_approval = copy.deepcopy(record)
+            future_approval["approvedAt"] = "2026-10-08T17:00:00Z"
+            invalid_records.append(future_approval)
+            long_window = copy.deepcopy(record)
+            long_window["approvedAt"] = "2026-10-08T00:00:00Z"
+            long_window["expiresAt"] = "2026-10-09T01:00:00Z"
+            invalid_records.append(long_window)
+            mismatched_digest = copy.deepcopy(record)
+            mismatched_digest["imageReference"] = "ghcr.io/zentrixlab/neverflat@sha256:" + "c" * 64
+            invalid_records.append(mismatched_digest)
+            incomplete = copy.deepcopy(record)
+            incomplete["evidence"]["migrationApplied"] = False
+            invalid_records.append(incomplete)
+            wrong_target = copy.deepcopy(record)
+            wrong_target["target"]["postgresVolumeName"] = "other-volume"
+            invalid_records.append(wrong_target)
+            for invalid in invalid_records:
+                record_path.write_text(json.dumps(invalid), encoding="utf-8")
+                with self.assertRaises(preflight.PreflightError):
+                    preflight.validate_release_record(
+                        record_path,
+                        source_commit=SOURCE_COMMIT,
+                        image_reference=IMAGE_REFERENCE,
+                        values=values,
+                        now=now,
+                    )
+
+            record_path.write_text("{broken", encoding="utf-8")
+            with self.assertRaises(preflight.PreflightError):
+                preflight.validate_release_record(
+                    record_path,
+                    source_commit=SOURCE_COMMIT,
+                    image_reference=IMAGE_REFERENCE,
+                    values=values,
+                    now=now,
+                )
+
+    def test_target_schema_check_requires_all_read_only_checks(self):
+        passing = {key: True for key in preflight.REQUIRED_SCHEMA_CHECKS}
+        completed = subprocess.CompletedProcess([], 0, json.dumps(passing), "")
+        with patch.object(preflight, "_run_checked", return_value=completed) as run_checked:
+            preflight.validate_target_schema()
+            run_checked.assert_called_once()
+            self.assertIn("users_uid_unique", run_checked.call_args.args[0][-1])
+
+        failing = dict(passing, active_wallet_unique=False)
+        with patch.object(
+            preflight,
+            "_run_checked",
+            return_value=subprocess.CompletedProcess([], 0, json.dumps(failing), ""),
+        ):
+            with self.assertRaises(preflight.PreflightError):
+                preflight.validate_target_schema()
 
     def test_acceptance_success(self):
         opener = FakeOpener([
@@ -297,11 +409,34 @@ class DeploymentHelperTests(unittest.TestCase):
         self.assertIn("POSTGRES_PASSWORD:?", compose)
         self.assertIn("DATABASE_URL:?", compose)
         self.assertIn("POSTGRES_VOLUME_NAME:?", compose)
+        self.assertIn('command: ["node", "dist/api.js"]', compose)
         self.assertIn("/ingest/health", compose)
         self.assertNotIn("POSTGRES_PASSWORD: postgres", compose)
 
+    def test_workflow_separates_main_publish_from_manual_production_dispatch(self):
+        workflow = (ROOT / ".github" / "workflows" / "production.yaml").read_text(encoding="utf-8")
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("build-and-publish:", workflow)
+        self.assertIn("deploy-production:", workflow)
+        self.assertIn("github.event_name == 'push'", workflow)
+        self.assertIn("github.event_name == 'workflow_dispatch'", workflow)
+        self.assertIn("github.ref == 'refs/heads/main'", workflow)
+        self.assertIn("name: production", workflow)
+        self.assertIn('[[ "$SOURCE_COMMIT" == "$EXPECTED_MAIN_COMMIT" ]]', workflow)
+        self.assertIn("org.opencontainers.image.revision=${{ github.sha }}", workflow)
+        self.assertIn("git merge-base --is-ancestor", workflow)
+        self.assertIn("steps.build.outputs.digest", workflow)
+        self.assertIn("GITHUB_STEP_SUMMARY", workflow)
+        self.assertNotIn("build-and-deploy:", workflow)
+        self.assertNotIn("docker/build-push-action@v6", workflow.split("deploy-production:", 1)[1])
+
     def test_compose_config_success_and_missing_setting_failure_when_docker_is_available(self):
-        if shutil.which("docker") is None:
+        docker_candidates = [
+            r"C:\Program Files\Docker\Docker\resources\bin\docker.exe",
+            shutil.which("docker"),
+        ]
+        docker = next((candidate for candidate in docker_candidates if candidate and Path(candidate).exists()), None)
+        if docker is None:
             self.skipTest("docker is unavailable; text checks still cover the Compose contract")
         with tempfile.TemporaryDirectory() as temp:
             env_path = Path(temp) / ".env"
@@ -319,7 +454,7 @@ class DeploymentHelperTests(unittest.TestCase):
                 if key not in (*preflight.COMPOSE_ENV_KEYS, "IMAGE_REFERENCE")
             }
             good = subprocess.run([
-                "docker", "compose", "--project-name", "neverflat", "--env-file", str(env_path),
+                docker, "compose", "--project-name", "neverflat", "--env-file", str(env_path),
                 "-f", str(ROOT / "compose.production.yaml"), "config", "--format", "json",
             ], capture_output=True, text=True,
                 env=preflight.effective_compose_environment(
@@ -334,7 +469,7 @@ class DeploymentHelperTests(unittest.TestCase):
                 encoding="utf-8",
             )
             bad = subprocess.run([
-                "docker", "compose", "--project-name", "neverflat", "--env-file", str(env_path),
+                docker, "compose", "--project-name", "neverflat", "--env-file", str(env_path),
                 "-f", str(ROOT / "compose.production.yaml"), "config", "--quiet",
             ], capture_output=True, text=True)
             self.assertNotEqual(bad.returncode, 0)
@@ -366,25 +501,38 @@ class DeploymentHelperTests(unittest.TestCase):
             (deploy_dir / "current").write_text("regular file\n", encoding="utf-8")
 
         log = root / "calls.log"
+        state = root / "container-state"
         image = "ghcr.io/zentrixlab/neverflat@sha256:" + "b" * 64
+        old_image = "ghcr.io/zentrixlab/neverflat@sha256:" + "c" * 64
+        initial_status = "running" if mode == "live-app" else "stopped"
+        initial_health = "healthy" if mode == "live-app" else "none"
+        state.write_text(f"old-app-id|{old_image}|{initial_status}|{initial_health}\n", encoding="utf-8")
         shell_tools = {
             "flock": """
                 #!/usr/bin/env bash
-                printf 'flock %s\\n' \"$*\" >> \"$FAKE_LOG\"
+                printf 'flock %s\\n' "$*" >> "$FAKE_LOG"
                 exit 0
             """,
             "ln": """
                 #!/usr/bin/env bash
-                printf 'ln %s\\n' \"$*\" >> \"$FAKE_LOG\"
+                printf 'ln %s\\n' "$*" >> "$FAKE_LOG"
                 exit 0
             """,
             "python3": """
                 #!/usr/bin/env bash
-                printf 'python %s\\n' \"$*\" >> \"$FAKE_LOG\"
-                case \"${1:-}\" in
+                printf 'python %s\\n' "$*" >> "$FAKE_LOG"
+                case "${1:-}" in
                   */preflight_production.py)
-                    if [[ \"${FAKE_PREFLIGHT:-success}\" == \"fail\" ]]; then
-                      printf 'preflight rejected changed volume\\n' >&2
+                    preflight_count=0
+                    [[ -f "$FAKE_PREFLIGHT_COUNT" ]] && preflight_count=$(cat "$FAKE_PREFLIGHT_COUNT")
+                    preflight_count=$((preflight_count + 1))
+                    printf '%s\\n' "$preflight_count" > "$FAKE_PREFLIGHT_COUNT"
+                    if [[ "${FAKE_PREFLIGHT:-success}" == "fail" ]]; then
+                      printf 'preflight rejected target release gate\\n' >&2
+                      exit 1
+                    fi
+                    if [[ "${FAKE_SECOND_PREFLIGHT:-success}" == "fail" && "$preflight_count" -ge 2 ]]; then
+                      printf 'preflight rejected refreshed target gate\\n' >&2
                       exit 1
                     fi
                     ;;
@@ -392,7 +540,7 @@ class DeploymentHelperTests(unittest.TestCase):
                     printf 'neverflat\\n'
                     ;;
                   */check_production_acceptance.py)
-                    [[ \"${FAKE_ACCEPTANCE:-fail}\" == \"success\" ]]
+                    [[ "${FAKE_ACCEPTANCE:-fail}" == "success" ]]
                     exit $?
                     ;;
                 esac
@@ -400,20 +548,76 @@ class DeploymentHelperTests(unittest.TestCase):
             """,
             "docker": """
                 #!/usr/bin/env bash
-                printf 'docker %s\\n' \"$*\" >> \"$FAKE_LOG\"
-                case \"${1:-}\" in
+                printf 'docker %s\\n' "$*" >> "$FAKE_LOG"
+                state_file="$FAKE_STATE"
+                read_state() {
+                  IFS='|' read -r app_id app_image app_status app_health < "$state_file"
+                }
+                write_state() {
+                  printf '%s|%s|%s|%s\\n' "$1" "$2" "$3" "$4" > "$state_file"
+                }
+                case "${1:-}" in
                   login) exit 0 ;;
                   network)
-                    [[ \"${2:-}\" == \"inspect\" ]] && exit 1
+                    [[ "${2:-}" == "inspect" ]] && exit 1
                     exit 0
                     ;;
-                  compose) exit 0 ;;
-                  inspect)
-                    if [[ \"$*\" == *Config.Image* ]]; then
-                      printf '%s\\n' \"$IMAGE_REFERENCE\"
-                    else
-                      printf 'running|healthy\\n'
+                  image)
+                    if [[ "${2:-}" == "inspect" ]]; then
+                      printf '%s\\n' "${FAKE_IMAGE_REVISION:-}"
                     fi
+                    exit 0
+                    ;;
+                  compose)
+                    if [[ "$*" == *" pull app"* ]]; then
+                      if [[ "${FAKE_COMPOSE_MODE:-success}" == "app-live-after-pull" ]]; then
+                        read_state
+                        write_state "$app_id" "$app_image" running healthy
+                      fi
+                      exit 0
+                    fi
+                    if [[ "$*" == *" up -d --no-deps app"* ]]; then
+                      read_state
+                      new_image="$IMAGE_REFERENCE"
+                      [[ "${FAKE_COMPOSE_MODE:-success}" == "image-mismatch" ]] && new_image="ghcr.io/zentrixlab/neverflat@sha256:$(printf 'd%.0s' {1..64})"
+                      new_health="healthy"
+                      [[ "${FAKE_COMPOSE_MODE:-success}" == "unhealthy" ]] && new_health="unhealthy"
+                      new_app_id="new-app-id"
+                      [[ "${FAKE_COMPOSE_MODE:-success}" == "same-id-readiness-failure" || "${FAKE_COMPOSE_MODE:-success}" == "same-id-up-partial-failure" ]] && new_app_id="old-app-id"
+                      write_state "$new_app_id" "$new_image" running "$new_health"
+                      [[ "${FAKE_COMPOSE_MODE:-success}" == "up-partial-failure" ]] && exit 1
+                      [[ "${FAKE_COMPOSE_MODE:-success}" == "same-id-up-partial-failure" ]] && exit 1
+                    fi
+                    exit 0
+                    ;;
+                  inspect)
+                    read_state
+                    if [[ "${FAKE_COMPOSE_MODE:-success}" == "inspect-failure" && "$app_id" == "new-app-id" && "$*" == *State.Status* ]]; then
+                      printf 'Error: daemon unavailable\\n' >&2
+                      exit 1
+                    elif [[ "$*" == *Config.Image* ]]; then
+                      printf '%s\\n' "$app_image"
+                    elif [[ "$*" == *"{{.Id}}|{{.State.Status}}"* ]]; then
+                      printf '%s|%s\\n' "$app_id" "$app_status"
+                    elif [[ "$*" == *"{{.Id}}"* ]]; then
+                      printf '%s\\n' "$app_id"
+                    elif [[ "$*" == *State.Status* ]]; then
+                      if [[ "${FAKE_COMPOSE_MODE:-success}" == "interrupt" && ! -f "${FAKE_STATE}.interrupt" ]]; then
+                        : > "${FAKE_STATE}.interrupt"
+                        kill -INT "$PPID"
+                      fi
+                      printf '%s|%s\\n' "$app_status" "$app_health"
+                    else
+                      printf '%s|%s\\n' "$app_status" "$app_health"
+                    fi
+                    exit 0
+                    ;;
+                  stop)
+                    if [[ "${FAKE_COMPOSE_MODE:-success}" == "stop-failure" ]]; then
+                      exit 1
+                    fi
+                    read_state
+                    write_state "$app_id" "$app_image" stopped none
                     exit 0
                     ;;
                 esac
@@ -434,19 +638,33 @@ class DeploymentHelperTests(unittest.TestCase):
                 env.get("PATH", ""),
             ]),
             "FAKE_LOG": str(log),
+            "FAKE_STATE": str(state),
+            "FAKE_PREFLIGHT_COUNT": str(root / "preflight-count"),
             "DEPLOY_DIR": str(deploy_dir),
             "RELEASE_DIR": str(release_dir),
             "ENV_FILE": str(env_file),
             "IMAGE_REFERENCE": image,
+            "SOURCE_COMMIT": SOURCE_COMMIT,
+            "APPROVAL_RECORD": str(deploy_dir / "approvals" / f"{SOURCE_COMMIT}.json"),
+            "FAKE_IMAGE_REVISION": "2" * 40 if mode == "image-revision-mismatch" else ("" if mode == "image-revision-missing" else SOURCE_COMMIT),
             "GHCR_USER": "operator",
             "GHCR_TOKEN": "opaque-token",
             "STARTUP_TIMEOUT_SECONDS": "1",
             "STARTUP_INTERVAL_SECONDS": "0",
-            "FAKE_PREFLIGHT": "fail" if mode == "changed-volume" else "success",
+            "FAKE_PREFLIGHT": "fail" if mode in {
+                "changed-volume", "gate-bypass", "malformed-gate", "stale-gate", "missing-gate", "live-app",
+            } else "success",
+            "FAKE_SECOND_PREFLIGHT": "fail" if mode in {"expired-after-pull", "app-live-after-pull"} else "success",
             "FAKE_ACCEPTANCE": "success" if mode == "success" else "fail",
+            "FAKE_COMPOSE_MODE": mode,
         })
-        if mode == "startup-failure":
-            (deploy_dir / ".deployed-image").write_text("ghcr.io/zentrixlab/neverflat@sha256:" + "c" * 64 + "\n", encoding="utf-8")
+        if mode in {
+            "up-partial-failure", "image-mismatch", "unhealthy", "readiness-failure", "interrupt", "stop-failure",
+            "same-id-readiness-failure", "same-id-up-partial-failure", "inspect-failure",
+            "image-revision-mismatch", "image-revision-missing",
+            "expired-after-pull", "app-live-after-pull",
+        }:
+            (deploy_dir / ".deployed-image").write_text(old_image + "\n", encoding="utf-8")
             old_release = deploy_dir / "releases" / "old"
             old_release.mkdir()
             os.symlink(old_release, deploy_dir / "current", target_is_directory=True)
@@ -458,18 +676,21 @@ class DeploymentHelperTests(unittest.TestCase):
             text=True,
             timeout=20,
         )
-        return result, deploy_dir, log, image
+        return result, deploy_dir, log, state, image, old_image
 
     def test_deploy_script_success_uses_exact_digest_and_orders_mutations(self):
         with tempfile.TemporaryDirectory() as temp:
-            result, deploy_dir, log, image = self._run_deploy_script(temp, mode="success")
+            result, deploy_dir, log, state, image, _old_image = self._run_deploy_script(temp, mode="success")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual((deploy_dir / ".deployed-image").read_text(encoding="utf-8").strip(), image)
+            self.assertEqual(state.read_text(encoding="utf-8").strip().split("|")[2:4], ["running", "healthy"])
             calls = log.read_text(encoding="utf-8").splitlines()
             preflight_index = next(index for index, line in enumerate(calls) if "preflight_production.py" in line)
             login_index = next(index for index, line in enumerate(calls) if "docker login" in line)
             network_index = next(index for index, line in enumerate(calls) if "docker network create" in line)
             compose_index = next(index for index, line in enumerate(calls) if "docker compose" in line)
+            revision_index = next(index for index, line in enumerate(calls) if "docker image inspect" in line)
+            up_index = next(index for index, line in enumerate(calls) if "up -d --no-deps app" in line)
             image_index = next(index for index, line in enumerate(calls) if "Config.Image" in line)
             state_index = next(index for index, line in enumerate(calls) if "State.Status" in line)
             acceptance_index = next(index for index, line in enumerate(calls) if "check_production_acceptance.py" in line)
@@ -477,42 +698,121 @@ class DeploymentHelperTests(unittest.TestCase):
             self.assertLess(preflight_index, login_index)
             self.assertLess(login_index, network_index)
             self.assertLess(network_index, compose_index)
+            self.assertLess(revision_index, up_index)
             self.assertLess(image_index, state_index)
             self.assertLess(state_index, acceptance_index)
             self.assertLess(acceptance_index, link_index)
+            self.assertIn("up -d --no-deps app", "\n".join(calls))
+            self.assertNotIn("--remove-orphans", "\n".join(calls))
+            self.assertFalse(any("stop " in line for line in calls))
 
     def test_deploy_script_stops_before_mutation_for_missing_or_changed_configuration(self):
         with tempfile.TemporaryDirectory() as temp:
-            result, deploy_dir, log, _ = self._run_deploy_script(temp, mode="changed-volume")
+            result, deploy_dir, log, state, _image, _old_image = self._run_deploy_script(temp, mode="changed-volume")
             self.assertNotEqual(result.returncode, 0)
-            self.assertFalse(any(line.startswith("docker ") for line in log.read_text(encoding="utf-8").splitlines()))
+            calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+            self.assertFalse(any(line.startswith("docker ") for line in calls))
             self.assertFalse((deploy_dir / ".deployed-image").exists())
+            self.assertEqual(state.read_text(encoding="utf-8").strip().split("|")[0], "old-app-id")
 
         with tempfile.TemporaryDirectory() as temp:
-            result, deploy_dir, log, _ = self._run_deploy_script(temp, mode="missing-config")
+            result, deploy_dir, log, _state, _image, _old_image = self._run_deploy_script(temp, mode="missing-config")
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse(log.exists() and log.read_text(encoding="utf-8").strip())
 
+    def test_deploy_script_rejects_gate_bypass_malformed_and_stale_records_before_docker(self):
+        for mode in ("gate-bypass", "malformed-gate", "stale-gate", "missing-gate", "live-app"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                result, _deploy_dir, log, state, _image, _old_image = self._run_deploy_script(temp, mode=mode)
+                self.assertNotEqual(result.returncode, 0)
+                calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+                self.assertFalse(any(line.startswith("docker ") for line in calls))
+                state_fields = state.read_text(encoding="utf-8").strip().split("|")
+                self.assertEqual(state_fields[0], "old-app-id")
+                self.assertEqual(state_fields[2:], ["running", "healthy"] if mode == "live-app" else ["stopped", "none"])
+
     def test_deploy_script_stops_before_docker_for_non_symlink_current_path(self):
         with tempfile.TemporaryDirectory() as temp:
-            result, deploy_dir, log, _ = self._run_deploy_script(temp, mode="success", current_file=True)
+            result, deploy_dir, log, state, _image, _old_image = self._run_deploy_script(temp, mode="success", current_file=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("not a symlink", result.stderr)
             self.assertFalse(log.exists() and log.read_text(encoding="utf-8").strip())
             self.assertTrue((deploy_dir / "current").is_file())
+            self.assertEqual(state.read_text(encoding="utf-8").strip().split("|")[0], "old-app-id")
 
-    def test_deploy_script_startup_failure_preserves_existing_release_record(self):
+    def test_deploy_script_stops_only_rejected_app_and_preserves_accepted_pointer(self):
+        for mode in (
+            "up-partial-failure", "image-mismatch", "unhealthy", "readiness-failure", "interrupt",
+            "same-id-readiness-failure", "same-id-up-partial-failure",
+        ):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                result, deploy_dir, log, state, _image, old_image = self._run_deploy_script(temp, mode=mode)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    (deploy_dir / ".deployed-image").read_text(encoding="utf-8"),
+                    old_image + "\n",
+                )
+                self.assertFalse((deploy_dir / ".previous-image").exists())
+                self.assertTrue((deploy_dir / "current").is_symlink())
+                self.assertEqual(Path(os.readlink(deploy_dir / "current")).name, "old")
+                state_fields = state.read_text(encoding="utf-8").strip().split("|")
+                expected_id = "old-app-id" if mode.startswith("same-id-") else "new-app-id"
+                self.assertEqual(state_fields[0], expected_id)
+                self.assertEqual(state_fields[2:], ["stopped", "none"])
+                calls = log.read_text(encoding="utf-8").splitlines()
+                self.assertTrue(any(line.startswith(f"docker stop --time 10 {expected_id}") for line in calls))
+                self.assertFalse(any(" compose down" in line for line in calls))
+                self.assertFalse(any(line.startswith("docker stop neverflat-db") for line in calls))
+
+    def test_deploy_script_rejects_missing_or_mismatched_image_revision_before_launch(self):
+        for mode in ("image-revision-missing", "image-revision-mismatch"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                result, deploy_dir, log, state, _image, old_image = self._run_deploy_script(temp, mode=mode)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("image revision", result.stderr)
+                self.assertEqual((deploy_dir / ".deployed-image").read_text(encoding="utf-8"), old_image + "\n")
+                self.assertEqual(state.read_text(encoding="utf-8").strip().split("|")[2:], ["stopped", "none"])
+                calls = log.read_text(encoding="utf-8").splitlines()
+                self.assertTrue(any(line.startswith("docker image inspect") for line in calls))
+                self.assertFalse(any(" compose up " in line for line in calls))
+                self.assertFalse(any(line.startswith("docker stop ") for line in calls))
+
+    def test_deploy_script_revalidates_gate_and_app_state_before_launch(self):
+        for mode, expected_state in (
+            ("expired-after-pull", ["stopped", "none"]),
+            ("app-live-after-pull", ["running", "healthy"]),
+        ):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                result, deploy_dir, log, state, _image, old_image = self._run_deploy_script(temp, mode=mode)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("preflight rejected refreshed target gate", result.stderr)
+                self.assertEqual((deploy_dir / ".deployed-image").read_text(encoding="utf-8"), old_image + "\n")
+                self.assertEqual(state.read_text(encoding="utf-8").strip().split("|")[2:], expected_state)
+                calls = log.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(
+                    sum("preflight_production.py" in line and not line.startswith("python -") for line in calls),
+                    2,
+                )
+                self.assertFalse(any(" compose up " in line for line in calls))
+                self.assertFalse(any(line.startswith("docker stop ") for line in calls))
+
+    def test_deploy_script_reports_inspection_failure_as_incomplete_cleanup(self):
         with tempfile.TemporaryDirectory() as temp:
-            result, deploy_dir, log, _ = self._run_deploy_script(temp, mode="startup-failure")
+            result, deploy_dir, log, state, _image, old_image = self._run_deploy_script(temp, mode="inspect-failure")
             self.assertNotEqual(result.returncode, 0)
-            self.assertEqual(
-                (deploy_dir / ".deployed-image").read_text(encoding="utf-8"),
-                "ghcr.io/zentrixlab/neverflat@sha256:" + "c" * 64 + "\n",
-            )
-            self.assertFalse((deploy_dir / ".previous-image").exists())
-            self.assertTrue((deploy_dir / "current").is_symlink())
-            self.assertEqual(Path(os.readlink(deploy_dir / "current")).name, "old")
-            self.assertNotIn("ln -sfn", log.read_text(encoding="utf-8"))
+            self.assertIn("cleanup was incomplete", result.stderr)
+            self.assertEqual((deploy_dir / ".deployed-image").read_text(encoding="utf-8"), old_image + "\n")
+            self.assertEqual(state.read_text(encoding="utf-8").strip().split("|")[2:], ["running", "healthy"])
+            calls = log.read_text(encoding="utf-8").splitlines()
+            self.assertFalse(any(line.startswith("docker stop ") for line in calls))
+
+    def test_deploy_script_reports_cleanup_failure_and_leaves_rejected_app_visible(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result, _deploy_dir, log, state, _image, _old_image = self._run_deploy_script(temp, mode="stop-failure")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("cleanup was incomplete", result.stderr)
+            self.assertEqual(state.read_text(encoding="utf-8").strip().split("|")[2:], ["running", "healthy"])
+            self.assertTrue(any(line.startswith("docker stop --time 10 new-app-id") for line in log.read_text(encoding="utf-8").splitlines()))
 
 
 if __name__ == "__main__":

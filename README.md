@@ -15,9 +15,10 @@ Built for Polygon Amoy network integration with the NVF contract.
 
 ## Production deployment
 
-Production deployments run when `main` is updated in `ZentrixLab/neverflat`.
-See [`DEPLOYMENT.md`](DEPLOYMENT.md) for configuration, preflight, backup,
-migration, rollout, and rollback procedures.
+Updating `main` in `ZentrixLab/neverflat` publishes an immutable image. A
+separate production dispatch consumes that image only after the target-owned
+release gate has been recorded. See [`DEPLOYMENT.md`](DEPLOYMENT.md) for
+configuration, preflight, backup, migration, rollout, and rollback procedures.
 
 ## Identifier Terminology
 
@@ -69,7 +70,8 @@ for both the API and PostgreSQL. The image entrypoint runs the complete
 compatible local database and expect the process to stop if historical
 migration checks find duplicate data. Do not use this command as a production
 rollout procedure. Production uses the separate `compose.production.yaml`
-definition and the review gates in [`DEPLOYMENT.md`](DEPLOYMENT.md).
+definition, which starts `node dist/api.js` after the target migration gate in
+[`DEPLOYMENT.md`](DEPLOYMENT.md) has been completed.
 
 ### Docker Secrets
 

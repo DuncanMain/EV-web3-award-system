@@ -10,6 +10,7 @@ import re
 import shlex
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import parse_qs, unquote, urlparse
@@ -19,6 +20,8 @@ IMAGE_REFERENCE_RE = re.compile(
     r"^ghcr\.io/zentrixlab/neverflat@sha256:[0-9a-f]{64}$",
     re.IGNORECASE,
 )
+SOURCE_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
+RELEASE_GATE_MAX_LIFETIME = timedelta(hours=24)
 REQUIRED_ENV = (
     "DATABASE_URL",
     "POSTGRES_DB",
@@ -41,6 +44,39 @@ COMPOSE_ENV_KEYS = (
     "DEPLOY_ENV_FILE",
 )
 DATABASE_QUERY_OVERRIDES = {"host", "port", "user", "password", "dbname", "database"}
+TARGET_SCHEMA_QUERY = """
+select json_build_object(
+  'uid_wallet_unique', to_regclass('public.users_uid_wallet_lower_unique') is not null,
+  'global_uid_absent',
+    not exists (select 1 from pg_constraint where conname = 'users_uid_unique')
+    and to_regclass('public.users_uid_unique') is null,
+  'charging_session_column', exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'token_operations'
+      and column_name = 'charging_session_id'
+  ),
+  'charging_session_unique',
+    to_regclass('public.token_operations_award_provider_charging_session_unique') is not null,
+  'reward_policy_table', to_regclass('public.reward_policy') is not null,
+  'reward_policy_row', exists (select 1 from public.reward_policy where id = 1),
+  'active_wallet_column', exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'users'
+      and column_name = 'is_active'
+  ),
+  'active_wallet_unique', to_regclass('public.users_uid_active_unique') is not null
+)::text;
+""".strip()
+REQUIRED_SCHEMA_CHECKS = (
+    "uid_wallet_unique",
+    "global_uid_absent",
+    "charging_session_column",
+    "charging_session_unique",
+    "reward_policy_table",
+    "reward_policy_row",
+    "active_wallet_column",
+    "active_wallet_unique",
+)
 
 
 class PreflightError(RuntimeError):
@@ -83,6 +119,94 @@ def parse_env_file(path: str | Path) -> dict[str, str]:
 def validate_image_reference(image_reference: str) -> None:
     if not IMAGE_REFERENCE_RE.fullmatch(image_reference.strip()):
         raise PreflightError("IMAGE_REFERENCE must be the Zentrix neverflat sha256 image digest")
+
+
+def validate_source_commit(source_commit: str) -> None:
+    if not SOURCE_COMMIT_RE.fullmatch(source_commit.strip()):
+        raise PreflightError("source commit must be a full 40-character Git SHA")
+
+
+def _parse_utc_timestamp(value: Any, field_name: str) -> datetime:
+    if not isinstance(value, str) or not value.strip():
+        raise PreflightError(f"approval record {field_name} is missing")
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise PreflightError(f"approval record {field_name} is not valid UTC") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise PreflightError(f"approval record {field_name} must include UTC")
+    return parsed.astimezone(timezone.utc)
+
+
+def _expected_target_identity(values: Mapping[str, str]) -> dict[str, Any]:
+    return {
+        "composeProjectName": values["COMPOSE_PROJECT_NAME"],
+        "postgresContainerName": "neverflat-db",
+        "postgresVolumeName": values["POSTGRES_VOLUME_NAME"],
+        "databaseHost": "postgres",
+        "databasePort": 5432,
+        "databaseName": values["POSTGRES_DB"],
+        "databaseUser": values["POSTGRES_USER"],
+    }
+
+
+def validate_release_record(
+    path: str | Path,
+    *,
+    source_commit: str,
+    image_reference: str,
+    values: Mapping[str, str],
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Validate target-owned release evidence without exposing its contents."""
+
+    record_path = Path(path)
+    if record_path.is_symlink() or not record_path.is_file():
+        raise PreflightError("target-owned release evidence record is missing")
+    try:
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PreflightError("target-owned release evidence record is not valid JSON") from exc
+    if not isinstance(record, dict):
+        raise PreflightError("target-owned release evidence record must be a JSON object")
+    if type(record.get("schemaVersion")) is not int or record["schemaVersion"] != 1:
+        raise PreflightError("target-owned release evidence schema is unsupported")
+    if record.get("sourceCommit") != source_commit.strip():
+        raise PreflightError("target-owned release evidence does not match the source commit")
+    if record.get("imageReference") != image_reference.strip():
+        raise PreflightError("target-owned release evidence does not match the image digest")
+    if not isinstance(record.get("approvedBy"), str) or not record["approvedBy"].strip():
+        raise PreflightError("target-owned release evidence has no approver")
+
+    current_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    approved_at = _parse_utc_timestamp(record.get("approvedAt"), "approvedAt")
+    expires_at = _parse_utc_timestamp(record.get("expiresAt"), "expiresAt")
+    if approved_at > current_time or expires_at <= current_time:
+        raise PreflightError("target-owned release evidence is outside its valid time window")
+    if expires_at > current_time + RELEASE_GATE_MAX_LIFETIME:
+        raise PreflightError("target-owned release evidence expiry is beyond the allowed window")
+    if expires_at <= approved_at:
+        raise PreflightError("target-owned release evidence expiry precedes approval")
+    if expires_at - approved_at > RELEASE_GATE_MAX_LIFETIME:
+        raise PreflightError("target-owned release evidence window is too long")
+
+    target = record.get("target")
+    expected_target = _expected_target_identity(values)
+    if not isinstance(target, dict) or any(target.get(key) != value for key, value in expected_target.items()):
+        raise PreflightError("target-owned release evidence does not match the operator target identity")
+
+    evidence = record.get("evidence")
+    required_evidence = (
+        "backupVerified",
+        "restoreVerified",
+        "writersQuiesced",
+        "migrationReviewed",
+        "migrationApplied",
+        "preservationVerified",
+    )
+    if not isinstance(evidence, dict) or any(evidence.get(key) is not True for key in required_evidence):
+        raise PreflightError("target-owned release evidence is incomplete")
+    return record
 
 
 def validate_release_pointer(deploy_dir: str | Path) -> None:
@@ -160,6 +284,16 @@ def effective_compose_environment(
 
 
 def validate_database_snapshot(snapshot: Mapping[str, Any], values: Mapping[str, str]) -> None:
+    state = snapshot.get("State")
+    health = state.get("Health") if isinstance(state, Mapping) else None
+    if (
+        not isinstance(state, Mapping)
+        or state.get("Status") != "running"
+        or not isinstance(health, Mapping)
+        or health.get("Status") != "healthy"
+    ):
+        raise PreflightError("existing PostgreSQL container is not running and healthy")
+
     project = snapshot.get("Config", {}).get("Labels", {}).get("com.docker.compose.project")
     if project != values["COMPOSE_PROJECT_NAME"]:
         raise PreflightError("existing PostgreSQL container belongs to a different Compose project")
@@ -182,6 +316,32 @@ def validate_database_snapshot(snapshot: Mapping[str, Any], values: Mapping[str,
     for key in ("POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD"):
         if container_env.get(key) != values[key]:
             raise PreflightError(f"{key} does not match the existing PostgreSQL container credential")
+
+
+def validate_release_record_target(record: Mapping[str, Any], snapshot: Mapping[str, Any]) -> None:
+    target = record.get("target")
+    container_name = str(snapshot.get("Name", "")).lstrip("/")
+    if not isinstance(target, Mapping) or container_name != target.get("postgresContainerName"):
+        raise PreflightError("target-owned release evidence does not match the existing database container")
+
+
+def validate_target_schema(container_name: str = "neverflat-db") -> None:
+    """Run only read-only schema/index checks inside the existing DB container."""
+
+    result = _run_checked(
+        [
+            "docker", "exec", "-i", container_name, "sh", "-c",
+            'PGPASSWORD="$POSTGRES_PASSWORD" psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" '
+            '-d "$POSTGRES_DB" -Atqc "$1"',
+            "sh", TARGET_SCHEMA_QUERY,
+        ]
+    )
+    try:
+        checks = json.loads(result.stdout.strip())
+    except json.JSONDecodeError as exc:
+        raise PreflightError("target schema check returned invalid JSON") from exc
+    if not isinstance(checks, dict) or any(checks.get(key) is not True for key in REQUIRED_SCHEMA_CHECKS):
+        raise PreflightError("target schema/index readiness checks did not pass")
 
 
 def _run_checked(command: list[str], *, env: Mapping[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -211,6 +371,43 @@ def docker_snapshot(container_name: str) -> Mapping[str, Any]:
     return rows[0]
 
 
+def docker_snapshot_if_present(container_name: str) -> Mapping[str, Any] | None:
+    """Inspect a container, treating Docker's not-found response as absent."""
+
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", container_name],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        raise PreflightError(f"required executable is unavailable: docker") from exc
+    if result.returncode != 0:
+        error = result.stderr.lower()
+        if "no such object" in error or "no such container" in error:
+            return None
+        raise PreflightError("Docker app inspection failed")
+    try:
+        rows = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise PreflightError("Docker returned an invalid app inspection") from exc
+    if not rows:
+        return None
+    return rows[0]
+
+
+def validate_existing_app_stopped(snapshot: Mapping[str, Any] | None) -> None:
+    """Require the prior app to be absent or stopped before a rollout."""
+
+    if snapshot is None:
+        return
+    state = snapshot.get("State")
+    if not isinstance(state, Mapping) or state.get("Status") not in {"exited", "dead"}:
+        raise PreflightError("existing neverflat-app must be stopped before rollout")
+
+
 def validate_effective_compose_config(
     config: Mapping[str, Any],
     values: Mapping[str, str],
@@ -229,6 +426,8 @@ def validate_effective_compose_config(
         raise PreflightError("rendered Compose configuration is missing app or postgres")
     if app.get("image") != image_reference:
         raise PreflightError("rendered app image does not match the requested immutable digest")
+    if app.get("command") != ["node", "dist/api.js"]:
+        raise PreflightError("production Compose must start the API without an implicit migration")
 
     app_environment = app.get("environment")
     postgres_environment = postgres.get("environment")
@@ -260,18 +459,31 @@ def run_preflight(
     deploy_dir: str | Path,
     env_file: str | Path,
     image_reference: str,
+    source_commit: str,
+    approval_record: str | Path,
     compose_file: str | Path | None = None,
 ) -> dict[str, str]:
     """Run all checks and return non-secret settings needed by the deployer."""
 
     validate_release_pointer(deploy_dir)
     validate_image_reference(image_reference)
+    validate_source_commit(source_commit)
     values = parse_env_file(env_file)
     validate_operator_env(values, env_file)
+    release_record = validate_release_record(
+        approval_record,
+        source_commit=source_commit,
+        image_reference=image_reference,
+        values=values,
+    )
     compose_env = effective_compose_environment(values, image_reference)
     _run_checked(["docker", "info"])
     _run_checked(["docker", "compose", "version"])
-    validate_database_snapshot(docker_snapshot("neverflat-db"), values)
+    validate_existing_app_stopped(docker_snapshot_if_present("neverflat-app"))
+    database_snapshot = docker_snapshot("neverflat-db")
+    validate_database_snapshot(database_snapshot, values)
+    validate_release_record_target(release_record, database_snapshot)
+    validate_target_schema()
 
     if compose_file is not None:
         compose_path = Path(compose_file)
@@ -306,6 +518,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--env-file")
     parser.add_argument("--compose-file")
     parser.add_argument("--image-reference", required=True)
+    parser.add_argument("--source-commit", required=True)
+    parser.add_argument("--approval-record", required=True)
     args = parser.parse_args(argv)
     env_file = Path(args.env_file or Path(args.deploy_dir) / ".env")
     try:
@@ -313,6 +527,8 @@ def main(argv: list[str] | None = None) -> int:
             deploy_dir=args.deploy_dir,
             env_file=env_file,
             image_reference=args.image_reference,
+            source_commit=args.source_commit,
+            approval_record=args.approval_record,
             compose_file=args.compose_file,
         )
     except PreflightError as exc:

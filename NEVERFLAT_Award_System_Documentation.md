@@ -176,6 +176,14 @@ selection while retaining historical wallet rows. A rollback to an older image
 must review active-wallet selection and pending financial operations; it must
 not drop those preferences or rewrite wallet mappings or financial rows.
 
+Wallet-link behavior preserves those rows as well: a signed unlink atomically
+removes the link while retaining every award, spend, and balance row,
+including zero balances. If the removed link was the active external wallet,
+the service selects the deterministic managed wallet; unlinking an inactive
+link leaves the current selection unchanged. Ordinary linking does not replace
+an existing active selection, and explicit authenticated mode selection keeps
+its existing behavior.
+
 The local activation path was backup-gated and used loopback disposable or
 controlled resources. A target environment needs its own reviewed backup,
 schema, credentials, and rollback procedure before any migration. This

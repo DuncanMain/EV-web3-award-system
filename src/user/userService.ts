@@ -2,6 +2,11 @@ import { ethers } from 'ethers';
 import { createRpcProvider } from '../rpcProvider';
 import { userRegistry } from './userRegistry';
 import { Users } from '../database/service';
+import {
+  DEFAULT_USER_ADDRESS_DERIVATION_SALT,
+  deriveManagedWalletAddress,
+  generateDeterministicWallet,
+} from './walletDerivation';
 
 export type WalletMode = 'managed' | 'custodial';
 
@@ -20,20 +25,7 @@ export type WalletMode = 'managed' | 'custodial';
  * @param derivationSalt - Salt for deterministic generation (environment-based)
  * @returns A deterministic Polygon wallet (with private key)
  */
-function generateDeterministicWallet(uid: string, derivationSalt: string) {
-  // Create a seed by hashing UID + salt
-  const seed = ethers.solidityPacked(['string', 'string'], [uid, derivationSalt]);
-  
-  // Derive a wallet from the seed
-  const hdNode = ethers.HDNodeWallet.fromSeed(seed);
-  const wallet = hdNode.derivePath("m/44'/60'/0'/0/0"); // Standard Ethereum derivation path
-  
-  return wallet;
-}
-
-/**
- * Export for use in other modules (like database integration)
- */
+/** Preserve the existing export used by database integration and tests. */
 export { generateDeterministicWallet };
 
 /**
@@ -45,12 +37,11 @@ export { generateDeterministicWallet };
  * @returns A deterministic Polygon wallet address (0x...)
  */
 function generateDeterministicAddress(uid: string, derivationSalt: string): string {
-  const wallet = generateDeterministicWallet(uid, derivationSalt);
-  return wallet.address;
+  return deriveManagedWalletAddress(uid, derivationSalt);
 }
 
 export function getManagedWalletAddress(uid: string): string {
-  const derivationSalt = process.env.USER_ADDRESS_DERIVATION_SALT || 'nvf-award-core-v1';
+  const derivationSalt = process.env.USER_ADDRESS_DERIVATION_SALT || DEFAULT_USER_ADDRESS_DERIVATION_SALT;
   return generateDeterministicAddress(uid, derivationSalt);
 }
 
@@ -93,7 +84,11 @@ export async function resolveActiveUidAddress(uid: string): Promise<string> {
     return existingUser.wallet_address;
   }
 
-  return resolveUidToAddress(uid);
+  // A stale in-memory address must never revive a wallet removed from the
+  // database. When no active row exists, the only safe fallback is managed.
+  const managedWalletAddress = getManagedWalletAddress(uid);
+  userRegistry.setAddress(uid, managedWalletAddress);
+  return managedWalletAddress;
 }
 
 export async function getUserWalletConfig(uid: string): Promise<{

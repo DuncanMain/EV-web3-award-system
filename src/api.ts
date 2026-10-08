@@ -5238,9 +5238,7 @@ app.post('/wallet/:uid/linked-wallets', validateApiKey, async (req: Request, res
     const checksumWalletAddress = ethers.getAddress(walletAddress);
     verifyLinkedWalletSignature(normalizedUid, checksumWalletAddress, 'link', signature);
 
-    await getUserWalletConfig(normalizedUid);
-    await LinkedWallets.add(normalizedUid, checksumWalletAddress);
-    await Users.linkContractId(normalizedUid, checksumWalletAddress);
+    await Users.linkLinkedWallet(normalizedUid, checksumWalletAddress);
 
     const payload = await getWalletPayload(normalizedUid, checksumWalletAddress);
     return res.status(200).json({
@@ -5317,11 +5315,7 @@ app.delete('/wallet/:uid/linked-wallets/:walletAddress', validateApiKey, async (
     const checksumWalletAddress = ethers.getAddress(walletAddress);
     verifyLinkedWalletSignature(normalizedUid, checksumWalletAddress, 'unlink', signature);
 
-    await LinkedWallets.remove(normalizedUid, checksumWalletAddress);
-    const user = await Users.findByUidAndWallet(normalizedUid, checksumWalletAddress);
-    if (user && !(await Users.hasActivity(user.id))) {
-      await Users.deleteByUidAndWallet(normalizedUid, checksumWalletAddress);
-    }
+    await Users.unlinkLinkedWallet(normalizedUid, checksumWalletAddress);
 
     const payload = await getWalletPayload(normalizedUid);
     return res.status(200).json({

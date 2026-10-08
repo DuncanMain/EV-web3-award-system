@@ -1,6 +1,10 @@
 import { getDatabase } from './connection';
 import type { Knex } from 'knex';
 import {
+  DEFAULT_USER_ADDRESS_DERIVATION_SALT,
+  deriveManagedWalletAddress,
+} from '../user/walletDerivation';
+import {
   canonicalTokenAmount,
   requireCanonicalTransactionHash,
   requireUnambiguousTransactionMatch,
@@ -211,6 +215,93 @@ export interface LinkedWalletAddressRecord {
   wallet_name?: string | null;
   created_at: Date;
   updated_at: Date;
+}
+
+const LINKED_WALLET_TABLE = 'linked_wallet_links';
+const MAX_LINKED_WALLETS_PER_UID = 5;
+
+function managedWalletAddressForUid(uid: string): string {
+  return deriveManagedWalletAddress(
+    uid,
+    process.env.USER_ADDRESS_DERIVATION_SALT || DEFAULT_USER_ADDRESS_DERIVATION_SALT,
+  );
+}
+
+async function hasActivityInTransaction(trx: Knex.Transaction, userId: string): Promise<boolean> {
+  const [award, spend, balance] = await Promise.all([
+    trx('awards').where({ user_id: userId }).first(),
+    trx('spends').where({ user_id: userId }).first(),
+    // A balance row is durable projection/history state even when its current
+    // balance is zero. Deleting the user would cascade that row and erase its
+    // cumulative awarded/spent totals.
+    trx('balances').where({ user_id: userId }).first(),
+  ]);
+  return Boolean(award || spend || balance);
+}
+
+/**
+ * Make the deterministic managed wallet the only active row for a UID.
+ * Historical external rows remain available for projections and reporting,
+ * but are never eligible for automatic replacement after unlink/delete.
+ */
+async function ensureManagedWalletInTransaction(trx: Knex.Transaction, uid: string): Promise<UserRecord> {
+  const managedWalletAddress = managedWalletAddressForUid(uid);
+  await trx('users').where({ uid }).update({ is_active: false });
+
+  const existing = await trx('users')
+    .where({ uid })
+    .whereRaw('lower(wallet_address) = lower(?)', [managedWalletAddress])
+    .first() as UserRecord | undefined;
+  if (existing) {
+    const [activated] = await trx('users')
+      .where({ id: existing.id })
+      .update({ is_active: true, updated_at: trx.fn.now() })
+      .returning('*');
+    return activated as UserRecord;
+  }
+
+  const [created] = await trx('users')
+    .insert({
+      uid,
+      wallet_address: managedWalletAddress,
+      wallet_name: null,
+      is_active: true,
+    })
+    .returning('*');
+  return created as UserRecord;
+}
+
+async function addLinkedWalletInTransaction(
+  trx: Knex.Transaction,
+  uid: string,
+  walletAddress: string,
+  walletName?: string | null,
+): Promise<LinkedWalletAddressRecord> {
+  const existingForUid = await trx(LINKED_WALLET_TABLE)
+    .where({ uid })
+    .whereRaw('lower(wallet_address) = lower(?)', [walletAddress])
+    .first();
+  if (existingForUid) return existingForUid as LinkedWalletAddressRecord;
+
+  const existingForOtherUid = await trx(LINKED_WALLET_TABLE)
+    .whereRaw('lower(wallet_address) = lower(?)', [walletAddress])
+    .first();
+  if (existingForOtherUid) {
+    throw new Error('This wallet address is already linked. Unlink it before linking it again.');
+  }
+
+  const count = await trx(LINKED_WALLET_TABLE)
+    .where({ uid })
+    .count<{ count: string }>({ count: '*' })
+    .first();
+  if (Number(count?.count || 0) >= MAX_LINKED_WALLETS_PER_UID) {
+    throw new Error(`A maximum of ${MAX_LINKED_WALLETS_PER_UID} wallet addresses can be linked`);
+  }
+
+  const [record] = await trx(LINKED_WALLET_TABLE)
+    .insert({ uid, wallet_address: walletAddress, wallet_name: walletName || null })
+    .returning('*');
+  return record as LinkedWalletAddressRecord;
 }
 
 function decimalUnits(value: unknown): bigint {
@@ -525,6 +616,39 @@ export const Users = {
   },
 
   /**
+   * Link an externally controlled wallet and its historical user row under
+   * one UID lock. Linking never changes the persisted active selection.
+   */
+  async linkLinkedWallet(
+    uid: string,
+    walletAddress: string,
+    walletName?: string | null,
+  ): Promise<UserRecord> {
+    const db = getDatabase();
+    return db.transaction(async trx => {
+      await lockUid(trx, uid);
+      await addLinkedWalletInTransaction(trx, uid, walletAddress, walletName);
+
+      const existing = await trx('users')
+        .where({ uid })
+        .whereRaw('lower(wallet_address) = lower(?)', [walletAddress])
+        .first() as UserRecord | undefined;
+      if (existing) return existing;
+
+      const hasExistingUid = await trx('users').where({ uid }).first('id');
+      const [record] = await trx('users')
+        .insert({
+          uid,
+          wallet_address: walletAddress,
+          wallet_name: walletName || null,
+          is_active: !hasExistingUid,
+        })
+        .returning('*');
+      return record as UserRecord;
+    });
+  },
+
+  /**
    * Atomically select one historical or newly linked wallet for a UID.
    * Ordinary links use create() and remain inactive; only this method changes
    * the persisted selection.
@@ -573,20 +697,87 @@ export const Users = {
         .first() as UserRecord | undefined;
       if (!existing) return 0;
 
-      const deleted = await trx('users')
-        .where({ id: existing.id })
-        .delete();
-      if (existing.is_active) {
-        const replacement = await trx('users')
-          .where({ uid })
-          .orderBy('created_at', 'asc')
-          .orderBy('id', 'asc')
-          .first() as UserRecord | undefined;
-        if (replacement) {
-          await trx('users').where({ id: replacement.id }).update({ is_active: true });
+      const wasActive = existing.is_active === true;
+      const hasActivity = await hasActivityInTransaction(trx, existing.id);
+      let deleted = 0;
+      if (hasActivity) {
+        if (wasActive) {
+          await trx('users').where({ id: existing.id }).update({ is_active: false, updated_at: trx.fn.now() });
         }
+      } else {
+        deleted = await trx('users').where({ id: existing.id }).delete();
+      }
+      if (wasActive) {
+        await ensureManagedWalletInTransaction(trx, uid);
       }
       return deleted;
+    });
+  },
+
+  /**
+   * Remove a signed linked wallet and repair active selection atomically.
+   * A removed active external wallet is retained when it has history, but it
+   * is always made inactive and the deterministic managed row is selected.
+   * An inactive wallet never affects the current selection.
+   */
+  async unlinkLinkedWallet(uid: string, walletAddress: string): Promise<{
+    removedLink: number;
+    deletedUser: number;
+    activeWallet?: UserRecord;
+  }> {
+    const db = getDatabase();
+    return db.transaction(async trx => {
+      await lockUid(trx, uid);
+
+      const removedLink = await trx(LINKED_WALLET_TABLE)
+        .where({ uid })
+        .whereRaw('lower(wallet_address) = lower(?)', [walletAddress])
+        .delete();
+      const existing = await trx('users')
+        .where({ uid })
+        .whereRaw('lower(wallet_address) = lower(?)', [walletAddress])
+        .first() as UserRecord | undefined;
+      if (!existing) {
+        return {
+          removedLink,
+          deletedUser: 0,
+          activeWallet: await trx('users').where({ uid, is_active: true }).first() as UserRecord | undefined,
+        };
+      }
+
+      // A previous release removed the link before deciding whether to delete
+      // the user row. Repair that legacy state when the matching external row
+      // is still active, while keeping unknown/inactive repeats idempotent and
+      // never treating the managed row as an implicit unlink target.
+      const isManagedWallet = existing.wallet_address.toLowerCase() === managedWalletAddressForUid(uid).toLowerCase();
+      const shouldRepairLegacyActive = existing.is_active === true && !isManagedWallet;
+      if (!removedLink && !shouldRepairLegacyActive) {
+        return {
+          removedLink: 0,
+          deletedUser: 0,
+          activeWallet: await trx('users').where({ uid, is_active: true }).first() as UserRecord | undefined,
+        };
+      }
+
+      const wasActive = existing.is_active === true;
+      const hasActivity = await hasActivityInTransaction(trx, existing.id);
+      let deletedUser = 0;
+      if (hasActivity) {
+        if (wasActive) {
+          await trx('users').where({ id: existing.id }).update({ is_active: false, updated_at: trx.fn.now() });
+        }
+      } else {
+        deletedUser = await trx('users').where({ id: existing.id }).delete();
+      }
+
+      if (wasActive) {
+        return { removedLink, deletedUser, activeWallet: await ensureManagedWalletInTransaction(trx, uid) };
+      }
+      return {
+        removedLink,
+        deletedUser,
+        activeWallet: await trx('users').where({ uid, is_active: true }).first() as UserRecord | undefined,
+      };
     });
   },
 
@@ -595,7 +786,7 @@ export const Users = {
     const [award, spend, balance] = await Promise.all([
       db('awards').where({ user_id: userId }).first(),
       db('spends').where({ user_id: userId }).first(),
-      db('balances').where({ user_id: userId }).whereRaw('balance <> 0').first(),
+      db('balances').where({ user_id: userId }).first(),
     ]);
     return Boolean(award || spend || balance);
   },
@@ -614,8 +805,8 @@ async function lockUid(trx: Knex.Transaction, uid: string): Promise<void> {
  * Address-based linked wallets.
  */
 export const LinkedWallets = {
-  tableName: 'linked_wallet_links',
-  maxPerUid: 5,
+  tableName: LINKED_WALLET_TABLE,
+  maxPerUid: MAX_LINKED_WALLETS_PER_UID,
 
   async findByUid(uid: string): Promise<LinkedWalletAddressRecord[]> {
     const db = getDatabase();
@@ -631,41 +822,17 @@ export const LinkedWallets = {
       .first();
   },
 
-  async add(uid: string, walletAddress: string): Promise<LinkedWalletAddressRecord> {
+  async add(uid: string, walletAddress: string, walletName?: string | null): Promise<LinkedWalletAddressRecord> {
     const db = getDatabase();
-    const existingForUid = await db(this.tableName)
-      .where({ uid })
-      .whereRaw('lower(wallet_address) = lower(?)', [walletAddress])
-      .first();
-
-    if (existingForUid) return existingForUid;
-
-    const existingForOtherUid = await this.findByAddress(walletAddress);
-    if (existingForOtherUid) {
-      throw new Error('This wallet address is already linked. Unlink it before linking it again.');
-    }
-
-    const count = await db(this.tableName)
-      .where({ uid })
-      .count<{ count: string }>({ count: '*' })
-      .first();
-
-    if (Number(count?.count || 0) >= this.maxPerUid) {
-      throw new Error(`A maximum of ${this.maxPerUid} wallet addresses can be linked`);
-    }
-
-    const [record] = await db(this.tableName)
-      .insert({ uid, wallet_address: walletAddress })
-      .returning('*');
-    return record;
+    return db.transaction(async trx => {
+      await lockUid(trx, uid);
+      return addLinkedWalletInTransaction(trx, uid, walletAddress, walletName);
+    });
   },
 
   async remove(uid: string, walletAddress: string): Promise<number> {
-    const db = getDatabase();
-    return db(this.tableName)
-      .where({ uid })
-      .whereRaw('lower(wallet_address) = lower(?)', [walletAddress])
-      .delete();
+    const result = await Users.unlinkLinkedWallet(uid, walletAddress);
+    return result.removedLink;
   },
 
   async updateName(uid: string, walletAddress: string, walletName: string | null): Promise<LinkedWalletAddressRecord | undefined> {

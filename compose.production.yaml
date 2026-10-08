@@ -23,6 +23,7 @@ services:
     image: ${IMAGE_REFERENCE:?IMAGE_REFERENCE must be the built sha256 image reference}
     container_name: neverflat-app
     restart: unless-stopped
+    command: ["node", "dist/api.js"]
     env_file:
       - ${DEPLOY_ENV_FILE:?DEPLOY_ENV_FILE must point to the operator environment file}
     environment:

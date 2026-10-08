@@ -165,6 +165,8 @@ jest.mock('./database/service', () => {
       findByUidAndWallet: jest.fn().mockResolvedValue(undefined),
       findAllByWallet: jest.fn().mockResolvedValue([]),
       linkContractId: jest.fn(),
+      linkLinkedWallet: jest.fn(),
+      unlinkLinkedWallet: jest.fn(),
       updateWalletNameByAddress: jest.fn(),
       hasActivity: jest.fn().mockResolvedValue(false),
       deleteByUidAndWallet: jest.fn(),
@@ -661,6 +663,35 @@ describe('api integration contracts', () => {
 
     expect(manualRes.status).toBe(403);
     expect(manualBody.message).toContain('/wallet/me');
+  });
+
+  it('verifies the signed unlink route and delegates cleanup atomically', async () => {
+    const { LinkedWallets, Users } = await import('./database/service');
+    const uid = 'contract-signed-unlink';
+    const checksumWalletAddress = ethers.getAddress(linkedWallet.address);
+    const signature = await linkedWallet.signMessage([
+      'NEVERFLAT unlink wallet address',
+      `EMP contract: ${uid}`,
+      `Wallet address: ${checksumWalletAddress}`,
+    ].join('\n'));
+
+    (Users.unlinkLinkedWallet as jest.Mock).mockResolvedValueOnce({
+      removedLink: 1,
+      deletedUser: 1,
+    });
+    (LinkedWallets.findByUid as jest.Mock).mockResolvedValueOnce([]);
+
+    const res = await apiFetch(`/wallet/${uid}/linked-wallets/${checksumWalletAddress}`, {
+      method: 'DELETE',
+      body: JSON.stringify({ signature }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body.message).toBe('Wallet address unlinked');
+    expect(Users.unlinkLinkedWallet).toHaveBeenCalledWith(uid, checksumWalletAddress);
+    expect(LinkedWallets.remove).not.toHaveBeenCalled();
+    expect(Users.deleteByUidAndWallet).not.toHaveBeenCalled();
   });
 
   it('rejects an array wallet profile before writing wallet state', async () => {

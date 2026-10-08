@@ -4,6 +4,16 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Full source commit SHA already built and approved for this release
+        required: true
+        type: string
+      image_reference:
+        description: Exact ghcr.io/zentrixlab/neverflat@sha256 image reference already built for source_commit
+        required: true
+        type: string
 
 concurrency:
   group: neverflat-production
@@ -15,8 +25,8 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  build-and-deploy:
-    if: github.repository == 'ZentrixLab/neverflat'
+  build-and-publish:
+    if: github.event_name == 'push' && github.repository == 'ZentrixLab/neverflat'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -33,7 +43,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Build and push immutable Docker image
+      - name: Build and publish immutable Docker image
         id: build
         uses: docker/build-push-action@v6
         with:
@@ -42,65 +52,112 @@ jobs:
           push: true
           no-cache: true
           tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
 
-      - name: Preflight existing target
-        uses: appleboy/scp-action@v0.1.7
+      - name: Record immutable image coordinates
+        shell: bash
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Immutable production image"
+            echo ""
+            echo "- Source commit: \`${GITHUB_SHA}\`"
+            echo "- Image digest: \`${IMAGE_NAME}@${IMAGE_DIGEST}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-production:
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'ZentrixLab/neverflat' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Check out the approved source commit
+        uses: actions/checkout@v5
         with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: root
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          source: scripts/preflight_production.py
-          target: /tmp/neverflat-preflight-${{ github.sha }}
-          strip_components: 1
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 0
 
-      - name: Run preflight before staging the release
+      - name: Validate source commit input
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          EXPECTED_MAIN_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]]
+          [[ "$SOURCE_COMMIT" == "$EXPECTED_MAIN_COMMIT" ]]
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_COMMIT" ]]
+          git fetch --no-tags origin main
+          MAIN_COMMIT="$(git rev-parse origin/main)"
+          git merge-base --is-ancestor "$SOURCE_COMMIT" "$MAIN_COMMIT"
+
+      - name: Record deployment coordinates
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          IMAGE_REFERENCE: ${{ inputs.image_reference }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Production deployment input"
+            echo ""
+            echo "- Source commit: \`${SOURCE_COMMIT}\`"
+            echo "- Image digest: \`${IMAGE_REFERENCE}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Prepare target release directory
         uses: appleboy/ssh-action@v1.2.0
         env:
-          IMAGE_REFERENCE: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: root
           key: ${{ secrets.SERVER_SSH_KEY }}
-          command_timeout: 10m
-          envs: IMAGE_REFERENCE
+          envs: SOURCE_COMMIT
           script: |
             set -euo pipefail
-            python3 /tmp/neverflat-preflight-${{ github.sha }}/preflight_production.py \
-              --deploy-dir /root/neverflat \
-              --env-file /root/neverflat/.env \
-              --image-reference "$IMAGE_REFERENCE"
-            mkdir -p /root/neverflat/releases/${{ github.sha }}
-            rm -f /tmp/neverflat-preflight-${{ github.sha }}/preflight_production.py
+            mkdir -p "/root/neverflat/releases/$SOURCE_COMMIT"
 
-      - name: Stage release files
+      - name: Stage deployment helpers
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: root
           key: ${{ secrets.SERVER_SSH_KEY }}
           source: compose.production.yaml,scripts/deploy_production.sh,scripts/preflight_production.py,scripts/check_production_acceptance.py
-          target: /root/neverflat/releases/${{ github.sha }}
+          target: /root/neverflat/releases/${{ inputs.source_commit }}
           strip_components: 0
 
-      - name: Validate and deploy staged release
+      - name: Validate gate and deploy approved digest
         uses: appleboy/ssh-action@v1.2.0
         env:
-          IMAGE_REFERENCE: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          IMAGE_REFERENCE: ${{ inputs.image_reference }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
           GHCR_USER: ${{ github.actor }}
           GHCR_TOKEN: ${{ github.token }}
           DEPLOY_DIR: /root/neverflat
-          RELEASE_DIR: /root/neverflat/releases/${{ github.sha }}
+          RELEASE_DIR: /root/neverflat/releases/${{ inputs.source_commit }}
+          APPROVAL_RECORD: /root/neverflat/approvals/${{ inputs.source_commit }}.json
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: root
           key: ${{ secrets.SERVER_SSH_KEY }}
           command_timeout: 10m
-          envs: IMAGE_REFERENCE,GHCR_USER,GHCR_TOKEN,DEPLOY_DIR,RELEASE_DIR
+          envs: IMAGE_REFERENCE,SOURCE_COMMIT,GHCR_USER,GHCR_TOKEN,DEPLOY_DIR,RELEASE_DIR,APPROVAL_RECORD
           script: |
             set -euo pipefail
             chmod 700 "$RELEASE_DIR/scripts/deploy_production.sh"
             chmod 600 "$RELEASE_DIR/scripts/preflight_production.py" "$RELEASE_DIR/scripts/check_production_acceptance.py"
             IMAGE_REFERENCE="$IMAGE_REFERENCE" \
+              SOURCE_COMMIT="$SOURCE_COMMIT" \
+              APPROVAL_RECORD="$APPROVAL_RECORD" \
               GHCR_USER="$GHCR_USER" \
               GHCR_TOKEN="$GHCR_TOKEN" \
               DEPLOY_DIR="$DEPLOY_DIR" \

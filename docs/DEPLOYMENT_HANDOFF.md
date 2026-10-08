@@ -8,10 +8,15 @@ rollout.
 ## Branch and automation boundary
 
 The existing ZentrixLab/neverflat `development` branch is used for integration.
-Keep the deployed baseline and `main` unchanged until the target release has
-passed the backup, migration, preservation, and acceptance gates. The
-production workflow is attached to pushes to `main` and uses an immutable
-Docker digest, not a `:latest` release identifier.
+A push to `main` publishes an immutable Docker image only. A separate
+`workflow_dispatch` from `main` references the `production` environment and
+consumes that source commit and exact digest after the target-owned release
+gate has been recorded. Required environment reviewers and branch protections
+are repository settings that must be configured and verified separately. The
+dispatch uses the current `main` revision; older-image rollback is a separate,
+schema-reviewed runbook decision. The target record and the operational
+safeguards are defined in [`DEPLOYMENT.md`](../DEPLOYMENT.md); any environment
+approval alone does not attest the database work.
 
 ## Verified local evidence
 
@@ -37,13 +42,20 @@ handoff remain unclaimed.
 The current package artifact was repacked after the reproducible build
 instructions were changed to `npm ci`. Its SHA-256 is
 `1E7B4666445AC129FA00299F1F5BA9A784DD61DDD3565527AC962784B3AD4AFE`.
-Node 22 backend verification passed 19 Jest suites with 327 tests and 12
-opt-in tests skipped, plus 21 real PostgreSQL integration checks. The current
-deployment helper suite passed 16 focused tests and the charging-card package
-passed 12 tests; the frontend build and package/frontend audits passed, and a
-portable Node 22 probe returned `v22.23.3`. The combined Node 22.23.3
-root/frontend/Sparkz `npm run ci:check` passed with all audits at zero
-vulnerabilities. The target acceptance record remains pending.
+The 6 October 2026 source-verification record reported Node 22 backend
+verification with 19 Jest suites, 327 tests, 12 opt-in tests skipped, and 21
+real PostgreSQL integration checks. It also recorded 12 charging-card tests,
+frontend/package audits, a portable Node 22 `v22.23.3` probe, and a combined
+Node 22.23.3 root/frontend/Sparkz `npm run ci:check` with zero audit findings.
+The 8 October 2026 verification used the official portable Node `v22.23.3`.
+The full `npm.cmd run ci:check` passed: root, frontend, and Sparkz audits
+reported 0 vulnerabilities, the backend had 19 suites pass with 3 skipped and
+329 tests pass with 20 opt-in tests skipped, and the frontend and Sparkz builds
+passed. A fresh maintained PostgreSQL 16.15 runner passed the full migrations
+and compiled migration-entrypoint proof, plus 29 schema, policy, and wallet
+tests, including 14 wallet tests. The offline deployment helper suite passed
+25 focused tests, including offline Compose checks; this does not provide
+live post-start acceptance evidence.
 
 ## Required target gate before deployment
 
@@ -64,7 +76,9 @@ vulnerabilities. The target acceptance record remains pending.
    session guard 017, and standalone active-wallet migration 022. Campaign
    migrations 018–021 remain outside this release.
 6. Apply the reviewed migration with the API stopped, verify schema/index
-   readiness, and compare the preservation snapshot. Do not use local
+   readiness, leave the existing app container stopped, and compare the
+   preservation snapshot. Preflight rejects a running or restarting app and
+   never stops it automatically. Do not use local
    loopback migration runners against a target.
 7. Start the approved immutable image and run health, readiness, identity,
    preview, reservation/receipt, reconciliation, alert, and evidence checks.
@@ -72,6 +86,13 @@ vulnerabilities. The target acceptance record remains pending.
    audit/report record and must be an explicitly approved operational check.
 8. Record the approver, UTC time, backup/restore result, migration result,
    digest comparison, smoke evidence, and rollback decision.
+
+The target-owned record binds the full source SHA and image digest to the
+existing Compose project, PostgreSQL container, database, role, and volume.
+It carries explicit backup, restore, writer-quiescence, migration, and
+preservation attestations with a bounded UTC expiry. Production Compose starts
+the API with `node dist/api.js` after the reviewed migration phase; the default
+local image entrypoint's migration command is not an implicit target migration.
 
 ## Invariants and rollback
 
@@ -101,8 +122,10 @@ resolved.
 ## Open release facts
 
 The production workflow and mirror results for the deployed baseline are
-recorded in the root deployment documentation. The built image digest and
-target post-start acceptance response for that run are not captured here. The
-source revision, image digest, target database/backup record, restore result,
+recorded in the root deployment documentation. A `main` push publishes the
+image; production target mutation requires the separate dispatch and target
+record described above. The built image digest and target post-start
+acceptance response for the baseline run are not captured here. The source
+revision, image digest, target database/backup record, restore result,
 migration decision, maintenance window, target secret owners, and final
 approval remain target-specific handoff fields.
