@@ -1,54 +1,35 @@
-name: ${COMPOSE_PROJECT_NAME:?COMPOSE_PROJECT_NAME must remain neverflat}
-
 services:
   postgres:
     image: postgres:17
     container_name: neverflat-db
     restart: unless-stopped
     env_file:
-      - ${DEPLOY_ENV_FILE:?DEPLOY_ENV_FILE must point to the operator environment file}
+      - .env
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set in the operator environment}
-      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set in the operator environment}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in the operator environment}
+      POSTGRES_DB: nvf_award
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d nvf_award"]
       interval: 10s
       timeout: 5s
       retries: 5
 
   app:
-    image: ${IMAGE_REFERENCE:?IMAGE_REFERENCE must be the built sha256 image reference}
+    image: ghcr.io/zentrixlab/neverflat:latest
     container_name: neverflat-app
     restart: unless-stopped
-    command: ["node", "dist/api.js"]
     env_file:
-      - ${DEPLOY_ENV_FILE:?DEPLOY_ENV_FILE must point to the operator environment file}
+      - .env
     environment:
       NODE_ENV: production
       PORT: 3000
-      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set in the operator environment}
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/nvf_award
     depends_on:
       postgres:
         condition: service_healthy
-    healthcheck:
-      test:
-        - CMD
-        - node
-        - -e
-        - >-
-          fetch('http://127.0.0.1:3000/ingest/health').then(async response => {
-          const body = await response.json();
-          if (response.status !== 200 || body?.status !== 'ok' || typeof
-          body?.timestamp !== 'string' || Number.isNaN(Date.parse(body.timestamp)))
-          process.exit(1);
-          }).catch(() => process.exit(1))
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 10s
     ports:
       - "127.0.0.1:3005:3000"
     networks:
@@ -57,9 +38,7 @@ services:
 
 volumes:
   pgdata:
-    name: ${POSTGRES_VOLUME_NAME:?POSTGRES_VOLUME_NAME must preserve the existing database volume}
 
 networks:
   shared-proxy:
     external: true
-    name: shared-proxy
