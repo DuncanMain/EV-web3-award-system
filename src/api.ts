@@ -644,7 +644,10 @@ function inferPublicErrorCode(
     }
   }
   const text = getErrorMessage(error).toLowerCase();
-  if (text.includes('token_operation_intent_mismatch')) return 'TOKEN_OPERATION_INTENT_MISMATCH';
+  if (text.includes('token_operation_intent_mismatch')
+    || text.includes('treasury_transaction_intent_mismatch')) {
+    return 'TOKEN_OPERATION_INTENT_MISMATCH';
+  }
   if (text.includes('allowance') || text.includes('transferfrom')) {
     return 'MANAGED_WALLET_ALLOWANCE_UNAVAILABLE';
   }
@@ -3311,6 +3314,14 @@ function buildOpenApiSpec(req: Request) {
                 },
               },
             },
+            202: {
+              description: 'Saved wallet operation confirmation or read-only recovery is pending; the mode change is not yet confirmed',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/MoveFundsPendingResponse' },
+                },
+              },
+            },
             400: errorResponse,
             409: {
               description: 'Source wallet still has SPARKZ balance, or the saved wallet operation requires review',
@@ -3495,6 +3506,14 @@ function buildOpenApiSpec(req: Request) {
               content: {
                 'application/json': {
                   schema: { $ref: '#/components/schemas/MoveFundsResponse' },
+                },
+              },
+            },
+            202: {
+              description: 'Transfer accepted; confirmation or read-only recovery is pending',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/MoveFundsPendingResponse' },
                 },
               },
             },
@@ -4386,6 +4405,26 @@ function buildOpenApiSpec(req: Request) {
             txHash: { type: 'string', example: '0xabc...' },
             amount: { type: 'string', example: '15.0' },
             targetAddress: { type: 'string' },
+          },
+        },
+        MoveFundsPendingResponse: {
+          type: 'object',
+          required: ['status', 'pending', 'retryable', 'requiresReview'],
+          properties: {
+            status: { type: 'string', enum: ['pending', 'error'], example: 'pending' },
+            code: { type: 'string' },
+            errorCode: { type: 'string' },
+            stage: { type: 'string' },
+            operationKey: { type: 'string', nullable: true },
+            txHash: { type: 'string', nullable: true },
+            fundingTxHash: { type: 'string', nullable: true },
+            movementOutcome: { type: 'string', nullable: true },
+            pending: { type: 'boolean' },
+            retryable: { type: 'boolean' },
+            requiresReview: { type: 'boolean' },
+            error: { type: 'string' },
+            message: { type: 'string' },
+            diagnostic: { $ref: '#/components/schemas/TransactionDiagnostic' },
           },
         },
         Transaction: {

@@ -459,9 +459,19 @@ describe('api integration contracts', () => {
     expect(body.components.schemas.SpendRequest.properties.operationKey.minLength).toBe(1);
     expect(body.components.schemas.WalletModeRequest.required).toEqual(['mode']);
     expect(body.components.schemas.WalletModeRequest.description).toContain('optional idempotencyKey');
+    expect(body.paths['/wallet/{uid}/mode'].post.responses['202'].description)
+      .toContain('mode change is not yet confirmed');
+    expect(body.paths['/wallet/{uid}/mode'].post.responses['202'].content['application/json'].schema.$ref)
+      .toBe('#/components/schemas/MoveFundsPendingResponse');
     expect(body.components.schemas.MoveFundsRequest.required).toEqual(['targetAddress']);
     expect(body.components.schemas.MoveFundsRequest.description).toContain('stable idempotencyKey');
     expect(body.paths['/wallet/{uid}/move-funds'].post.description).toContain('one stable idempotencyKey');
+    expect(body.paths['/wallet/{uid}/move-funds'].post.responses['202'].description)
+      .toContain('confirmation or read-only recovery is pending');
+    expect(body.paths['/wallet/{uid}/move-funds'].post.responses['202'].content['application/json'].schema.$ref)
+      .toBe('#/components/schemas/MoveFundsPendingResponse');
+    expect(body.components.schemas.MoveFundsPendingResponse.required)
+      .toEqual(expect.arrayContaining(['status', 'pending', 'retryable', 'requiresReview']));
     expect(body.components.schemas.CdrRequest.oneOf).toEqual([
       { $ref: '#/components/schemas/NeverflatCdrRequest' },
       { $ref: '#/components/schemas/OcpiCdrRequest' },
@@ -941,6 +951,38 @@ describe('api integration contracts', () => {
       process.env.TOKEN_CONTRACT_ADDRESS,
       operationKey,
     );
+  });
+
+  it('normalizes the core treasury intent conflict to the public move contract', async () => {
+    const operationKey = 'wallet-move-core-intent-conflict';
+    mockIntegrationModule!.moveFundsFromManagedWallet.mockRejectedValueOnce(
+      Object.assign(new Error('TREASURY_TRANSACTION_INTENT_MISMATCH'), {
+        operationKey,
+        retryable: false,
+        requiresReview: false,
+        movementOutcome: 'no_movement',
+      }),
+    );
+
+    const res = await apiFetch('/wallet/contract-wallet-move/move-funds', {
+      method: 'POST',
+      body: JSON.stringify({
+        targetAddress: treasuryWallet.address,
+        idempotencyKey: operationKey,
+      }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(409);
+    expect(body).toMatchObject({
+      status: 'error',
+      code: 'TOKEN_OPERATION_INTENT_MISMATCH',
+      errorCode: 'TOKEN_OPERATION_INTENT_MISMATCH',
+      operationKey,
+      retryable: false,
+      requiresReview: false,
+      movementOutcome: 'no_movement',
+    });
   });
 
   it('surfaces a zero managed-wallet allowance as an actionable move failure', async () => {

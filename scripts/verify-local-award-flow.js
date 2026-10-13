@@ -18,9 +18,12 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { Pool } = require('pg');
 const { ethers } = require('ethers');
+const { parseDisposableDatabaseUrl } = require('./disposableDatabaseUrl');
 
 const APP_ROOT = path.resolve(__dirname, '..');
-const CONTRACT_ROOT = path.resolve(APP_ROOT, '..', 'NVF-award-contract');
+const CONTRACT_ROOT = path.resolve(
+  process.env.NVF_CONTRACT_ROOT || path.resolve(APP_ROOT, '..', 'NVF-award-contract'),
+);
 const CONTRACT_ARTIFACT = path.join(CONTRACT_ROOT, 'artifacts', 'contracts', 'NVF.sol', 'NVF.json');
 const HARNESS_ID = `${process.pid}_${Date.now().toString(36)}`;
 const DB_CONTAINER = `nvf-award-api-check-${HARNESS_ID}`.replace(/[^a-zA-Z0-9_.-]/g, '_');
@@ -59,6 +62,7 @@ const resources = {
   hardhatConfigPath: undefined,
   hardhatProjectDir: undefined,
   schemaActivation: undefined,
+  databaseManagedExternally: false,
   backupRestore: undefined,
   receiptTrigger: undefined,
   projectionTriggers: [],
@@ -209,16 +213,24 @@ async function waitFor(label, check, timeout = 60000) {
 }
 
 async function startDatabase() {
-  resources.dbPort = await getFreePort();
-  resources.databaseUrl = `postgres://${DB_USER}:${DB_PASSWORD}@127.0.0.1:${resources.dbPort}/${DB_NAME}`;
-  await runCommand('docker', [
-    'run', '--rm', '--name', DB_CONTAINER, '-d',
-    '-e', `POSTGRES_USER=${DB_USER}`,
-    '-e', `POSTGRES_PASSWORD=${DB_PASSWORD}`,
-    '-e', `POSTGRES_DB=${DB_NAME}`,
-    '-p', `127.0.0.1:${resources.dbPort}:5432`,
-    'postgres:16-alpine',
-  ], { timeoutMs: 60000 });
+  const suppliedDatabaseUrl = process.env.DISPOSABLE_POSTGRES_URL?.trim();
+  if (suppliedDatabaseUrl) {
+    const supplied = parseDisposableDatabaseUrl(suppliedDatabaseUrl);
+    resources.dbPort = supplied.port;
+    resources.databaseUrl = suppliedDatabaseUrl;
+    resources.databaseManagedExternally = true;
+  } else {
+    resources.dbPort = await getFreePort();
+    resources.databaseUrl = `postgres://${DB_USER}:${DB_PASSWORD}@127.0.0.1:${resources.dbPort}/${DB_NAME}`;
+    await runCommand('docker', [
+      'run', '--rm', '--name', DB_CONTAINER, '-d',
+      '-e', `POSTGRES_USER=${DB_USER}`,
+      '-e', `POSTGRES_PASSWORD=${DB_PASSWORD}`,
+      '-e', `POSTGRES_DB=${DB_NAME}`,
+      '-p', `127.0.0.1:${resources.dbPort}:5432`,
+      'postgres:16-alpine',
+    ], { timeoutMs: 60000 });
+  }
   await waitFor('disposable PostgreSQL', async () => {
     const pool = new Pool({ connectionString: resources.databaseUrl, max: 1, connectionTimeoutMillis: 2000 });
     try {
@@ -2947,7 +2959,7 @@ async function cleanup() {
   for (const child of [...children]) {
     await hardStopProcess(child);
   }
-  if (resources.dbPort) {
+  if (resources.dbPort && !resources.databaseManagedExternally) {
     await runCommand('docker', ['rm', '-f', DB_CONTAINER]).catch(() => undefined);
   }
   const expectedHardhatDir = path.join(APP_ROOT, `.codex-hardhat-${HARNESS_ID}`);
