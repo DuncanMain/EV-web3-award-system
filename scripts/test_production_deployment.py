@@ -402,33 +402,35 @@ class DeploymentHelperTests(unittest.TestCase):
                     opener_factory=lambda opener=opener: opener,
                 )
 
-    def test_compose_has_immutable_and_operator_owned_inputs(self):
+    def test_compose_keeps_existing_automatic_entrypoint_and_shared_network(self):
         compose = (ROOT / "compose.production.yaml").read_text(encoding="utf-8")
-        self.assertNotIn(":latest", compose)
-        self.assertIn("IMAGE_REFERENCE:?", compose)
-        self.assertIn("POSTGRES_PASSWORD:?", compose)
-        self.assertIn("DATABASE_URL:?", compose)
-        self.assertIn("POSTGRES_VOLUME_NAME:?", compose)
-        self.assertIn('command: ["node", "dist/api.js"]', compose)
-        self.assertIn("/ingest/health", compose)
-        self.assertNotIn("POSTGRES_PASSWORD: postgres", compose)
+        self.assertIn("image: ghcr.io/zentrixlab/neverflat:latest", compose)
+        self.assertIn("      - .env", compose)
+        self.assertIn("POSTGRES_DB: nvf_award", compose)
+        self.assertIn("POSTGRES_USER: postgres", compose)
+        self.assertIn("POSTGRES_PASSWORD: postgres", compose)
+        self.assertIn("DATABASE_URL: postgres://postgres:postgres@postgres:5432/nvf_award", compose)
+        self.assertIn("shared-proxy:", compose)
+        self.assertNotIn("IMAGE_REFERENCE", compose)
+        self.assertNotIn('command: ["node", "dist/api.js"]', compose)
 
-    def test_workflow_separates_main_publish_from_manual_production_dispatch(self):
+    def test_workflow_keeps_automatic_main_build_and_deploy(self):
         workflow = (ROOT / ".github" / "workflows" / "production.yaml").read_text(encoding="utf-8")
-        self.assertIn("workflow_dispatch:", workflow)
-        self.assertIn("build-and-publish:", workflow)
-        self.assertIn("deploy-production:", workflow)
-        self.assertIn("github.event_name == 'push'", workflow)
-        self.assertIn("github.event_name == 'workflow_dispatch'", workflow)
-        self.assertIn("github.ref == 'refs/heads/main'", workflow)
-        self.assertIn("name: production", workflow)
-        self.assertIn('[[ "$SOURCE_COMMIT" == "$EXPECTED_MAIN_COMMIT" ]]', workflow)
-        self.assertIn("org.opencontainers.image.revision=${{ github.sha }}", workflow)
-        self.assertIn("git merge-base --is-ancestor", workflow)
-        self.assertIn("steps.build.outputs.digest", workflow)
-        self.assertIn("GITHUB_STEP_SUMMARY", workflow)
-        self.assertNotIn("build-and-deploy:", workflow)
-        self.assertNotIn("docker/build-push-action@v6", workflow.split("deploy-production:", 1)[1])
+        self.assertNotIn("workflow_dispatch:", workflow)
+        self.assertIn("build-and-deploy:", workflow)
+        self.assertIn("branches:\n      - main", workflow)
+        self.assertIn("docker/build-push-action@v6", workflow)
+        self.assertIn("appleboy/scp-action@v0.1.7", workflow)
+        self.assertIn("appleboy/ssh-action@v1.2.0", workflow)
+        self.assertIn("docker compose -p neverflat -f compose.production.yaml pull app", workflow)
+        self.assertIn("docker compose -p neverflat -f compose.production.yaml up -d --no-deps app", workflow)
+        self.assertIn("docker network inspect shared-proxy", workflow)
+        self.assertIn("pg_dump --username=postgres --dbname=nvf_award", workflow)
+        self.assertIn("pg_restore --list", workflow)
+        self.assertIn("DOCKER_CONFIG", workflow)
+        self.assertNotIn("docker network create", workflow)
+        self.assertNotIn("--remove-orphans", workflow)
+        self.assertNotIn("APPROVAL_RECORD", workflow)
 
     def test_compose_config_success_and_missing_setting_failure_when_docker_is_available(self):
         docker_candidates = [
@@ -440,39 +442,26 @@ class DeploymentHelperTests(unittest.TestCase):
             self.skipTest("docker is unavailable; text checks still cover the Compose contract")
         with tempfile.TemporaryDirectory() as temp:
             env_path = Path(temp) / ".env"
-            values = dict(
-                VALID_ENV,
-                DEPLOY_ENV_FILE=str(env_path),
-                IMAGE_REFERENCE="ghcr.io/zentrixlab/neverflat@sha256:" + "a" * 64,
-            )
+            compose_path = Path(temp) / "compose.production.yaml"
+            shutil.copy2(ROOT / "compose.production.yaml", compose_path)
+            values = dict(VALID_ENV)
             env_path.write_text(
                 "\n".join(f"{key}={value}" for key, value in values.items()) + "\n",
                 encoding="utf-8",
             )
             compose_host_env = {
                 key: value for key, value in os.environ.items()
-                if key not in (*preflight.COMPOSE_ENV_KEYS, "IMAGE_REFERENCE")
+                if key not in (*preflight.COMPOSE_ENV_KEYS, "IMAGE_REFERENCE", "COMPOSE_FILE", "COMPOSE_ENV_FILE")
             }
             good = subprocess.run([
                 docker, "compose", "--project-name", "neverflat", "--env-file", str(env_path),
-                "-f", str(ROOT / "compose.production.yaml"), "config", "--format", "json",
-            ], capture_output=True, text=True,
-                env=preflight.effective_compose_environment(
-                    values, values["IMAGE_REFERENCE"], compose_host_env
-                ))
+                "-f", str(compose_path), "config", "--format", "json",
+            ], capture_output=True, text=True, env=compose_host_env, cwd=str(Path(temp)))
             self.assertEqual(good.returncode, 0, good.stderr)
-            preflight.validate_effective_compose_config(
-                json.loads(good.stdout), values, values["IMAGE_REFERENCE"]
-            )
-            env_path.write_text(
-                env_path.read_text(encoding="utf-8").replace("POSTGRES_PASSWORD=target-secret\n", ""),
-                encoding="utf-8",
-            )
-            bad = subprocess.run([
-                docker, "compose", "--project-name", "neverflat", "--env-file", str(env_path),
-                "-f", str(ROOT / "compose.production.yaml"), "config", "--quiet",
-            ], capture_output=True, text=True)
-            self.assertNotEqual(bad.returncode, 0)
+            rendered = json.loads(good.stdout)
+            self.assertEqual(rendered["name"], "neverflat")
+            self.assertEqual(rendered["services"]["app"]["image"], "ghcr.io/zentrixlab/neverflat:latest")
+            self.assertIn("shared-proxy", rendered["services"]["app"]["networks"])
 
     def _run_deploy_script(self, temp: str, *, mode: str, current_file: bool = False):
         bash_candidates = [r"C:\Program Files\Git\usr\bin\bash.exe", r"C:\Program Files\Git\bin\bash.exe", shutil.which("bash")]

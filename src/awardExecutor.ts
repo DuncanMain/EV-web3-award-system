@@ -1,5 +1,5 @@
 import { ethers } from 'ethers';
-import { NormalisedSession, AwardMetadata, AwardResult, RawSession, OCPICDRFormat, NonOwningTokenMetadata, CdrProtocol } from './types';
+import { NormalisedSession, AwardMetadata, AwardResult, RawSession, OCPICDRFormat, NonOwningTokenMetadata, CdrProtocol, TransactionDiagnostic } from './types';
 import { calculateAwardTokens, getAwardCalculationContext, getDeduplicationKey, formatLocalTime } from './config/awardRules';
 import { validateAndNormaliseCdr } from './normaliser';
 import { getContract } from './contract';
@@ -7,9 +7,11 @@ import { getUserWalletConfig } from './user/userService';
 import { recordAward, approveUserForSpendingViaFunding } from './database/integration';
 import { TokenOperations } from './database/service';
 import { assetContextMismatch, awardIntentFingerprint, awardOperationKey, canonicalTokenAmount, canonicalTransactionHash, getTokenAssetContext } from './database/tokenOperation';
-import { verifySpendEvidence, SpendEvidenceResult } from './spendEvidence';
+import { verifySpendEvidence, SpendEvidenceFailure, SpendEvidenceResult } from './spendEvidence';
 import { getTreasuryAddress } from './treasury/treasuryConfig';
 import { exceedsTokenOperationCap, MAX_TOKENS_PER_OPERATION } from './config/tokenLimits';
+import { isPreBroadcastTransactionDiagnostic, prepareAndBroadcastTransaction, TransactionReliabilityError, TransactionReliabilityResult } from './transactionReliability';
+import { withNullableRpcReadRetry, withRpcReadRetry } from './rpcProvider';
 
 /**
  * Result of executing an award (from raw CDR through to on-chain execution)
@@ -27,12 +29,35 @@ export interface ExecutionResult {
   operationStatus?: string;
   pending?: boolean;
   requiresReview?: boolean;
+  diagnostic?: TransactionDiagnostic;
+  preflightFailure?: boolean;
+  movementOutcome?: 'unknown' | 'confirmed' | 'no_movement' | 'review';
+  retryable?: boolean;
   duplicate?: boolean;
   stage: 'normalisation' | 'calculation' | 'validation' | 'execution' | 'complete';
 }
 
 function getErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+function awardEvidenceDiagnostic(
+  failureCode: string,
+  txHash?: string,
+  sourceFailure?: SpendEvidenceFailure,
+): TransactionDiagnostic {
+  const pending = failureCode === 'RECEIPT_PENDING'
+    || failureCode === 'PROVIDER_ERROR'
+    || failureCode === 'TRANSACTION_NOT_FOUND';
+  return {
+    stage: 'receipt',
+    category: pending ? 'confirmation_pending' : 'review_required',
+    ...(sourceFailure?.diagnostic || {}),
+    rpcMethod: sourceFailure?.diagnostic?.rpcMethod || 'spendEvidence.read',
+    errorCode: failureCode === 'PROVIDER_ERROR' ? 'RECEIPT_READ_UNAVAILABLE' : failureCode,
+    retryable: sourceFailure?.diagnostic?.retryable ?? pending,
+    ...(txHash ? { savedHash: txHash } : {}),
+  };
 }
 
 function isAwardChargingSessionCollisionError(err: unknown): err is Error & { code?: string } {
@@ -400,23 +425,38 @@ function awardRecoveryIntentMismatch(
  * @param amount - Number of SPARKZ tokens to award
  */
 export async function executeAward(signer: ethers.Signer, to: string, amount: number): Promise<string> {
-  const tx = await submitAward(signer, to, amount);
-  await tx.wait();
-  return tx.hash;
+  const provider = signer.provider;
+  if (!provider) throw new Error('PROVIDER_REQUIRED');
+  const chain = await withRpcReadRetry(() => provider.getNetwork());
+  const tx = await submitAward(signer, to, amount, `compat:award:${to.toLowerCase()}:${amount}:${Date.now()}`, String(chain.chainId), undefined, 'standalone');
+  const receipt = await withNullableRpcReadRetry(() => provider.waitForTransaction(tx.txHash));
+  if (!receipt || Number(receipt.status) !== 1) throw new Error('Award transaction is not confirmed');
+  return tx.txHash;
 }
 
 /** Submit without waiting so the transaction hash can be durably recorded. */
 async function submitAward(
   signer: ethers.Signer,
   to: string,
-  amount: number
-): Promise<ethers.ContractTransactionResponse> {
+  amount: number,
+  operationKey: string,
+  chainId: string | number,
+  tokenContractAddress = undefined as string | undefined,
+  targetType: 'token_operation' | 'standalone' = 'token_operation',
+): Promise<TransactionReliabilityResult> {
   const canonicalAmount = canonicalTokenAmount(amount);
   if (!canonicalAmount || canonicalAmount.units <= 0n) throw new Error('UNSUPPORTED_TOKEN_PRECISION');
-  const contract = getContract(signer);
-  // Use standard ERC20 transfer function: transfer(to, amount)
-  const tx = await contract.transfer(to, ethers.parseUnits(canonicalAmount.decimal, 18));
-  return tx as ethers.ContractTransactionResponse;
+  const contractAddress = tokenContractAddress || getContract(signer).target.toString();
+  const iface = new ethers.Interface(['function transfer(address to,uint256 amount)']);
+  return prepareAndBroadcastTransaction({
+    operationKey,
+    targetType,
+    signer,
+    chainId,
+    to: contractAddress,
+    data: iface.encodeFunctionData('transfer', [to, ethers.parseUnits(canonicalAmount.decimal, 18)]),
+    value: 0n,
+  });
 }
 
 function pendingAwardResult(
@@ -424,7 +464,8 @@ function pendingAwardResult(
   operationStatus: string,
   error: string,
   txHash?: string,
-  requiresReview = false
+  requiresReview = false,
+  diagnostic?: TransactionDiagnostic,
 ): ExecutionResult {
   return {
     success: false,
@@ -436,6 +477,7 @@ function pendingAwardResult(
     operationStatus,
     pending: true,
     requiresReview,
+    ...(diagnostic ? { diagnostic } : {}),
     error,
     stage: 'execution',
   };
@@ -454,6 +496,7 @@ async function projectAwardOperation(
     wallet_address?: string;
     intent_context?: Record<string, unknown> | null;
     movement_outcome?: string | null;
+    diagnostic_context?: TransactionDiagnostic | null;
   },
   awardResult: AwardResult,
   normalised: NormalisedSession,
@@ -467,6 +510,7 @@ async function projectAwardOperation(
 ): Promise<ExecutionResult> {
   const originalAmount = Number(operation.amount);
   const replayMetadata = savedAwardMetadata(operation.intent_context) || awardResult.metadata;
+  const savedDiagnostic = operation.diagnostic_context || undefined;
   const replayAward = {
     ...awardResult,
     amount: originalAmount,
@@ -483,6 +527,7 @@ async function projectAwardOperation(
         'Award evidence or durable failure state requires operator review; no replacement transfer was submitted.',
         operation.tx_hash || undefined,
         true,
+        savedDiagnostic,
       );
     }
     return failedExecutionResult({
@@ -493,6 +538,7 @@ async function projectAwardOperation(
       txHash: operation.tx_hash || undefined,
       operationStatus: 'failed',
       requiresReview: false,
+      diagnostic: savedDiagnostic,
       error: 'Award operation is marked failed; no replacement transfer was submitted.',
       stage: 'execution',
     });
@@ -544,13 +590,21 @@ async function projectAwardOperation(
       operation.status,
       'Token award submission is unresolved and requires operator review before retrying.',
       undefined,
-      true
+      true,
+      savedDiagnostic,
     );
   }
 
   if ((operation.status === 'submitted' || operation.status === 'unknown' || requireFreshEvidence) && verifyEvidence) {
     if (!verifyEvidence) {
-      return pendingAwardResult(replayAward, operation.status, 'Award transaction is awaiting confirmation.', operation.tx_hash);
+      return pendingAwardResult(
+        replayAward,
+        operation.status,
+        'Award transaction is awaiting confirmation.',
+        operation.tx_hash,
+        false,
+        savedDiagnostic,
+      );
     }
     let evidence: SpendEvidenceResult;
     if (preverifiedEvidence) {
@@ -559,11 +613,24 @@ async function projectAwardOperation(
       try {
         evidence = await verifyEvidence();
       } catch (err) {
+        const diagnostic = awardEvidenceDiagnostic('PROVIDER_ERROR', operation.tx_hash);
+        try {
+          await TokenOperations.markUnknown(
+            operation.operation_key,
+            'Award transaction confirmation is pending',
+            diagnostic,
+          );
+        } catch {
+          // Keep the saved operation hash if the diagnostic update is
+          // temporarily unavailable.
+        }
         return pendingAwardResult(
           replayAward,
           operation.status,
           `Award transaction confirmation is pending: ${getErrorMessage(err)}`,
-          operation.tx_hash
+          operation.tx_hash,
+          false,
+          diagnostic,
         );
       }
     }
@@ -571,20 +638,34 @@ async function projectAwardOperation(
       if (evidence.failure.code === 'RECEIPT_PENDING'
         || evidence.failure.code === 'PROVIDER_ERROR'
         || evidence.failure.code === 'TRANSACTION_NOT_FOUND') {
+        const diagnostic = awardEvidenceDiagnostic(evidence.failure.code, operation.tx_hash, evidence.failure);
+        try {
+          await TokenOperations.markUnknown(
+            operation.operation_key,
+            `Award transaction confirmation is pending: ${evidence.failure.message}`,
+            diagnostic,
+          );
+        } catch {
+          // Keep the saved operation hash if the diagnostic update is
+          // temporarily unavailable.
+        }
         return pendingAwardResult(
           replayAward,
           operation.status,
           `Award transaction confirmation is pending: ${evidence.failure.message}`,
           operation.tx_hash,
           evidence.failure.code === 'TRANSACTION_NOT_FOUND',
+          diagnostic,
         );
       }
+      const diagnostic = awardEvidenceDiagnostic(evidence.failure.code, operation.tx_hash, evidence.failure);
       const movementOutcome = evidence.failure.code === 'TRANSACTION_FAILED' ? 'no_movement' : 'review';
       try {
         await TokenOperations.markFailed(
           operation.operation_key,
           `Award evidence rejected: ${evidence.failure.message}`,
           movementOutcome,
+          diagnostic,
         );
       } catch (err) {
         return pendingAwardResult(
@@ -593,6 +674,7 @@ async function projectAwardOperation(
           `Award evidence was rejected, but durable failure state could not be saved: ${getErrorMessage(err)}`,
           operation.tx_hash,
           true,
+          diagnostic,
         );
       }
       if (movementOutcome === 'review') {
@@ -602,6 +684,7 @@ async function projectAwardOperation(
           `Award transfer was not projected because chain evidence requires operator review (${evidence.failure.code}): ${evidence.failure.message}`,
           operation.tx_hash,
           true,
+          diagnostic,
         );
       }
       return failedExecutionResult({
@@ -612,6 +695,7 @@ async function projectAwardOperation(
         txHash: operation.tx_hash,
         operationStatus: 'failed',
         requiresReview: false,
+        diagnostic,
         error: `Award transfer was not projected because chain evidence was rejected (${evidence.failure.code}): ${evidence.failure.message}`,
         stage: 'execution',
       });
@@ -891,22 +975,52 @@ export async function recoverAwardOperation(
     try {
       preverifiedEvidence = await verifyEvidence();
     } catch (err) {
+      const diagnostic = awardEvidenceDiagnostic('PROVIDER_ERROR', operation.tx_hash || undefined);
+      try {
+        await TokenOperations.markUnknown(
+          operation.operation_key,
+          'Award recovery evidence is pending',
+          diagnostic,
+        );
+      } catch {
+        // Preserve the read-only recovery result if the diagnostic update is
+        // temporarily unavailable.
+      }
       return pendingAwardResult(
         awardResult,
         operation.status,
         `AWARD_RECOVERY_CHAIN_READ_UNAVAILABLE: ${getErrorMessage(err)}`,
         operation.tx_hash || undefined,
         false,
+        diagnostic,
       );
     }
     if (!preverifiedEvidence.valid) {
       const requiresReview = !['RECEIPT_PENDING', 'PROVIDER_ERROR'].includes(preverifiedEvidence.failure.code);
+      const diagnostic = awardEvidenceDiagnostic(
+        preverifiedEvidence.failure.code,
+        operation.tx_hash || undefined,
+        preverifiedEvidence.failure,
+      );
+      if (!requiresReview) {
+        try {
+          await TokenOperations.markUnknown(
+            operation.operation_key,
+            `Award recovery evidence is pending: ${preverifiedEvidence.failure.message}`,
+            diagnostic,
+          );
+        } catch {
+          // Preserve the read-only recovery result if the diagnostic update is
+          // temporarily unavailable.
+        }
+      }
       return pendingAwardResult(
         awardResult,
         operation.status,
         `AWARD_RECOVERY_EVIDENCE_BLOCKED: ${preverifiedEvidence.failure.code}`,
         operation.tx_hash || undefined,
         requiresReview,
+        diagnostic,
       );
     }
   }
@@ -1326,12 +1440,87 @@ export async function processAwardFromCDR(
         };
       }
 
-      let tx: ethers.ContractTransactionResponse;
+      let tx: TransactionReliabilityResult;
       try {
-        tx = await submitAward(treasurySigner, userWalletAddress, awardResult.amount);
+        tx = await submitAward(
+          treasurySigner,
+          userWalletAddress,
+          awardResult.amount,
+          operationKey,
+          assetContext.chainId,
+          assetContext.tokenContractAddress,
+        );
       } catch (err) {
+        const diagnostic = err instanceof TransactionReliabilityError ? err.diagnostic : undefined;
+        const savedHash = diagnostic?.savedHash;
+        if (diagnostic && isPreBroadcastTransactionDiagnostic(diagnostic)) {
+          try {
+            await TokenOperations.markPreflightFailed(operationKey, diagnostic.errorCode, diagnostic);
+          } catch {
+            // Keep the operation claim if its no-movement marker cannot be saved.
+          }
+          return {
+            ...pendingAwardResult(
+              awardResult,
+              'failed',
+              `Award transaction preparation failed and no movement was attempted: ${diagnostic.errorCode}`,
+              undefined,
+              false,
+              diagnostic,
+            ),
+            pending: diagnostic.retryable,
+            preflightFailure: true,
+            movementOutcome: 'no_movement',
+            retryable: diagnostic.retryable,
+          };
+        }
+
+        // A provider can accept the raw transaction and lose the response.
+        // Reconcile the exact saved hash once with bounded read-only evidence
+        // before returning an unresolved result. This path never prepares or
+        // broadcasts a replacement transaction.
+        if (savedHash && diagnostic?.stage === 'broadcast' && treasurySigner.provider) {
+          try {
+            const evidence = await verifySpendEvidence({
+              provider: treasurySigner.provider as ethers.Provider,
+              tokenContractAddress: assetContext.tokenContractAddress,
+              chainId: assetContext.chainId,
+              sourceWallet: assetContext.signerAddress,
+              treasuryRecipient: userWalletAddress,
+              amountUnits: ethers.parseUnits(canonicalAmount.decimal, 18),
+              txHash: savedHash,
+            });
+            return projectAwardOperation(
+              {
+                operation_key: operationKey,
+                status: 'unknown',
+                tx_hash: savedHash,
+                amount: canonicalAmount.decimal,
+                wallet_address: userWalletAddress,
+                intent_context: claimIntentContext,
+                diagnostic_context: diagnostic,
+              },
+              awardResult,
+              normalised,
+              rawCDR,
+              walletMode,
+              treasurySigner,
+              async () => evidence,
+              true,
+              false,
+              evidence,
+            );
+          } catch {
+            // Keep the original saved-hash diagnostic if the reconciliation
+            // read itself is unavailable.
+          }
+        }
         try {
-          await TokenOperations.markUnknown(operationKey, `Submission outcome is unknown: ${getErrorMessage(err)}`);
+          await TokenOperations.markUnknown(
+            operationKey,
+            diagnostic?.errorCode || 'CHAIN_OUTCOME_UNKNOWN',
+            diagnostic,
+          );
         } catch {
           // The durable claim remains in place even if the error update is
           // unavailable.  A retry still fails closed on the claim.
@@ -1339,14 +1528,15 @@ export async function processAwardFromCDR(
         return pendingAwardResult(
           awardResult,
           'unknown',
-          `Award submission outcome is unknown and requires operator review: ${getErrorMessage(err)}`,
-          undefined,
-          true
+          `Award submission outcome is unknown and requires operator review: ${diagnostic?.errorCode || 'CHAIN_OUTCOME_UNKNOWN'}`,
+          savedHash,
+          true,
+          diagnostic,
         );
       }
 
       try {
-        await TokenOperations.markSubmitted(operationKey, tx.hash);
+        await TokenOperations.markSubmitted(operationKey, tx.txHash);
       } catch (err) {
         // We know a hash in process memory, but it was not durably saved.  Do
         // not resubmit; retain the claim and surface this for review.
@@ -1359,8 +1549,9 @@ export async function processAwardFromCDR(
           awardResult,
           'unknown',
           `Award was submitted but its transaction hash could not be durably saved; operator review is required.`,
-          tx.hash,
-          true
+          tx.txHash,
+          true,
+          undefined,
         );
       }
 
@@ -1368,7 +1559,7 @@ export async function processAwardFromCDR(
         {
           operation_key: operationKey,
           status: 'submitted',
-          tx_hash: tx.hash,
+          tx_hash: tx.txHash,
           amount: canonicalAmount.decimal,
           wallet_address: userWalletAddress,
           intent_context: claimIntentContext,
@@ -1385,7 +1576,7 @@ export async function processAwardFromCDR(
           sourceWallet: assetContext.signerAddress,
           treasuryRecipient: userWalletAddress,
           amountUnits: ethers.parseUnits(canonicalAmount.decimal, 18),
-          txHash: tx.hash,
+          txHash: tx.txHash,
         }),
         true,
       );

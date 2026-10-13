@@ -9,6 +9,7 @@ import {
 } from './tokenOperationSchema';
 import { up as runStrictMigration015 } from './migrations/015_add_token_operations';
 import { up as runChargingSessionMigration017 } from './migrations/017_add_charging_session_guard';
+import { up as runTransactionReliabilityMigration023 } from './migrations/023_add_transaction_reliability';
 
 function requireDisposableSchemaDatabaseUrl(): string {
   const databaseUrl = process.env.SCHEMA_DATABASE_URL;
@@ -76,6 +77,7 @@ if (process.env.RUN_LOCAL_SCHEMA_TESTS === '1') {
         await trx.raw('create table awards (id uuid default gen_random_uuid(), tx_hash text)');
         await trx.raw('create table spends (id uuid default gen_random_uuid(), tx_hash text)');
         await trx.raw('create table spend_receipts (id uuid default gen_random_uuid(), token_tx_hash text)');
+        await trx.raw('create table spend_reservations (id uuid primary key default gen_random_uuid(), delivered_kwh numeric(20,3))');
         await stageTokenOperationSchema(trx as unknown as Knex);
         await runChargingSessionMigration017(trx as unknown as Knex);
       });
@@ -84,8 +86,10 @@ if (process.env.RUN_LOCAL_SCHEMA_TESTS === '1') {
         await trx.raw('create table awards (id uuid default gen_random_uuid(), tx_hash text)');
         await trx.raw('create table spends (id uuid default gen_random_uuid(), tx_hash text)');
         await trx.raw('create table spend_receipts (id uuid default gen_random_uuid(), token_tx_hash text)');
+        await trx.raw('create table spend_reservations (id uuid primary key default gen_random_uuid(), delivered_kwh numeric(20,3))');
         await runStrictMigration015(trx as unknown as Knex);
         await runChargingSessionMigration017(trx as unknown as Knex);
+        await runTransactionReliabilityMigration023(trx as unknown as Knex);
       });
     });
 

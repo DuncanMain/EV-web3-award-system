@@ -70,6 +70,52 @@ function pushDetail(details: AuditPresentationDetail[], label: string, value: un
   details.push({ label, value: text });
 }
 
+function safeDiagnosticToken(value: unknown, maxLength = 80): string | null {
+  if (typeof value !== 'string' && typeof value !== 'number') return null;
+  const text = String(value).trim();
+  return /^[A-Za-z0-9_.:-]{1,80}$/.test(text) ? text.slice(0, maxLength) : null;
+}
+
+function safeDiagnosticCode(value: unknown): string | null {
+  const text = safeDiagnosticToken(value, 64)?.toUpperCase();
+  return text && /^[A-Z][A-Z0-9_.-]{2,63}$/.test(text) ? text : null;
+}
+
+function safeDiagnosticStage(value: unknown): string | null {
+  const text = typeof value === 'string' ? value.toLowerCase() : '';
+  return [
+    'asset_context',
+    'preflight',
+    'prepare',
+    'persist_hash',
+    'broadcast',
+    'receipt',
+    'projection',
+    'recovery',
+    'validation',
+  ].includes(text) ? text : null;
+}
+
+function safeDiagnosticHash(value: unknown): string | null {
+  return typeof value === 'string' && /^0x[0-9a-fA-F]{64}$/.test(value.trim())
+    ? value.trim().toLowerCase()
+    : null;
+}
+
+function safeRpcFailover(value: unknown): string | null {
+  if (!Array.isArray(value)) return null;
+  const entries = value.flatMap(entry => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
+    const record = entry as Record<string, unknown>;
+    const label = safeDiagnosticToken(record.label, 40);
+    const outcome = record.outcome === 'success' || record.outcome === 'failed' || record.outcome === 'null'
+      ? record.outcome
+      : null;
+    return label && outcome ? [`${label}:${outcome}`] : [];
+  });
+  return entries.length ? entries.join(', ') : null;
+}
+
 function eventType(event: AuditPresentationEvent): string {
   return safeText(event.event_type, 120) || 'unknown';
 }
@@ -135,9 +181,30 @@ function addCorrelationDetails(details: AuditPresentationDetail[], event: AuditP
   pushDetail(details, 'Operation key', data.operationKey);
   pushDetail(details, 'Reservation', data.reservationId);
   pushDetail(details, 'Transaction hash', data.txHash ?? data.transactionHash ?? data.awardTxHash ?? data.reservationTxHash);
+  pushDetail(details, 'Funding transaction hash', safeDiagnosticHash(data.fundingTxHash ?? data.funding_tx_hash));
   pushDetail(details, 'Receipt', data.receiptId);
-  pushDetail(details, 'Stage', data.stage);
+  pushDetail(details, 'Stage', data.stage ?? data.failureStage ?? data.failure_stage);
   pushDetail(details, 'Movement outcome', data.movementOutcome ?? data.movement_outcome);
+  pushDetail(details, 'Error code', safeDiagnosticCode(data.errorCode ?? data.error_code));
+
+  const diagnostic = asRecord(data.diagnostic ?? data.diagnostics ?? data.diagnostic_context);
+  if (diagnostic) {
+    pushDetail(details, 'Failure stage', safeDiagnosticStage(diagnostic.stage));
+    pushDetail(details, 'RPC method', safeDiagnosticToken(diagnostic.rpcMethod));
+    pushDetail(details, 'RPC code', safeDiagnosticToken(diagnostic.rpcCode ?? diagnostic.providerCode, 32));
+    const httpStatus = typeof diagnostic.httpStatus === 'number'
+      && Number.isInteger(diagnostic.httpStatus)
+      && diagnostic.httpStatus >= 100
+      && diagnostic.httpStatus <= 599
+      ? diagnostic.httpStatus
+      : null;
+    pushDetail(details, 'HTTP status', httpStatus);
+    pushDetail(details, 'Provider trace', safeDiagnosticToken(diagnostic.traceId ?? diagnostic.requestId));
+    pushDetail(details, 'RPC endpoint', safeDiagnosticToken(diagnostic.rpcEndpoint ?? diagnostic.endpointLabel, 40));
+    pushDetail(details, 'RPC failover', safeRpcFailover(diagnostic.rpcFailover ?? diagnostic.failover));
+    pushDetail(details, 'Saved transaction hash', safeDiagnosticHash(diagnostic.savedHash));
+    pushDetail(details, 'Nonce', diagnostic.nonce !== undefined && /^(?:0|[1-9]\d*)$/.test(String(diagnostic.nonce)) ? String(diagnostic.nonce) : null);
+  }
 }
 
 function isIdentityValidationEvent(structuredError: boolean): boolean {

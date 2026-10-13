@@ -241,9 +241,85 @@ export interface SpendExecutionResult {
   dbStored?: boolean;
   dbError?: string;
   error?: string;
+  diagnostic?: TransactionDiagnostic;
+  retryable?: boolean;
 }
 
 export interface SpendResult {
   valid: boolean;
   // Additional validation details if needed
+}
+
+/** Stable lifecycle stage used by financial transaction diagnostics. */
+export type TransactionDiagnosticStage =
+  | 'asset_context'
+  | 'preflight'
+  | 'prepare'
+  | 'persist_hash'
+  | 'broadcast'
+  | 'receipt';
+
+/** Allowlisted category suitable for API responses and audit presentation. */
+export type TransactionDiagnosticCategory =
+  | 'rpc_unavailable'
+  | 'confirmation_pending'
+  | 'database_unavailable'
+  | 'review_required'
+  | 'preflight';
+
+/** Sanitised evidence for each RPC endpoint tried by the failover transport. */
+export interface RpcEndpointEvidence {
+  /** Stable configured label such as `primary` or `fallback-1`; never a URL. */
+  label: string;
+  outcome: 'success' | 'failed' | 'null';
+  providerCode?: string;
+  rpcCode?: string | number;
+  httpStatus?: number;
+  traceId?: string;
+}
+
+/**
+ * Sanitised, JSON-serialisable evidence about a financial operation failure.
+ * Raw provider bodies, URLs, signed bytes, and private key material never
+ * belong in this shape.
+ */
+export interface TransactionDiagnostic {
+  stage: TransactionDiagnosticStage;
+  category?: TransactionDiagnosticCategory;
+  rpcMethod?: string;
+  providerCode?: string;
+  rpcCode?: string | number;
+  httpStatus?: number;
+  traceId?: string;
+  /** Endpoint selected for the final attempt, with no URL or credential. */
+  rpcEndpoint?: string;
+  /** Sanitised ordered endpoint evidence when failover was attempted. */
+  rpcFailover?: RpcEndpointEvidence[];
+  errorCode: string;
+  retryable: boolean;
+  savedHash?: string;
+  nonce?: number;
+}
+
+/** Exact fields needed to reproduce and reconcile one signed transaction. */
+export interface PreparedTransactionContext {
+  chainId: string;
+  signerAddress: string;
+  nonce: number;
+  to: string;
+  data?: string;
+  value: string;
+  gasLimit?: string;
+  gasPrice?: string;
+  maxFeePerGas?: string;
+  maxPriorityFeePerGas?: string;
+  type?: number;
+  accessList?: Array<[string, string[]]>;
+}
+
+/** In-memory result returned after durable pre-broadcast persistence. */
+export interface PreparedTreasuryTransaction {
+  txHash: string;
+  rawTransaction: string;
+  context: PreparedTransactionContext;
 }

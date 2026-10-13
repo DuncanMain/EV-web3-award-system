@@ -1,562 +1,155 @@
 # NVF Award Core deployment and operations
 
-This document is the operator runbook for the checked-in NVF Award Core
-container and its PostgreSQL state. It describes the current repository
-workflow and the gates that remain before a production rollout.
+This runbook describes the checked-in Neverflat deployment flow and the
+target facts that still belong to the operator. A push to main runs one
+automatic build-and-deploy workflow. The workflow does not use a manual
+release dispatch or a repository approval file.
 
 ## Deployment status
 
-The deployed main baseline is merge commit
-`87b35bdf4e0d9bde7b4d8c4cbb93ab459b0f321a` (PR #6, 6 October 2026). GitHub
-recorded successful [Deploy Neverflat #45](https://github.com/ZentrixLab/neverflat/actions/runs/37457660589)
-and [Mirror Repositories #33](https://github.com/ZentrixLab/neverflat/actions/runs/37457660702).
-The immutable candidate commit `5a3b4386d71d97d568942dc5d705f4f438c6133d`
-had the same released tree `d5382d1eff4dadb8b189ae1869095418637e6e0d` as
-that merge. Those workflow results do not record the built image digest or
-post-start target health/readiness, backup, or migration acceptance evidence.
-Current source changes require the same operational gates and a separate target
-acceptance record before production rollout.
+The current main baseline is merge commit
+62dda34ecd17bc2001434dc90f259862a9d47d1f. GitHub's latest successful
+automatic deployment is run 37936154795 on 9 October 2026. This review does not
+claim that this candidate has been deployed. Local verification uses disposable
+resources and never supplies live credentials or production data.
 
-The local verification used disposable PostgreSQL, Hardhat 31337, and API
-processes. It did not use the live server, Polygon Amoy, external providers,
-the active dashboard database, or production credentials.
+## Automatic main-push deployment
 
-See the [dated release notes](docs/RELEASE_NOTES_2026-09-30.md) and the
-[local release verification record](docs/RELEASE_VERIFICATION_2026-10-01.md)
-for historical local evidence. Those documents do not fill in the
-target-specific facts listed below.
+The production workflow is limited to a push on main and keeps a single serial
+build-and-deploy job. It checks out the commit, builds the existing Dockerfile,
+and pushes the existing latest and commit tags to GHCR. The Dockerfile
+entrypoint remains:
 
-## What the checked-in deployment actually does
-
-The checked-in `Dockerfile` builds the backend with Node 22 Alpine, builds the
-frontend, installs production dependencies in a runtime image, and has this
-default local image command:
-
-```text
+~~~text
 node dist/database/migrate.js && node dist/api.js
-```
+~~~
 
-That command runs the complete migration chain before the API listens. It is
-the normal local Docker behavior and is not the production rollout path.
-Production Compose overrides it with `node dist/api.js`, so the target
-migration is a separately reviewed operator phase before the API is started.
-Do not assume that a container restart is a safe schema upgrade.
+The image therefore applies the repository migration chain before the API
+listens. The production Compose file keeps the existing database and app
+definition; the app-only command below does not start or recreate PostgreSQL.
 
-`compose.production.yaml` receives an immutable
-`ghcr.io/zentrixlab/neverflat@sha256:...` reference from the workflow. It runs
-PostgreSQL 17 as `neverflat-db`, binds the app to `127.0.0.1:3005`, joins the
-external `shared-proxy` network, and uses the operator-owned `DATABASE_URL`
-and PostgreSQL settings from the target `.env`. The named volume and Compose
-project are explicit so a staged release path cannot create a fresh database.
-The app healthcheck validates the actual `{status: "ok", timestamp}` response
-from `/ingest/health`.
+Before copying compose.production.yaml, the workflow makes a read-only SSH
+check. /root/neverflat must resolve to the canonical directory, .env must
+exist inside it, the existing neverflat-db labels must be neverflat|postgres,
+and any existing neverflat-app must be labelled neverflat|app. The existing
+Compose destination must be a regular path inside the canonical directory.
+The check also verifies the Compose plugin and reads the existing shared-proxy
+network; it never creates that network.
 
-The [production GitHub Actions workflow](.github/workflows/production.yaml) is
-restricted to `ZentrixLab/neverflat`. A `main` push builds and publishes the
-immutable image only. A separate `workflow_dispatch` from `main` uses the
-`production` environment reference and consumes an already-built source
-commit and exact digest, stages the Compose and helper files, and invokes the
-bounded rollout helper. Required environment reviewers and branch protections
-are repository settings that must be configured and verified separately. The
-dispatch requires the source commit to equal the current `main` revision and
-the target-owned release record described below is required. Older-image
-rollback is a separate, schema-reviewed runbook decision. Any environment
-approval is an additional control, not evidence that the database backup,
-restore, quiescence, migration, or preservation work occurred.
-GitHub Actions and the remote helper both serialize rollouts; an active rollout
-is allowed to finish. The workflow does not write GitHub secrets into the
-operator `.env` or create the target release record.
+The deploy step validates the forwarded full source SHA, rechecks the
+canonical .env, compose file, database, app labels, and shared-proxy before
+removing legacy compose names or changing the target. It then creates a
+mode-600 private dump of nvf_award from neverflat-db using the postgres role,
+and runs pg_restore --list against that dump before pulling or launching the
+new app. GHCR login uses a temporary DOCKER_CONFIG directory below
+/root/neverflat. Any existing /root/.docker/cli-plugins directory is made
+discoverable through that temporary config; the owned temporary directory is
+removed on exit and shared Docker credentials are left alone. The current
+secret resolver remains in the automatic workflow and its values are passed
+only to the target-side process.
 
-## Target facts that must be resolved before deployment
+After the backup is verified, the service operations are explicitly scoped to
+Neverflat:
 
-Record these values in the deployment record without putting secrets in the
-repository or logs:
+~~~bash
+docker compose -p neverflat -f compose.production.yaml pull app
+docker compose -p neverflat -f compose.production.yaml up -d --no-deps app
+~~~
 
-- approved backend commit and image digest;
-- target host, SSH/secret-manager owner, `shared-proxy` route, and maintenance
-  window;
-- PostgreSQL host, port, database, role, server version, TLS policy, and the
-  backup/restore owner;
-- target `POLYGON_RPC_URL`, `CHAIN_ID` (Polygon Amoy is 80002 for the normal
-  test deployment), `TOKEN_CONTRACT_ADDRESS`, and `TREASURY_ADDRESS`;
-- the provisioned `TREASURY_SIGNER_KEY` or `TREASURY_SIGNER_KEY_FILE` source;
-- separate `API_KEY` and `INGEST_API_KEY` values, admin credentials,
-  `USER_IDENTITY_HEADER`, CORS/proxy settings, and alert webhook ownership;
-- the provisioned test eMAID and partner smoke-test payloads; and
-- the reviewed target migration procedure and its rollback/recovery decision.
+The workflow then polls the loopback /ingest/health endpoint with bounded
+timeouts. A failed health check fails the job without running a financial or
+admin smoke test. The workflow does not use --remove-orphans, start or
+recreate the database, mutate a different Compose project, or print the
+database dump or secret values. The backup is retained below
+/root/neverflat/backups for the target operator.
 
-The operator `.env` must already contain the target values before deployment:
-`COMPOSE_PROJECT_NAME=neverflat`, `DEPLOY_ENV_FILE` pointing to that same
-file, `POSTGRES_VOLUME_NAME` matching the existing `neverflat-db` data volume,
-`POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, and a matching
-`DATABASE_URL`. It must also provide `API_KEY` (or `BEIA_API_KEY`),
-`INGEST_API_KEY`, `ADMIN_EMAIL`, and `ADMIN_PASSWORD`. The preflight compares
-the database role, database, password, Compose project, and mounted volume with
-the existing container before the staged Compose file is used. Do not rotate or
-rewrite these values as part of a release.
+## Target facts and invariants
 
-The preflight requires these settings to be present and consistent with the
-existing target; it does not reject a nonempty credential based only on how the
-value looks. If an existing credential is judged weak, record that as an
-operator-owned hardening follow-up through the target secret process. This
-release never rotates or rewrites a credential automatically.
+Record these values through the target owner without placing secrets in Git or
+workflow logs:
 
-`DATABASE_URL` must resolve to the Compose `postgres` service on port `5432`;
-query parameters that override host, port, user, password, or database name
-are rejected. The preflight also compares any exported Compose input in the
-remote shell with the operator file before rendering the staged configuration.
-A stale host override fails before registry login, network creation, pull, or
-service start, so the configuration rendered by preflight is the one the
-rollout uses.
+- target host, proxy route, maintenance window, and secret owner;
+- PostgreSQL server, database, role, volume, backup location, and restore owner;
+- POLYGON_RPC_URL, optional same-chain fallback endpoints, CHAIN_ID, token
+  contract, and treasury address;
+- treasury signer source, API/admin credentials, identity header, and alert
+  ownership; and
+- the provisioned test eMAID and partner smoke-test payloads.
 
-## Target-owned release gate
+Keep the existing eMAID-to-wallet derivation salt, treasury identity, token
+contract, chain, signer, balances, awards, spends, receipts, reservations,
+operation rows, and linked-wallet mappings. Do not relink wallets, reset the
+database, delete history, or replay a financial operation because an app
+deployment was retried.
 
-Before a rollout, the target operator must create a per-release JSON record at
-`/root/neverflat/approvals/<source-commit>.json`. Keep it on the target outside
-the checkout and do not have GitHub Actions or the checkout create it. The
-preflight reads the record before registry login, network creation, image pull,
-or service start and compares it with the existing database container and the
-rendered Compose configuration. A GitHub `production` environment review, where
-configured, does not replace this record.
+The checked-in Compose file uses the existing .env, PostgreSQL database
+nvf_award, role postgres, named volume pgdata, app container neverflat-app,
+database container neverflat-db, and external network shared-proxy. The app
+binds to 127.0.0.1:3005; PostgreSQL is not published. The existing target
+environment and secret resolver remain the source of truth.
 
-The record has this shape; the values are examples and must be replaced with
-the actual target identity:
+## Migration and backup boundary
 
-```json
-{
-  "schemaVersion": 1,
-  "sourceCommit": "<40-character-source-sha>",
-  "imageReference": "ghcr.io/zentrixlab/neverflat@sha256:<64-hex-digest>",
-  "target": {
-    "composeProjectName": "neverflat",
-    "postgresContainerName": "neverflat-db",
-    "postgresVolumeName": "<existing-volume-name>",
-    "databaseHost": "postgres",
-    "databasePort": 5432,
-    "databaseName": "<existing-database>",
-    "databaseUser": "<existing-role>"
-  },
-  "evidence": {
-    "backupVerified": true,
-    "restoreVerified": true,
-    "writersQuiesced": true,
-    "migrationReviewed": true,
-    "migrationApplied": true,
-    "preservationVerified": true
-  },
-  "approvedBy": "<target-operator>",
-  "approvedAt": "2026-10-08T12:00:00Z",
-  "expiresAt": "2026-10-08T20:00:00Z"
-}
-```
+The automatic image entrypoint runs migrations before the API starts. The
+workflow takes the target-local pg_dump backup and verifies its readable
+manifest before compose up; it does not run a second database creation or a
+loopback migration runner. A target owner must still confirm that the existing
+data is compatible with migrations 001 through 017, active-wallet migration
+022, and transaction-reliability migration 023 before accepting the new app.
+Migration 023 covers durable prepared context, approval funding attempts,
+immutable settlement context, the treasury lease table, and nonce uniqueness.
 
-The helper validates the full source SHA, exact image digest, project and
-database identity, all six boolean attestations, and a UTC approval window that
-has not expired and is no longer than 24 hours. These fields record the
-operator's backup, restore, quiescence, migration, and preservation sign-offs;
-the helper does not claim to repeat a physical backup or restore. The target
-database container must already be running and healthy. The helper then runs
-read-only checks for migration 008's scoped UID/wallet uniqueness and absent
-global UID constraint, migration 017's charging-session column and unique
-index, migration 016's reward-policy table and row, and migration 022's active
-wallet column and unique index. Missing, malformed, stale, mismatched, or
-incomplete records fail closed without printing their contents.
+For any target migration decision, quiesce writers through the target's normal
+maintenance process, retain the verified backup, and restore-test a disposable
+copy. Do not use compose down -v, DROP DATABASE, table cleanup, or
+financial-row edits as deployment steps. The workflow backup is evidence of
+the target state; it does not authorize a restore over the live database.
 
-The existing `neverflat-app` container must already be absent or stopped before
-preflight. A running or restarting app is rejected before registry login,
-network creation, pull, or service start; preflight never stops it
-automatically. This makes the API-stop part of the reviewed migration and
-writer-quiescence phase an enforced rollout precondition.
+## RPC and application runtime
 
-Do not invent a target value from the local defaults. In particular, preserve
-the existing eMAID-to-wallet derivation salt, treasury identity, token
-contract, chain, and signer unless a separately approved migration covers the
-impact.
+The runtime accepts the configured RPC primary and same-chain fallback
+described in API.md. The default Polygon Amoy fallback is the verified
+PublicNode endpoint; a custom primary requires an explicit same-chain backup.
+Reads and preparation calls use bounded retries. A raw transaction may fail
+over only with the exact already-signed bytes; the service never re-signs,
+allocates a new nonce, or creates a replacement during provider failover.
+Operation diagnostics retain the original identity and distinguish dependency
+failure, ambiguous broadcast, and confirmation pending states.
 
-## Identity, wallet, signer, and token invariants
+Use the API and admin evidence endpoints for diagnosis. Do not use a real CDR,
+spend, or reconciliation write as a generic deployment smoke test; those calls
+can create reservations or financial side effects.
 
-The ownership value is the charging-contract **eMAID**. Wire compatibility
-names such as `contract_id`, `EvcoID`, `contractId`, `x-contract-id`, and
-`uid` remain in routes or database columns, but they carry the eMAID value.
-An RFID/token UID is not an ownership value. Do not rename or remap existing
-users during deployment.
+## Local verification
 
-Keep these values identical to the existing target unless a separate migration
-has been approved:
+The focused offline checks are:
 
-- `USER_ADDRESS_DERIVATION_SALT` — changing it changes deterministic wallet
-  addresses;
-- `TREASURY_ADDRESS` and the corresponding signer secret or secret file;
-- `TOKEN_CONTRACT_ADDRESS` and `CHAIN_ID`;
-- `POLYGON_RPC_URL`; and
-- existing eMAID, wallet, balance, award, spend, receipt, reservation, and
-  operation rows.
-
-For a pilot or production target, explicitly set `NODE_ENV=production`, keep
-`ENABLE_TEST_UID_LOOKUP=false`, require `API_KEY`, `INGEST_API_KEY`,
-`ADMIN_EMAIL`, and `ADMIN_PASSWORD`, and keep the treasury signer out of the
-image and source tree. The service does not support an empty production API
-key as a safe mode. Rotate keys only through the target's planned secret and
-partner-change process; this runbook does not authorize an uncoordinated key
-rotation.
-
-## Preflight checks
-
-Use the recorded 30 September results when source, dependencies, and
-configuration are unchanged. Rerun only the affected checks after a later
-change. If the candidate or dependency tree changes, the source-supported
-full sequence is:
-
-```powershell
-git rev-parse HEAD
-git status --short
-npm.cmd ci --ignore-scripts --no-audit
-npm.cmd run build
-npm.cmd test -- --runInBand
-```
-
-Also run the repository's relevant frontend and package checks when those
-artifacts are part of the release:
-
-```powershell
-Push-Location frontend
-npm.cmd run build
-npx.cmd tsc --noEmit --target es2020 --lib dom,dom.iterable,esnext --allowJs false --esModuleInterop --allowSyntheticDefaultImports --strict --forceConsistentCasingInFileNames --noFallthroughCasesInSwitch --module esnext --moduleResolution node --resolveJsonModule --isolatedModules --jsx react-jsx src/AdminApp.tsx src/AdminDashboard.tsx src/App.tsx src/AuthGate.tsx src/index.tsx src/apiConfig.ts
-Pop-Location
-
-Push-Location packages/sparkz-charging-card
-npm.cmd test
-npm.cmd pack --dry-run
-Pop-Location
-```
-
-The 1 October 2026 local evidence recorded 321 backend tests passed with 6
-opt-in tests skipped, 15 isolated PostgreSQL tests passed, 178 shared HTTP
-contract cases passed, and 199 admin HTTP cases passed. Frontend and charging-card results
-are summarised in the [local release verification record](docs/RELEASE_VERIFICATION_2026-10-01.md).
-The package remains an artifact handoff with no registry publication claim. If
-source, dependencies, or configuration change after that evidence, rerun the
-affected checks before assigning a release record.
-
-The 6 October 2026 source-verification record reported Node 22 backend
-verification with 19 Jest suites, 327 tests, 12 opt-in tests skipped, and 21
-real PostgreSQL integration checks. It also recorded 12 charging-card tests,
-frontend/package audits, a portable Node 22 `v22.23.3` probe, and a combined
-Node 22.23.3 root/frontend/Sparkz `npm run ci:check` with zero audit findings.
-The 8 October 2026 verification used the official portable Node `v22.23.3`.
-The full `npm.cmd run ci:check` passed: root, frontend, and Sparkz audits
-reported 0 vulnerabilities, the backend had 19 suites pass with 3 skipped and
-329 tests pass with 20 opt-in tests skipped, and the frontend and Sparkz builds
-passed. A fresh maintained PostgreSQL 16.15 runner passed the full migrations
-and compiled migration-entrypoint proof, plus 29 schema, policy, and wallet
-tests, including 14 wallet tests. The offline deployment helper suite passed
-25 tests, including offline Compose checks. These results do not provide live
-post-start acceptance evidence.
-
-The isolated deployment helper checks are run with:
-
-```powershell
+~~~powershell
 python scripts/test_production_deployment.py
-docker compose --project-name neverflat --env-file <operator-env> `
-  -f compose.production.yaml config --quiet
-```
+python scripts/test_production_workflow.py
+~~~
 
-On a host without a `python` alias, use its installed Python 3 executable. The
-Compose command only renders configuration; it does not start services or
-contact a target.
+The first suite covers the existing deployment helpers. The second executes
+the workflow's extracted SSH scripts against fake Docker/PostgreSQL commands
+and verifies wrong project/service, symlink, backup ordering, temporary Docker
+config cleanup, health polling, and app-only Compose operations. These checks
+do not contact a server, registry, provider, or production database.
 
-## Backup, restore, and preservation gate
-
-Use a target-approved maintenance window and stop or quiesce every writer
-before taking the release baseline. This includes API ingestion, manual spends,
-reservation settlement, admin policy writes, scheduled jobs, and any partner
-replay. Record the time and the writer-quiescence evidence.
-
-Before any schema or image change:
-
-1. Take a fresh physical PostgreSQL backup using the target-approved backup
-   mechanism. Where the target permits the PostgreSQL tools, the evidence must
-   include the backup manifest and a successful `pg_verifybackup` result.
-2. Copy or retain the verified backup in the approved protected location and
-   record its path, manifest checksum, database identity, server version, and
-   timestamp. Do not print credentials in the release record.
-3. Restore the backup into an isolated disposable database or volume and run
-   the restore checks there. Never restore over the live database as a test.
-4. Capture a deterministic before snapshot for the financial and identity
-   tables. At minimum include `users`, `balances`, `awards`, `spends`,
-   `spend_receipts`, `token_operations`, `approval_preparations`,
-   `spend_reservations`, `reward_policy`, `reconciliation_reports`, and the
-   linked-wallet tables where present. Record row counts and content digests;
-   do not publish raw user rows or secrets.
-5. Repeat the same snapshot after the migration and smoke checks. Explain
-   every expected additive row or audit event. Any unexpected financial,
-   wallet, eMAID, hash, or policy change is a release blocker.
-
-The local backup/restore evidence proves this procedure against disposable
-resources only. It is not a production restore rehearsal. Do not run
-`docker compose down -v`, `npm run db:reset`, `DROP DATABASE`, table drops, or
-catalog edits on a target database.
-
-## Migration gate
-
-The normal `npm run db:migrate` command compiles the source and runs
-`dist/database/migrate.js`, which attempts migrations 001 through 017 and the
-standalone active-wallet migration 022. The default Dockerfile entrypoint does
-the same automatically for local use. Production Compose overrides that
-entrypoint with `node dist/api.js`; a target with historical rows must complete
-the target-specific plan against a restored copy before the production API is
-started.
-
-The repository contains three scoped runners used for local evidence:
-
-- `npm run db:stage-token-operations` stages the additive token-operation
-  schema and checks a caller-provided verified backup marker;
-- `npm run db:apply-reward-policy` applies reward-policy migration 016; and
-- after `npm.cmd run build`,
-  `node dist/database/applyChargingSessionGuardMigration.js` applies the
-  charging-session guard migration 017.
-
-These runners deliberately accept only the existing loopback local database
-`nvf_award` on port `55432`, and require `NVF_TOKEN_SCHEMA_BACKUP_PATH` plus
-`NVF_TOKEN_SCHEMA_BACKUP_VERIFIED=pg_verifybackup`. They are local review
-tools. **Do not copy them, their loopback checks, or their local backup marker
-into production.** Production needs a separately reviewed target migration
-procedure that validates duplicate `(uid, lower(wallet_address))` pairs,
-confirms migration 008's scoped uniqueness and removal of the obsolete global
-UID constraint, handles migration 015 duplicate transaction hashes, policy 016,
-guard 017, and standalone migration 022 according to the actual target schema
-and data. Migration 022 is the standalone active-wallet fix; the campaign's
-reserved 018–021 range remains outside this release. The target-specific
-procedure and migration result are not yet recorded here.
-
-The source audit also requires two focused acceptance checks for the follow-up
-fixes: restart/idempotence must validate duplicate `(uid,
-lower(wallet_address))` pairs, leave migration 008's scoped UID/wallet index,
-and avoid restoring the obsolete global UID constraint; switching a UID
-between wallets must preserve historical rows while reads use the explicit
-active selection. These are source and disposable-check requirements; no live
-production impact is asserted here.
-
-The safe release boundary is therefore:
-
-1. freeze the candidate commit and immutable image digest;
-2. quiesce writers, take and verify the target backup, restore-test a copy, and
-   capture the financial/eMAID baseline;
-3. apply only the reviewed target migration steps while the API is stopped;
-4. verify schema/index readiness and compare the database preservation
-   snapshot;
-5. start the approved image with the production Compose API-only command after
-   the reviewed migration and read-only schema checks; and
-6. perform health, readiness, identity, and reconciliation checks before
-   reopening writes. `GET` reconciliation reads are read-only. A new
-   `POST /admin/reconciliation/run` writes a reconciliation report and audit
-   event, but does not transfer tokens; run it only as an explicitly approved
-   controlled operational check after the read-only checks.
-
-If step 3 is not available, stop. Do not deploy the current image and hope that
-an implicit startup migration resolves historical data.
-
-## Source-supported container rollout
-
-After the backup and migration gates pass, the checked-in production workflow
-uses the following shape. Run it only with an approved target, immutable image
-selection, and change record; the commands were not run against a live target
-by this review:
-
-The `main` build job writes the source SHA and exact image digest to its GitHub
-Actions step summary under **Immutable production image**. Copy that digest into
-the manual dispatch `image_reference` input; do not substitute a tag or
-`:latest`.
-
-```bash
-python3 /root/neverflat/releases/<commit>/scripts/preflight_production.py \
-  --deploy-dir /root/neverflat \
-  --env-file /root/neverflat/.env \
-  --compose-file /root/neverflat/releases/<commit>/compose.production.yaml \
-  --image-reference ghcr.io/zentrixlab/neverflat@sha256:<64-hex-digest> \
-  --source-commit <40-character-source-sha> \
-  --approval-record /root/neverflat/approvals/<commit>.json
-IMAGE_REFERENCE=ghcr.io/zentrixlab/neverflat@sha256:<64-hex-digest> \
-  SOURCE_COMMIT=<40-character-source-sha> \
-  APPROVAL_RECORD=/root/neverflat/approvals/<commit>.json \
-  DEPLOY_DIR=/root/neverflat \
-  RELEASE_DIR=/root/neverflat/releases/<commit> \
-  /root/neverflat/releases/<commit>/scripts/deploy_production.sh
-```
-
-The helper takes a blocking deployment lock, revalidates the staged Compose
-file and existing PostgreSQL volume, pulls the exact digest, and runs
-`docker compose ... up -d --no-deps app`. It never recreates or starts
-PostgreSQL as part of an application rollout. It verifies the running app image
-and checks the pulled image's `org.opencontainers.image.revision` label against
-the source commit before startup, then repeats the read-only gate and stopped-app
-preflight immediately before `up`. It then waits for both the healthcheck and
-the actual health/readiness response. It records only the immutable image
-reference in `.deployed-image` and
-`.previous-image`; credentials remain in the operator environment and are never
-written to those records. Do not use PM2, an untracked process manager, or
-speculative queues as part of this release.
-Durable operation claims and database locking are part of the application
-contract and were exercised in single-instance local evidence. Multi-replica
-deployment, in-memory admin session behavior across replicas, rate limiting,
-and cross-replica operational coordination have not been validated here; do
-not introduce them as an unreviewed scaling change.
-
-The helper's bounded acceptance check uses the actual service responses. Manual
-invocation requires `GHCR_USER` and `GHCR_TOKEN` to be injected into the
-protected process environment by the approved secret manager before running
-the deploy script. Do not type the token into shell history or pass it as a
-command-line argument; the script supplies it to `docker login` through
-standard input and never records it.
-
-A cleanup trap is installed before the first attempted app start. A pull or
-other pre-launch failure leaves the existing app untouched. If startup, image
-verification, health, readiness, or an interrupt rejects the app started or
-restarted by this rollout, the helper stops that app by its container ID,
-including when Compose reused the prior container ID. It never runs `docker
-compose down`, stops PostgreSQL, removes a volume, or rewrites the accepted
-image records/current pointer. If the bounded 10-second cleanup stop itself
-fails, the helper reports cleanup as incomplete and returns failure so the
-target can be handled explicitly.
-
-The acceptance helper uses the actual service responses:
-
-```bash
-python3 /root/neverflat/releases/<commit>/scripts/check_production_acceptance.py \
-  --base-url http://127.0.0.1:3005 \
-  --env-file /root/neverflat/.env
-```
-
-`GET /ingest/health` must return HTTP 200 with `status: "ok"` and an ISO
-timestamp. Admin login must return a token, and `GET /admin/readiness` must
-return HTTP 200 with `status` `ready` or `ready_with_warnings`, zero failed
-checks, matching warning/check details, and passing `database`,
-`token_operation_schema`, and `reward_policy` checks. `ready` must have zero
-warnings; `ready_with_warnings` must have at least one matching warning.
-
-Do not expose PostgreSQL publicly. Keep the app bound behind the approved
-proxy, use HTTPS at the proxy, and check that the proxy forwards the intended
-identity header without allowing a caller to choose another eMAID.
-
-## Post-start acceptance
-
-Run these checks with target credentials held outside shell history and logs:
-
-- health and OpenAPI return the expected status and schema;
-- admin login works with the configured email and password, logout invalidates
-  the bearer session, and `/admin/readiness` reports every failure or warning
-  explicitly;
-- read-only `/admin/rules`, `/admin/off-peak`, `/admin/audit`,
-  `/admin/operations`, `/admin/reconciliation`, and `/admin/evidence-pack`
-  calls return safe, allowlisted data;
-- a provisioned test eMAID resolves to the same existing wallet address and
-  balance as the preflight snapshot;
-- `POST /ingest/cdr/preview` accepts representative OCPI and OICP payloads,
-  reports protocol/source/eMAID provenance, and rejects UID-only or conflicting
-  identity records;
-- `GET /admin/reconciliation` matches the approved baseline. A controlled
-  `POST /admin/reconciliation/run` may be run only when explicitly approved;
-  it writes a reconciliation report and audit event but does not transfer
-  tokens; and
-- the proxy, alert target, RPC chain ID, token contract, signer address, and
-  treasury gas status match the release record.
-
-Do not use a real `POST /ingest/cdr` or spend request as a generic smoke test.
-Those endpoints can create wallets, reservations, database rows, or blockchain
-transactions. Use a separately approved provisioned test eMAID and fixture if
-financial movement is part of acceptance, and record every hash. A balance
-comparison alone does not prove ownership of an unrecorded transfer.
+The full application, frontend, package, and disposable PostgreSQL evidence is
+kept under the dated diagnostic output used for the corresponding review. A
+successful local check does not prove target credentials, target data
+preservation, partner delivery, or live chain state.
 
 ## Rollback and incident handling
 
-If the container fails before writes resume, stop the new app, retain its logs,
-and use the previously approved image digest only if it is compatible with the
-schema already applied. If schema compatibility is uncertain, keep writers
-quiescent and use the target recovery plan against an isolated restore.
+If the new app fails health or readiness, retain the image, logs, backup
+manifest, migration output, and RPC/transaction evidence. Stop the app through
+the target's normal operator process and use a compatible image only after
+checking schema and pending financial operations. Do not roll back the
+database over chain activity, delete audit rows, rewrite wallet mappings,
+submit a compensating transfer, or blindly replay an unknown operation.
 
-Do not roll back by reversing financial rows, deleting audit history, changing
-the eMAID derivation salt, replaying awards/spends, or submitting a compensating
-blockchain transaction. Migration 022 retains historical wallet rows and
-persists the active selection, so a rollback to an older image must review
-active-wallet selection and pending financial operations. Do not automatically
-drop that preference or rewrite wallet mappings or financial rows. Do not
-restore a backup over the target until the incident owner has reconciled
-database state, on-chain hashes, reservations, receipts, and balances. A
-deployment rollback is an application-version decision; it is not permission
-to rewind financial history.
-
-The deployed baseline's startup chain can reapply migration 005's global UID
-uniqueness rule. With multiple wallet rows for one UID, that older image can
-fail startup on duplicate data; if it starts, it does not use `is_active` and
-selects the oldest row. An older rollback target therefore requires reviewed
-schema/data compatibility and a migration-safe image. Never delete or
-deduplicate wallet/history rows to make it start; restoring data remains an
-explicit operator decision with pending token-operation reconciliation.
-
-Preserve the failed image digest, migration output, backup manifest, before and
-after digests, API logs, readiness response, and chain/provider evidence. Open
-the target-specific recovery decision before reopening writers.
-
-## Security and operational checklist
-
-- [ ] Candidate commit, immutable image digest, package manifest, and approver
-      recorded; no value is fabricated while these are pending.
-- [ ] Target host, proxy route, PostgreSQL role/database/TLS, and maintenance
-      window recorded.
-- [ ] `API_KEY`, `INGEST_API_KEY`, `ADMIN_EMAIL`, and `ADMIN_PASSWORD` are
-      present and separate where their roles differ; no default or empty
-      production key is used.
-- [ ] `ADMIN_ALERT_WEBHOOK_URL` is owned and reachable through the approved
-      network path; alert delivery is checked without exposing webhook data.
-- [ ] `TREASURY_SIGNER_KEY` is supplied through the approved secret mechanism;
-      it is absent from images, source, logs, and shell history.
-- [ ] `USER_ADDRESS_DERIVATION_SALT`, treasury address, token contract, chain,
-      RPC, and existing eMAID/wallet mapping are preserved.
-- [ ] `ENABLE_TEST_UID_LOOKUP=false` is explicit for pilot/production.
-- [ ] HTTPS, proxy identity forwarding, PostgreSQL firewalling, and log
-      redaction are checked.
-- [ ] Fresh physical backup, `pg_verifybackup`, isolated restore, and before
-      digests are recorded.
-- [ ] Target migration procedure validates duplicate `(uid,
-      lower(wallet_address))` pairs, preserves migration 008's scoped
-      uniqueness while removing the obsolete global UID constraint, and covers
-      migrations 015/016/017/022; campaign migrations 018–021 are outside this
-      release.
-- [ ] Writers are quiesced during schema work; no clean/reset/drop operation
-      is used.
-- [ ] Post-start health, readiness, read-only admin, preview, reconciliation,
-      and preservation checks are recorded.
-- [ ] A `main` push only published the immutable image; production was started
-      by an explicit dispatch with the target-owned release gate.
-
-## Deployment record template
-
-Complete this record at deployment time; leave fields blank or marked pending
-until verified:
-
-```text
-Candidate commit:
-Image reference and immutable digest:
-Production workflow run / mirror run:
-Target-owned release gate path and expiry:
-BEIA package version/checksum (if shipped):
-Target host/proxy:
-Database/server/version/TLS:
-Backup path and manifest checksum:
-Restore rehearsal result:
-Writer-quiescence window:
-Migration procedure/version and verification:
-Pre-deploy table counts/digests:
-Post-deploy table counts/digests:
-RPC URL owner / chain ID / token contract:
-Treasury address / signer secret reference:
-Health/readiness result:
-Preview and partner smoke result:
-Rollback decision and previous image digest:
-Approver and UTC timestamp:
-Unresolved risks:
-```
-
-The release notes and local evidence deliberately leave these target fields
-pending. Completing them requires target access and an explicit deployment
-decision; it is outside this local documentation update.
+An older image may not understand active-wallet selection or transaction
+reliability state. A rollback therefore requires a reviewed schema/data
+compatibility decision and reconciliation of any saved transaction hash,
+nonce, reservation, or settlement context before writers reopen.

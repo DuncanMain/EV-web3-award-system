@@ -112,6 +112,15 @@ describe('presentAuditEvent', () => {
       metadata: {
         stage: 'execution',
         error: 'receipt lookup failed at https://rpc.example.test?secret=hidden',
+        diagnostic: {
+          stage: 'receipt',
+          rpcEndpoint: 'fallback-1',
+          rpcFailover: [
+            { label: 'primary', outcome: 'failed', httpStatus: 500 },
+            { label: 'fallback-1', outcome: 'success' },
+            { label: 'https://rpc.example.test?secret=hidden', outcome: 'success' },
+          ],
+        },
       },
     });
 
@@ -120,6 +129,29 @@ describe('presentAuditEvent', () => {
     expect(presentation.reason).toContain('existing transaction');
     expect(JSON.stringify(presentation)).not.toContain('rpc.example.test');
     expect(JSON.stringify(presentation)).not.toContain('hidden');
+    expect(presentation.details).toContainEqual({ label: 'RPC endpoint', value: 'fallback-1' });
+    expect(presentation.details).toContainEqual({ label: 'RPC failover', value: 'primary:failed, fallback-1:success' });
+  });
+
+  it('keeps a native funding hash separate from the token transaction hash', () => {
+    const fundingHash = `0x${'b'.repeat(64)}`;
+    const tokenHash = `0x${'c'.repeat(64)}`;
+    const presentation = presentAuditEvent({
+      event_type: 'wallet.mode_allowance_revoke_failed',
+      status: 'requires_review',
+      metadata: {
+        txHash: tokenHash,
+        fundingTxHash: fundingHash,
+        diagnostic: {
+          stage: 'prepare',
+          errorCode: 'RPC_SUBMISSION_UNAVAILABLE',
+          retryable: false,
+        },
+      },
+    });
+
+    expect(presentation.details).toContainEqual({ label: 'Transaction hash', value: tokenHash });
+    expect(presentation.details).toContainEqual({ label: 'Funding transaction hash', value: fundingHash });
   });
 
   it('does not call a proven no-movement failure transaction-pending', () => {

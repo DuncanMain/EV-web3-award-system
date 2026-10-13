@@ -10,6 +10,12 @@ import {
   requireUnambiguousTransactionMatch,
   truncateTokenAmount,
 } from './tokenOperation';
+import type {
+  PreparedTransactionContext,
+  PreparedTreasuryTransaction,
+  TransactionDiagnostic,
+} from '../types';
+import { TREASURY_TRANSACTION_LEASES_TABLE } from './tokenOperationSchema';
 
 /**
  * Database service for managing application data
@@ -101,6 +107,11 @@ export interface SpendReservationRecord {
   settled_amount?: string | null;
   released_amount?: string | null;
   delivered_kwh?: string | null;
+  settlement_context?: {
+    deliveredKwh: string;
+    normalizedThreeDecimal: string;
+    sourcePrecision: number;
+  } | null;
   status: 'reserved' | 'settling' | 'settled' | 'released';
   tx_hash?: string | null;
   error_message?: string | null;
@@ -171,6 +182,9 @@ export interface TokenOperationRecord {
   status: TokenOperationStatus;
   movement_outcome?: TokenMovementOutcome;
   tx_hash?: string | null;
+  tx_nonce?: number | string | null;
+  tx_context?: PreparedTransactionContext | null;
+  diagnostic_context?: TransactionDiagnostic | null;
   error_message?: string | null;
   submitted_at?: Date | null;
   confirmed_at?: Date | null;
@@ -312,7 +326,416 @@ function decimalUnits(value: unknown): bigint {
   return BigInt(whole) * 100n + BigInt((fraction + '00').slice(0, 2));
 }
 
-export type ApprovalPreparationStatus = 'funding' | 'funded' | 'approving' | 'approved' | 'unknown';
+export type TreasuryTransactionTargetType = 'token_operation' | 'approval_funding' | 'standalone';
+
+export interface TreasuryTransactionPreparationRequest {
+  operationKey: string;
+  /** Durable movement row to update; defaults to operationKey. */
+  targetOperationKey?: string;
+  targetType: TreasuryTransactionTargetType;
+  chainId: string | number;
+  signerAddress: string;
+  to: string;
+  data?: string;
+  value?: unknown;
+  accessList?: unknown;
+  getPendingNonce: () => Promise<number>;
+  prepare: (nonce: number) => Promise<PreparedTreasuryTransaction>;
+}
+
+export class TreasuryTransactionPreparationError extends Error {
+  readonly code = 'TREASURY_TRANSACTION_PREPARATION_FAILED' as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'TreasuryTransactionPreparationError';
+  }
+}
+
+export const TREASURY_NONCE_LOCK_TIMEOUT_MS = 5_000;
+/**
+ * A freshly committed prepared lease is still being actively started by
+ * another request.  Report that bounded contention as a proven-unsent,
+ * retryable result; older prepared/unknown leases remain fail-closed gaps.
+ */
+export const TREASURY_NONCE_BUSY_WINDOW_MS = 10_000;
+
+function normaliseLeaseAccessList(value: unknown): Array<[string, string[]]> {
+  if (value === undefined || value === null) return [];
+  return (value as unknown[]).map(entry => {
+    if (Array.isArray(entry)) {
+      return [String(entry[0]).toLowerCase(), (entry[1] as unknown[]).map(key => String(key).toLowerCase())] as [string, string[]];
+    }
+    const objectEntry = entry as { address?: unknown; storageKeys?: unknown };
+    return [
+      String(objectEntry.address || '').toLowerCase(),
+      Array.isArray(objectEntry.storageKeys) ? objectEntry.storageKeys.map(key => String(key).toLowerCase()) : [],
+    ] as [string, string[]];
+  });
+}
+
+function treasuryIntentMatches(
+  existing: TreasuryTransactionLeaseRecord,
+  requested: {
+    targetOperationKey: string;
+    targetType: TreasuryTransactionTargetType;
+    chainId: string;
+    signerAddress: string;
+    to: string;
+    data?: string;
+    value?: unknown;
+    accessList?: unknown;
+  },
+): boolean {
+  const context = existing.tx_context;
+  if (existing.target_type !== requested.targetType
+    || (existing.target_operation_key || existing.operation_key) !== requested.targetOperationKey
+    || existing.chain_id !== requested.chainId
+    || existing.signer_address.toLowerCase() !== requested.signerAddress.toLowerCase()) return false;
+  if (!context || context.to.toLowerCase() !== requested.to.toLowerCase()) return false;
+  if ((context.data || '0x').toLowerCase() !== (requested.data || '0x').toLowerCase()) return false;
+  try {
+    if (BigInt(context.value || '0') !== BigInt(String(requested.value === undefined ? 0 : requested.value))) return false;
+  } catch {
+    return false;
+  }
+  return JSON.stringify(normaliseLeaseAccessList(context.accessList))
+    === JSON.stringify(normaliseLeaseAccessList(requested.accessList));
+}
+
+/**
+ * Update an approval funding parent only while the lease is the parent's
+ * current funding attempt. A terminal lease callback can arrive after a
+ * later top-up has replaced the parent's hash, so both the attempt key and
+ * hash are required. A funded parent is retained as proven evidence.
+ */
+async function updateApprovalFundingParent(
+  trx: Knex.Transaction,
+  lease: TreasuryTransactionLeaseRecord,
+  status: 'unknown' | 'failed',
+  diagnostic: TransactionDiagnostic,
+  errorMessage: string,
+): Promise<void> {
+  if (lease.target_type !== 'approval_funding') return;
+  const targetKey = lease.target_operation_key || lease.operation_key;
+  const current = await trx('approval_preparations')
+    .where({ operation_key: targetKey })
+    .forUpdate()
+    .first() as ApprovalPreparationRecord | undefined;
+  if (!current
+    || !['funding', 'unknown'].includes(current.status)
+    || !current.funding_attempt_key
+    || current.funding_attempt_key !== lease.operation_key
+    || !current.funding_tx_hash
+    || current.funding_tx_hash.toLowerCase() !== lease.tx_hash.toLowerCase()) return;
+  await trx('approval_preparations')
+    .where({ operation_key: targetKey, funding_attempt_key: lease.operation_key })
+    .whereRaw('lower(funding_tx_hash) = lower(?)', [lease.tx_hash])
+    .whereIn('status', ['funding', 'unknown'])
+    .update({
+      status,
+      diagnostic_context: diagnostic,
+      error_message: errorMessage.slice(0, 500),
+      updated_at: trx.fn.now(),
+    });
+}
+
+/**
+ * Durable nonce coordination shared by award, spend, and treasury gas
+ * funding.  Signing happens while the chain/signer advisory lock is held;
+ * the signed bytes are returned to the caller and are never stored.
+ */
+export const TreasuryTransactions = {
+  async findByOperationKey(operationKey: string): Promise<TreasuryTransactionLeaseRecord | undefined> {
+    const db = getDatabase();
+    return db(TREASURY_TRANSACTION_LEASES_TABLE)
+      .where({ operation_key: operationKey })
+      .first() as Promise<TreasuryTransactionLeaseRecord | undefined>;
+  },
+
+  async prepare(data: TreasuryTransactionPreparationRequest): Promise<{
+    lease: TreasuryTransactionLeaseRecord;
+    alreadyPrepared: boolean;
+    rawTransaction?: string;
+  }> {
+    const db = getDatabase();
+    const chainId = String(data.chainId);
+    const signerAddress = data.signerAddress.toLowerCase();
+    const targetOperationKey = data.targetOperationKey || data.operationKey;
+    return db.transaction(async trx => {
+      const lockKey = `treasury:${chainId}:${signerAddress}`;
+      try {
+        await trx.raw(`set local lock_timeout = '${TREASURY_NONCE_LOCK_TIMEOUT_MS}ms'`);
+        await trx.raw('select pg_advisory_xact_lock(hashtext(?))', [lockKey]);
+      } catch {
+        throw new TreasuryTransactionPreparationError('TREASURY_NONCE_LOCK_TIMEOUT');
+      }
+      const existing = await trx(TREASURY_TRANSACTION_LEASES_TABLE)
+        .where({ operation_key: data.operationKey })
+        .forUpdate()
+        .first() as TreasuryTransactionLeaseRecord | undefined;
+      if (existing) {
+        if (!treasuryIntentMatches(existing, {
+          targetOperationKey,
+          targetType: data.targetType,
+          chainId,
+          signerAddress,
+          to: data.to,
+          data: data.data,
+          value: data.value,
+          accessList: data.accessList,
+        })) {
+          throw new TreasuryTransactionPreparationError('TREASURY_TRANSACTION_INTENT_MISMATCH');
+        }
+        return { lease: existing, alreadyPrepared: true };
+      }
+
+      const pendingNonce = Number(await data.getPendingNonce());
+      if (!Number.isSafeInteger(pendingNonce) || pendingNonce < 0) {
+        throw new TreasuryTransactionPreparationError('TREASURY_PENDING_NONCE_UNAVAILABLE');
+      }
+      const unresolvedLease = await trx(TREASURY_TRANSACTION_LEASES_TABLE)
+        .where({ chain_id: chainId })
+        .whereRaw('lower(signer_address) = lower(?)', [signerAddress])
+        .whereIn('status', ['prepared', 'unknown'])
+        .where('nonce', '>=', pendingNonce)
+        .orderBy('nonce', 'asc')
+        .first() as Pick<TreasuryTransactionLeaseRecord, 'operation_key' | 'nonce' | 'status' | 'created_at' | 'updated_at'> | undefined;
+      if (unresolvedLease) {
+        const leaseTimestamp = unresolvedLease.updated_at || unresolvedLease.created_at;
+        const leaseAge = leaseTimestamp ? Date.now() - new Date(leaseTimestamp).getTime() : Number.POSITIVE_INFINITY;
+        if (unresolvedLease.status === 'prepared'
+          && Number.isFinite(leaseAge)
+          && leaseAge >= 0
+          && leaseAge <= TREASURY_NONCE_BUSY_WINDOW_MS) {
+          throw new TreasuryTransactionPreparationError(
+            `TREASURY_NONCE_BUSY_RETRYABLE:${unresolvedLease.operation_key}:${unresolvedLease.nonce}:prepared`,
+          );
+        }
+        throw new TreasuryTransactionPreparationError(
+          `TREASURY_NONCE_GAP_REQUIRES_REVIEW:${unresolvedLease.operation_key}:${unresolvedLease.nonce}:${unresolvedLease.status}`,
+        );
+      }
+      const maxLease = await trx(TREASURY_TRANSACTION_LEASES_TABLE)
+        .where({ chain_id: chainId })
+        .whereRaw('lower(signer_address) = lower(?)', [signerAddress])
+        .whereNot({ status: 'failed' })
+        .max({ maxNonce: 'nonce' })
+        .first() as { maxNonce?: string | number | null } | undefined;
+      const leasedNonce = maxLease?.maxNonce === null || maxLease?.maxNonce === undefined
+        ? -1
+        : Number(maxLease.maxNonce);
+      const nonce = Math.max(pendingNonce, Number.isSafeInteger(leasedNonce) ? leasedNonce + 1 : pendingNonce);
+      if (!Number.isSafeInteger(nonce) || nonce < 0) {
+        throw new TreasuryTransactionPreparationError('TREASURY_NONCE_UNAVAILABLE');
+      }
+
+      let prepared: PreparedTreasuryTransaction;
+      try {
+        prepared = await data.prepare(nonce);
+      } catch (error) {
+        throw error;
+      }
+      const normalizedHash = requireCanonicalTransactionHash(prepared.txHash, 'prepared transaction hash');
+      if (prepared.context.nonce !== nonce
+        || prepared.context.chainId !== chainId
+        || prepared.context.signerAddress.toLowerCase() !== signerAddress) {
+        throw new TreasuryTransactionPreparationError('TREASURY_TRANSACTION_CONTEXT_MISMATCH');
+      }
+
+      await trx(TREASURY_TRANSACTION_LEASES_TABLE).insert({
+        operation_key: data.operationKey,
+        target_operation_key: targetOperationKey,
+        target_type: data.targetType,
+        chain_id: chainId,
+        signer_address: signerAddress,
+        nonce,
+        tx_hash: normalizedHash,
+        tx_context: prepared.context,
+        status: 'prepared',
+        diagnostic_context: null,
+        error_message: null,
+      });
+
+      if (data.targetType === 'token_operation') {
+        const current = await trx('token_operations')
+          .where({ operation_key: targetOperationKey })
+          .forUpdate()
+          .first() as TokenOperationRecord | undefined;
+        if (!current) throw new TreasuryTransactionPreparationError('TOKEN_OPERATION_NOT_FOUND');
+        if (!['submitting', 'submitted', 'unknown'].includes(current.status)) {
+          throw new TreasuryTransactionPreparationError('TOKEN_OPERATION_TERMINAL_STATE');
+        }
+        if (current.tx_hash && current.tx_hash.toLowerCase() !== normalizedHash.toLowerCase()) {
+          throw new TreasuryTransactionPreparationError('TOKEN_OPERATION_TX_HASH_MISMATCH');
+        }
+        await trx('token_operations').where({ operation_key: targetOperationKey }).update({
+          tx_hash: normalizedHash,
+          tx_nonce: nonce,
+          tx_context: prepared.context,
+          status: 'submitting',
+          movement_outcome: current.movement_outcome || 'unknown',
+          error_message: null,
+          updated_at: trx.fn.now(),
+        });
+      } else if (data.targetType === 'approval_funding') {
+        const current = await trx('approval_preparations')
+          .where({ operation_key: targetOperationKey })
+          .forUpdate()
+          .first() as ApprovalPreparationRecord | undefined;
+        if (!current) throw new TreasuryTransactionPreparationError('APPROVAL_PREPARATION_NOT_FOUND');
+        if (!['funding', 'funded', 'unknown'].includes(current.status)) {
+          throw new TreasuryTransactionPreparationError('APPROVAL_PREPARATION_TERMINAL_STATE');
+        }
+        if (current.funding_attempt_key && current.funding_attempt_key !== data.operationKey) {
+          throw new TreasuryTransactionPreparationError('APPROVAL_FUNDING_ATTEMPT_MISMATCH');
+        }
+        if (current.funding_tx_hash
+          && current.funding_tx_hash.toLowerCase() !== normalizedHash.toLowerCase()
+          && current.funding_attempt_key !== data.operationKey) {
+          throw new TreasuryTransactionPreparationError('APPROVAL_FUNDING_TX_HASH_MISMATCH');
+        }
+        await trx('approval_preparations').where({ operation_key: targetOperationKey }).update({
+          funding_tx_hash: normalizedHash,
+          funding_tx_nonce: nonce,
+          funding_tx_context: prepared.context,
+          funding_attempt_key: data.operationKey,
+          funding_attempt_value: prepared.context.value,
+          status: 'funding',
+          error_message: null,
+          updated_at: trx.fn.now(),
+        });
+      }
+
+      const inserted = await trx(TREASURY_TRANSACTION_LEASES_TABLE)
+        .where({ operation_key: data.operationKey })
+        .first() as TreasuryTransactionLeaseRecord;
+      return { lease: inserted, alreadyPrepared: false, rawTransaction: prepared.rawTransaction };
+    });
+  },
+
+  async markSubmitted(operationKey: string, txHash: string): Promise<TreasuryTransactionLeaseRecord | undefined> {
+    const db = getDatabase();
+    const normalizedHash = requireCanonicalTransactionHash(txHash, 'transaction hash');
+    return db.transaction(async trx => {
+      const existing = await trx(TREASURY_TRANSACTION_LEASES_TABLE)
+        .where({ operation_key: operationKey })
+        .where({ tx_hash: normalizedHash })
+        .forUpdate()
+        .first() as TreasuryTransactionLeaseRecord | undefined;
+      if (!existing) {
+        return await trx(TREASURY_TRANSACTION_LEASES_TABLE)
+          .where({ operation_key: operationKey })
+          .first() as TreasuryTransactionLeaseRecord | undefined;
+      }
+      const [record] = await trx(TREASURY_TRANSACTION_LEASES_TABLE)
+        .where({ operation_key: operationKey })
+        .where({ tx_hash: normalizedHash })
+        .whereIn('status', ['prepared', 'submitted', 'unknown'])
+        .update({ status: 'submitted', error_message: null, updated_at: trx.fn.now() })
+        .returning('*') as TreasuryTransactionLeaseRecord[];
+      const targetKey = existing.target_operation_key || operationKey;
+      if (existing.target_type === 'token_operation') {
+        await trx('token_operations')
+          .where({ operation_key: targetKey })
+          .whereIn('status', ['submitting', 'submitted', 'unknown'])
+          .update({ status: 'submitted', updated_at: trx.fn.now() });
+      }
+      return record || existing;
+    });
+  },
+
+  async markUnknown(
+    operationKey: string,
+    diagnostic: TransactionDiagnostic,
+    errorMessage = diagnostic.errorCode,
+  ): Promise<TreasuryTransactionLeaseRecord | undefined> {
+    const db = getDatabase();
+    return db.transaction(async trx => {
+      const existing = await trx(TREASURY_TRANSACTION_LEASES_TABLE)
+        .where({ operation_key: operationKey })
+        .forUpdate()
+        .first() as TreasuryTransactionLeaseRecord | undefined;
+      if (!existing) return undefined;
+      const [record] = await trx(TREASURY_TRANSACTION_LEASES_TABLE)
+        .where({ operation_key: operationKey })
+        .whereIn('status', ['prepared', 'submitted', 'unknown'])
+        .update({
+          status: 'unknown',
+          diagnostic_context: diagnostic,
+          error_message: errorMessage.slice(0, 500),
+          updated_at: trx.fn.now(),
+        })
+        .returning('*') as TreasuryTransactionLeaseRecord[];
+      const targetKey = existing.target_operation_key || operationKey;
+      if (!record) return existing;
+      if (existing.target_type === 'token_operation') {
+        await trx('token_operations')
+          .where({ operation_key: targetKey })
+          .whereIn('status', ['submitting', 'submitted', 'unknown'])
+          .update({
+            status: 'unknown',
+            diagnostic_context: diagnostic,
+            error_message: errorMessage.slice(0, 500),
+            updated_at: trx.fn.now(),
+          });
+      } else if (existing.target_type === 'approval_funding') {
+        await updateApprovalFundingParent(trx, existing, 'unknown', diagnostic, errorMessage);
+      }
+      return record;
+    });
+  },
+
+  /**
+   * Mark an original lease failed only when receipt/evidence proves no
+   * movement. This keeps failed nonces out of future allocation while
+   * retaining the original hash and diagnostic for idempotent review.
+   */
+  async markFailed(
+    operationKey: string,
+    diagnostic: TransactionDiagnostic,
+    errorMessage = diagnostic.errorCode,
+  ): Promise<TreasuryTransactionLeaseRecord | undefined> {
+    const db = getDatabase();
+    return db.transaction(async trx => {
+      const existing = await trx(TREASURY_TRANSACTION_LEASES_TABLE)
+        .where({ operation_key: operationKey })
+        .forUpdate()
+        .first() as TreasuryTransactionLeaseRecord | undefined;
+      if (!existing) return undefined;
+      const [record] = await trx(TREASURY_TRANSACTION_LEASES_TABLE)
+        .where({ operation_key: operationKey })
+        .whereIn('status', ['prepared', 'submitted', 'unknown'])
+        .update({
+          status: 'failed',
+          diagnostic_context: diagnostic,
+          error_message: errorMessage.slice(0, 500),
+          updated_at: trx.fn.now(),
+        })
+        .returning('*') as TreasuryTransactionLeaseRecord[];
+      const targetKey = existing.target_operation_key || operationKey;
+      if (!record) return existing;
+      if (existing.target_type === 'token_operation') {
+        await trx('token_operations')
+          .where({ operation_key: targetKey })
+          .whereNotNull('tx_hash')
+          .whereIn('status', ['submitting', 'submitted', 'unknown'])
+          .update({
+            status: 'failed',
+            movement_outcome: 'no_movement',
+            diagnostic_context: diagnostic,
+            error_message: errorMessage.slice(0, 500),
+            updated_at: trx.fn.now(),
+          });
+      } else if (existing.target_type === 'approval_funding') {
+        await updateApprovalFundingParent(trx, existing, 'failed', diagnostic, errorMessage);
+      }
+      return record;
+    });
+  },
+};
+
+export type ApprovalPreparationStatus = 'funding' | 'funded' | 'approving' | 'approved' | 'unknown' | 'failed';
 
 export interface ApprovalPreparationRecord {
   id: string;
@@ -323,7 +746,29 @@ export interface ApprovalPreparationRecord {
   treasury_address: string;
   status: ApprovalPreparationStatus;
   funding_tx_hash?: string | null;
+  funding_tx_nonce?: number | string | null;
+  funding_tx_context?: PreparedTransactionContext | null;
+  funding_attempt_key?: string | null;
+  funding_attempt_value?: string | null;
   approval_tx_hash?: string | null;
+  diagnostic_context?: TransactionDiagnostic | null;
+  error_message?: string | null;
+  created_at: Date;
+  updated_at: Date;
+}
+
+export interface TreasuryTransactionLeaseRecord {
+  id: string;
+  operation_key: string;
+  target_operation_key?: string | null;
+  target_type: 'token_operation' | 'approval_funding' | 'standalone';
+  chain_id: string;
+  signer_address: string;
+  nonce: number | string;
+  tx_hash: string;
+  tx_context: PreparedTransactionContext;
+  status: 'prepared' | 'submitted' | 'unknown' | 'confirmed' | 'failed';
+  diagnostic_context?: TransactionDiagnostic | null;
   error_message?: string | null;
   created_at: Date;
   updated_at: Date;
@@ -369,6 +814,23 @@ export const ApprovalPreparations = {
           || existing.treasury_address.toLowerCase() !== data.treasuryAddress.toLowerCase()) {
           throw new Error('APPROVAL_PREPARATION_INTENT_MISMATCH: saved wallet, asset, chain, or treasury differs');
         }
+        if (existing.status === 'failed'
+          && !existing.funding_tx_hash
+          && existing.diagnostic_context
+          && ['prepare', 'persist_hash', 'preflight', 'asset_context'].includes(existing.diagnostic_context.stage)
+          && !existing.diagnostic_context.savedHash) {
+          const [reclaimed] = await trx('approval_preparations')
+            .where({ operation_key: data.operationKey, status: 'failed' })
+            .update({
+              status: 'funding',
+              funding_attempt_key: null,
+              funding_attempt_value: null,
+              error_message: null,
+              updated_at: trx.fn.now(),
+            })
+            .returning('*') as ApprovalPreparationRecord[];
+          if (reclaimed) return { record: reclaimed, acquired: true };
+        }
         return { record: existing, acquired: false };
       }
       const [record] = await trx('approval_preparations').insert({
@@ -379,6 +841,8 @@ export const ApprovalPreparations = {
         treasury_address: data.treasuryAddress.toLowerCase(),
         status: 'funding',
         funding_tx_hash: null,
+        funding_attempt_key: null,
+        funding_attempt_value: null,
         approval_tx_hash: null,
         error_message: null,
       }).returning('*') as ApprovalPreparationRecord[];
@@ -386,19 +850,69 @@ export const ApprovalPreparations = {
     });
   },
 
-  async markFundingSubmitted(operationKey: string, txHash: string): Promise<ApprovalPreparationRecord | undefined> {
+  async markFundingSubmitted(
+    operationKey: string,
+    txHash: string,
+    options: {
+      nonce?: number;
+      context?: PreparedTransactionContext;
+      diagnostic?: TransactionDiagnostic | null;
+      attemptKey?: string;
+    } = {},
+  ): Promise<ApprovalPreparationRecord | undefined> {
     const db = getDatabase();
     const normalizedHash = requireCanonicalTransactionHash(txHash, 'funding transaction hash');
-    const [record] = await db('approval_preparations').where({ operation_key: operationKey }).update({
-      funding_tx_hash: normalizedHash, status: 'funding', error_message: null, updated_at: db.fn.now(),
+    const current = await this.findByKey(operationKey);
+    if (current?.funding_tx_hash
+      && current.funding_tx_hash.toLowerCase() !== normalizedHash.toLowerCase()
+      && current.funding_attempt_key !== options.attemptKey) {
+      throw new Error('APPROVAL_FUNDING_TX_HASH_MISMATCH');
+    }
+    const [record] = await db('approval_preparations').where({ operation_key: operationKey })
+      .whereIn('status', ['funding'])
+      .update({
+      funding_tx_hash: normalizedHash,
+      ...(options.nonce === undefined ? {} : { funding_tx_nonce: options.nonce }),
+      ...(options.context === undefined ? {} : { funding_tx_context: options.context }),
+      ...(options.attemptKey === undefined ? {} : { funding_attempt_key: options.attemptKey }),
+      ...(options.diagnostic === undefined ? {} : { diagnostic_context: options.diagnostic }),
+      status: 'funding', error_message: null, updated_at: db.fn.now(),
     }).returning('*') as ApprovalPreparationRecord[];
+    return record || this.findByKey(operationKey);
+  },
+
+  async markFundingPreflightFailed(
+    operationKey: string,
+    error: string,
+    diagnostic?: TransactionDiagnostic | null,
+  ): Promise<ApprovalPreparationRecord | undefined> {
+    const db = getDatabase();
+    const [record] = await db('approval_preparations')
+      .where({ operation_key: operationKey })
+      .whereNull('funding_tx_hash')
+      .whereIn('status', ['funding', 'failed'])
+      .update({
+        status: 'failed',
+        error_message: error.slice(0, 500),
+        funding_attempt_key: null,
+        funding_attempt_value: null,
+        ...(diagnostic === undefined ? {} : { diagnostic_context: diagnostic }),
+        updated_at: db.fn.now(),
+      })
+      .returning('*') as ApprovalPreparationRecord[];
     return record || this.findByKey(operationKey);
   },
 
   async markFunded(operationKey: string): Promise<ApprovalPreparationRecord | undefined> {
     const db = getDatabase();
-    const [record] = await db('approval_preparations').where({ operation_key: operationKey }).update({
-      status: 'funded', error_message: null, updated_at: db.fn.now(),
+    const [record] = await db('approval_preparations').where({ operation_key: operationKey })
+      .whereIn('status', ['funding', 'funded'])
+      .update({
+      status: 'funded',
+      funding_attempt_key: null,
+      funding_attempt_value: null,
+      error_message: null,
+      updated_at: db.fn.now(),
     }).returning('*') as ApprovalPreparationRecord[];
     return record || this.findByKey(operationKey);
   },
@@ -409,17 +923,46 @@ export const ApprovalPreparations = {
    * update mean a second API process receives `acquired: false` and cannot
    * broadcast its own funding transaction.
    */
-  async claimFundingTopUp(operationKey: string): Promise<ApprovalFundingClaim> {
+  async claimFundingTopUp(
+    operationKey: string,
+    fundingAttemptKey: string,
+    fundingAttemptValue: string,
+  ): Promise<ApprovalFundingClaim> {
     const db = getDatabase();
     return db.transaction(async trx => {
       await trx.raw('select pg_advisory_xact_lock(hashtext(?))', [`approval:${operationKey}`]);
-      const [record] = await trx('approval_preparations')
-        .where({ operation_key: operationKey, status: 'funded' })
-        .whereNull('approval_tx_hash')
-        .update({ status: 'funding', error_message: null, updated_at: trx.fn.now() })
-        .returning('*') as ApprovalPreparationRecord[];
+      const current = await trx('approval_preparations')
+        .where({ operation_key: operationKey })
+        .forUpdate()
+        .first() as ApprovalPreparationRecord | undefined;
+      if (current?.status === 'funded' && !current.approval_tx_hash && current.funding_tx_hash) {
+        // A legacy funded row may predate the treasury nonce journal. Its old
+        // hash/context must remain independently durable before a new top-up
+        // can replace the row's current funding fields.
+        const priorLease = await trx(TREASURY_TRANSACTION_LEASES_TABLE)
+          .where({ target_operation_key: operationKey, target_type: 'approval_funding' })
+          .whereRaw('lower(tx_hash) = lower(?)', [current.funding_tx_hash])
+          .orderBy('created_at', 'asc')
+          .first() as TreasuryTransactionLeaseRecord | undefined;
+        if (!priorLease || !priorLease.tx_context) {
+          throw new Error('APPROVAL_FUNDING_PRIOR_EVIDENCE_REQUIRED');
+        }
+      }
+      const [record] = current?.status === 'funded' && !current.approval_tx_hash
+        ? await trx('approval_preparations')
+          .where({ operation_key: operationKey, status: 'funded' })
+          .whereNull('approval_tx_hash')
+          .update({
+            status: 'funding',
+            funding_attempt_key: fundingAttemptKey,
+            funding_attempt_value: fundingAttemptValue,
+            error_message: null,
+            updated_at: trx.fn.now(),
+          })
+          .returning('*') as ApprovalPreparationRecord[]
+        : [];
       if (record) return { record, acquired: true };
-      const existing = await trx('approval_preparations')
+      const existing = current || await trx('approval_preparations')
         .where({ operation_key: operationKey })
         .forUpdate()
         .first() as ApprovalPreparationRecord | undefined;
@@ -441,14 +984,22 @@ export const ApprovalPreparations = {
       .where({ operation_key: operationKey, status: 'unknown' })
       .whereNotNull('funding_tx_hash')
       .whereNull('approval_tx_hash')
-      .update({ status: 'funded', error_message: null, updated_at: db.fn.now() })
+      .update({
+        status: 'funded',
+        funding_attempt_key: null,
+        funding_attempt_value: null,
+        error_message: null,
+        updated_at: db.fn.now(),
+      })
       .returning('*') as ApprovalPreparationRecord[];
     return record || this.findByKey(operationKey);
   },
 
   async markApproving(operationKey: string): Promise<ApprovalPreparationRecord | undefined> {
     const db = getDatabase();
-    const [record] = await db('approval_preparations').where({ operation_key: operationKey }).update({
+    const [record] = await db('approval_preparations').where({ operation_key: operationKey })
+      .whereIn('status', ['funded'])
+      .update({
       status: 'approving', error_message: null, updated_at: db.fn.now(),
     }).returning('*') as ApprovalPreparationRecord[];
     return record || this.findByKey(operationKey);
@@ -484,7 +1035,9 @@ export const ApprovalPreparations = {
   async markApprovalSubmitted(operationKey: string, txHash: string): Promise<ApprovalPreparationRecord | undefined> {
     const db = getDatabase();
     const normalizedHash = requireCanonicalTransactionHash(txHash, 'approval transaction hash');
-    const [record] = await db('approval_preparations').where({ operation_key: operationKey }).update({
+    const [record] = await db('approval_preparations').where({ operation_key: operationKey })
+      .whereIn('status', ['approving'])
+      .update({
       approval_tx_hash: normalizedHash, status: 'approving', error_message: null, updated_at: db.fn.now(),
     }).returning('*') as ApprovalPreparationRecord[];
     return record || this.findByKey(operationKey);
@@ -492,7 +1045,9 @@ export const ApprovalPreparations = {
 
   async markApproved(operationKey: string): Promise<ApprovalPreparationRecord | undefined> {
     const db = getDatabase();
-    const [record] = await db('approval_preparations').where({ operation_key: operationKey }).update({
+    const [record] = await db('approval_preparations').where({ operation_key: operationKey })
+      .whereIn('status', ['approving', 'approved'])
+      .update({
       status: 'approved', error_message: null, updated_at: db.fn.now(),
     }).returning('*') as ApprovalPreparationRecord[];
     return record || this.findByKey(operationKey);
@@ -501,20 +1056,48 @@ export const ApprovalPreparations = {
   async markUnknown(
     operationKey: string,
     error: string,
-    options: { fundingTxHash?: string; clearFundingHash?: boolean } = {},
+    options: {
+      fundingTxHash?: string;
+      fundingAttemptKey?: string;
+      clearFundingHash?: boolean;
+      diagnostic?: TransactionDiagnostic | null;
+    } = {},
   ): Promise<ApprovalPreparationRecord | undefined> {
     const db = getDatabase();
-    const update: Record<string, unknown> = {
-      status: 'unknown', error_message: error, updated_at: db.fn.now(),
-    };
-    if (options.fundingTxHash) {
-      update.funding_tx_hash = requireCanonicalTransactionHash(options.fundingTxHash, 'funding transaction hash');
-    }
-    else if (options.clearFundingHash) update.funding_tx_hash = null;
-    const [record] = await db('approval_preparations').where({ operation_key: operationKey }).update({
-      ...update,
-    }).returning('*') as ApprovalPreparationRecord[];
-    return record || this.findByKey(operationKey);
+    return db.transaction(async trx => {
+      const current = await trx('approval_preparations')
+        .where({ operation_key: operationKey })
+        .forUpdate()
+        .first() as ApprovalPreparationRecord | undefined;
+      if (!current) return undefined;
+      // A delayed callback from an older funding attempt must not demote a
+      // newer top-up or replace its hash. Returning the current row keeps the
+      // callback idempotent while leaving the newer attempt untouched.
+      if (options.fundingAttemptKey !== undefined
+        && current.funding_attempt_key !== options.fundingAttemptKey) {
+        return current;
+      }
+      const normalizedFundingHash = options.fundingTxHash
+        ? requireCanonicalTransactionHash(options.fundingTxHash, 'funding transaction hash')
+        : undefined;
+      if (normalizedFundingHash
+        && current.funding_tx_hash
+        && normalizedFundingHash.toLowerCase() !== current.funding_tx_hash.toLowerCase()) {
+        return current;
+      }
+      const update: Record<string, unknown> = {
+        status: 'unknown', error_message: error.slice(0, 500), updated_at: trx.fn.now(),
+      };
+      if (normalizedFundingHash) update.funding_tx_hash = normalizedFundingHash;
+      else if (options.clearFundingHash) update.funding_tx_hash = null;
+      if (options.diagnostic !== undefined) update.diagnostic_context = options.diagnostic;
+      const [record] = await trx('approval_preparations')
+        .where({ operation_key: operationKey })
+        .whereIn('status', ['funding', 'funded', 'approving', 'unknown'])
+        .update({ ...update })
+        .returning('*') as ApprovalPreparationRecord[];
+      return record || current;
+    });
   },
 };
 
@@ -1214,10 +1797,12 @@ export const TokenOperations = {
     const [record] = await db('token_operations')
       .where({ operation_key: operationKey })
       .whereNull('tx_hash')
+      .whereIn('status', ['submitting', 'submitted', 'unknown'])
       .update({
         tx_hash: normalizedHash,
         status: 'submitted',
         submitted_at: db.fn.now(),
+        diagnostic_context: null,
         error_message: null,
         updated_at: db.fn.now(),
       })
@@ -1228,17 +1813,41 @@ export const TokenOperations = {
       if (current.tx_hash && current.tx_hash.toLowerCase() !== normalizedHash) {
         throw new Error('TOKEN_OPERATION_TX_HASH_MISMATCH');
       }
+      if (current.tx_hash) {
+        const [updated] = await db('token_operations')
+          .where({ operation_key: operationKey })
+          .whereRaw('lower(tx_hash) = lower(?)', [normalizedHash])
+          .whereIn('status', ['submitting', 'submitted', 'unknown'])
+          .update({
+            status: 'submitted',
+            submitted_at: db.fn.now(),
+            diagnostic_context: null,
+            error_message: null,
+            updated_at: db.fn.now(),
+          })
+          .returning('*') as TokenOperationRecord[];
+        return updated || current;
+      }
       return current;
     }
     return record;
   },
 
-  async markUnknown(operationKey: string, error: string): Promise<TokenOperationRecord | undefined> {
+  async markUnknown(
+    operationKey: string,
+    error: string,
+    diagnostic?: TransactionDiagnostic | null,
+  ): Promise<TokenOperationRecord | undefined> {
     const db = getDatabase();
     const [record] = await db('token_operations')
       .where({ operation_key: operationKey })
-      .whereNull('tx_hash')
-      .update({ status: 'unknown', error_message: error, updated_at: db.fn.now() })
+      .whereIn('status', ['submitting', 'submitted', 'unknown'])
+      .update({
+        status: 'unknown',
+        error_message: error.slice(0, 500),
+        ...(diagnostic === undefined ? {} : { diagnostic_context: diagnostic }),
+        updated_at: db.fn.now(),
+      })
       .returning('*') as TokenOperationRecord[];
     return record || this.findByKey(operationKey);
   },
@@ -1248,7 +1857,7 @@ export const TokenOperations = {
     const [record] = await db('token_operations')
       .where({ operation_key: operationKey })
       .whereNotNull('tx_hash')
-      .whereNot({ status: 'projected' })
+      .whereIn('status', ['submitting', 'submitted', 'unknown', 'confirmed'])
       .update({
         status: 'confirmed',
         movement_outcome: 'confirmed',
@@ -1265,7 +1874,7 @@ export const TokenOperations = {
     const [record] = await db('token_operations')
       .where({ operation_key: operationKey })
       .whereNotNull('tx_hash')
-      .whereNot({ status: 'projected' })
+      .whereIn('status', ['submitting', 'submitted', 'unknown', 'confirmed'])
       .update({ status: 'confirmed', error_message: error, updated_at: db.fn.now() })
       .returning('*') as TokenOperationRecord[];
     return record || this.findByKey(operationKey);
@@ -1302,6 +1911,7 @@ export const TokenOperations = {
     operationKey: string,
     error: string,
     movementOutcome: TokenMovementOutcome = 'review',
+    diagnostic?: TransactionDiagnostic | null,
   ): Promise<TokenOperationRecord | undefined> {
     const db = getDatabase();
     return db.transaction(async trx => {
@@ -1316,19 +1926,38 @@ export const TokenOperations = {
       const [record] = await trx('token_operations')
         .where({ operation_key: operationKey })
         .whereNotNull('tx_hash')
-        .whereNot({ status: 'projected' })
-        .update({ status: 'failed', movement_outcome: movementOutcome, error_message: error, updated_at: trx.fn.now() })
+        // A stale receipt/projection callback must not turn a confirmed
+        // movement back into a failed one.  Failed is terminal for this
+        // lifecycle; only pre-terminal states may enter it.
+        .whereIn('status', ['submitting', 'submitted', 'unknown'])
+        .update({
+          status: 'failed',
+          movement_outcome: movementOutcome,
+          error_message: error,
+          ...(diagnostic === undefined ? {} : { diagnostic_context: diagnostic }),
+          updated_at: trx.fn.now(),
+        })
         .returning('*') as TokenOperationRecord[];
       return record || (await trx('token_operations').where({ operation_key: operationKey }).first() as TokenOperationRecord | undefined);
     });
   },
 
-  async markPreflightFailed(operationKey: string, error: string): Promise<TokenOperationRecord | undefined> {
+  async markPreflightFailed(
+    operationKey: string,
+    error: string,
+    diagnostic?: TransactionDiagnostic | null,
+  ): Promise<TokenOperationRecord | undefined> {
     const db = getDatabase();
     const [record] = await db('token_operations')
       .where({ operation_key: operationKey })
       .whereNull('tx_hash')
-      .update({ status: 'failed', movement_outcome: 'no_movement', error_message: `PREFLIGHT:${error}`, updated_at: db.fn.now() })
+      .update({
+        status: 'failed',
+        movement_outcome: 'no_movement',
+        error_message: `PREFLIGHT:${error}`,
+        ...(diagnostic === undefined ? {} : { diagnostic_context: diagnostic }),
+        updated_at: db.fn.now(),
+      })
       .returning('*') as TokenOperationRecord[];
     return record || this.findByKey(operationKey);
   },
@@ -1549,6 +2178,55 @@ export const SpendReservations = {
     return record;
   },
 
+  /**
+   * Persist the immutable physical settlement context before any token send.
+   * A repeated CDR must match byte-for-byte at declared three-decimal
+   * precision; a mismatch is a review condition and leaves the original
+   * context untouched.
+   */
+  async persistSettlementContext(id: string, deliveredKwh: number): Promise<SpendReservationRecord> {
+    if (!Number.isFinite(deliveredKwh) || deliveredKwh < 0) {
+      throw new Error('INVALID_SETTLEMENT_CONTEXT: deliveredKwh must be a finite non-negative value');
+    }
+    const raw = String(deliveredKwh).trim();
+    if (!/^\d+(?:\.\d+)?$/.test(raw) || raw.split('.')[1]?.length > 12) {
+      throw new Error('INVALID_SETTLEMENT_CONTEXT: deliveredKwh must be a bounded decimal value');
+    }
+    const [whole, fraction = ''] = raw.split('.');
+    const normalized = `${whole}.${fraction.slice(0, 3).padEnd(3, '0')}`;
+    const sourcePrecision = fraction.length;
+    const settlementContext = {
+      deliveredKwh: `${whole}.${fraction || '0'}`,
+      normalizedThreeDecimal: normalized,
+      sourcePrecision,
+    };
+    const db = getDatabase();
+    return db.transaction(async trx => {
+      const current = await trx('spend_reservations').where({ id }).forUpdate().first() as SpendReservationRecord | undefined;
+      if (!current) throw new Error(`Reservation ${id} not found`);
+      const existingContext = current.settlement_context;
+      if (existingContext) {
+        if (existingContext.deliveredKwh !== settlementContext.deliveredKwh) {
+          throw new Error('RESERVATION_SETTLEMENT_CONTEXT_MISMATCH');
+        }
+        return current;
+      }
+      if (current.delivered_kwh !== null && current.delivered_kwh !== undefined) {
+        const existingRaw = String(current.delivered_kwh);
+        const [existingWhole, existingFraction = ''] = existingRaw.split('.');
+        const existingNormalized = `${existingWhole}.${existingFraction.slice(0, 3).padEnd(3, '0')}`;
+        if (existingNormalized !== normalized) throw new Error('RESERVATION_SETTLEMENT_CONTEXT_MISMATCH');
+        return current;
+      }
+      const [record] = await trx('spend_reservations').where({ id }).update({
+        delivered_kwh: normalized,
+        settlement_context: settlementContext,
+        updated_at: trx.fn.now(),
+      }).returning('*') as SpendReservationRecord[];
+      return record;
+    });
+  },
+
   async complete(id: string, deliveredKwh: number, settledAmount: number, txHash?: string): Promise<SpendReservationRecord> {
     const db = getDatabase();
     const normalizedHash = txHash
@@ -1572,13 +2250,33 @@ export const SpendReservations = {
       const reserved = canonicalTokenAmount(String(current.reserved_amount));
       const requestedSettled = canonicalTokenAmount(settledAmount);
       if (!reserved || !requestedSettled) throw new Error('UNSUPPORTED_TOKEN_PRECISION');
+      if (!Number.isFinite(deliveredKwh) || deliveredKwh < 0 || !/^\d+(?:\.\d+)?$/.test(String(deliveredKwh))) {
+        throw new Error('INVALID_SETTLEMENT_CONTEXT: deliveredKwh must be a bounded decimal value');
+      }
+      const [deliveredWhole, deliveredFraction = ''] = String(deliveredKwh).split('.');
+      const deliveredContext = `${deliveredWhole}.${deliveredFraction.slice(0, 3).padEnd(3, '0')}`;
+      const fullDelivered = `${deliveredWhole}.${deliveredFraction || '0'}`;
+      if (current.settlement_context && current.settlement_context.deliveredKwh !== fullDelivered) {
+        throw new Error('RESERVATION_SETTLEMENT_CONTEXT_MISMATCH');
+      }
+      if (!current.settlement_context && current.delivered_kwh !== null && current.delivered_kwh !== undefined) {
+        const [existingWhole, existingFraction = ''] = String(current.delivered_kwh).split('.');
+        if (`${existingWhole}.${existingFraction.slice(0, 3).padEnd(3, '0')}` !== deliveredContext) {
+          throw new Error('RESERVATION_SETTLEMENT_CONTEXT_MISMATCH');
+        }
+      }
       const settledUnits = requestedSettled.units < reserved.units ? requestedSettled.units : reserved.units;
       const releasedUnits = reserved.units - settledUnits;
       const boundedSettled = Number(settledUnits) / 100;
       const releasedAmount = Number(releasedUnits) / 100;
       const [record] = await trx('spend_reservations').where({ id }).update({
         status: boundedSettled > 0 ? 'settled' : 'released',
-        delivered_kwh: deliveredKwh.toFixed(3),
+        delivered_kwh: current.delivered_kwh || deliveredContext,
+        settlement_context: current.settlement_context || {
+          deliveredKwh: fullDelivered,
+          normalizedThreeDecimal: deliveredContext,
+          sourcePrecision: deliveredFraction.length,
+        },
         settled_amount: boundedSettled.toFixed(2),
         released_amount: releasedAmount.toFixed(2),
         tx_hash: normalizedHash || current.tx_hash || null,

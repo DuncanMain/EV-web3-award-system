@@ -24,6 +24,26 @@ jest.mock('./database/integration', () => ({
   recordSpend: jest.fn().mockResolvedValue(undefined),
 }));
 jest.mock('./database/service', () => ({
+  TreasuryTransactions: {
+    prepare: jest.fn(async (request: any) => {
+      const nonce = await request.getPendingNonce();
+      const prepared = await request.prepare(nonce);
+      return {
+        alreadyPrepared: false,
+        rawTransaction: prepared.rawTransaction,
+        lease: {
+          operation_key: request.operationKey,
+          chain_id: String(request.chainId),
+          signer_address: '0x9999999999999999999999999999999999999999',
+          nonce,
+          tx_hash: `0x${'b'.repeat(64)}`,
+          tx_context: prepared.context,
+        },
+      };
+    }),
+    markSubmitted: jest.fn().mockResolvedValue(undefined),
+    markUnknown: jest.fn().mockResolvedValue(undefined),
+  },
   TokenOperations: {
     findByKey: jest.fn(),
     claim: jest.fn(),
@@ -34,6 +54,9 @@ jest.mock('./database/service', () => ({
     markUnknown: jest.fn(),
     markFailed: jest.fn(),
     markPreflightFailed: jest.fn(),
+  },
+  SpendReservations: {
+    persistSettlementContext: jest.fn().mockResolvedValue(undefined),
   },
 }));
 
@@ -59,6 +82,11 @@ describe('bounded spend execution', () => {
   ]);
   const mockProvider = {
     getNetwork: jest.fn().mockResolvedValue({ chainId: 80002n }),
+    getTransactionCount: jest.fn().mockResolvedValue(0),
+    getFeeData: jest.fn().mockResolvedValue({ maxFeePerGas: 100n, maxPriorityFeePerGas: 10n, gasPrice: null }),
+    estimateGas: jest.fn().mockResolvedValue(100_000n),
+    broadcastTransaction: jest.fn().mockResolvedValue({ hash: `0x${'b'.repeat(64)}` }),
+    waitForTransaction: jest.fn().mockResolvedValue({ status: 1 }),
     call: jest.fn(async (transaction: { data?: string }) => {
       const selector = (transaction.data || '').slice(0, 10);
       if (selector === readonlyInterface.getFunction('allowance')?.selector) {
@@ -70,6 +98,7 @@ describe('bounded spend execution', () => {
   const mockSigner = {
     getAddress: jest.fn().mockResolvedValue('0x9999999999999999999999999999999999999999'),
     provider: mockProvider,
+    signTransaction: jest.fn().mockResolvedValue('0x1234'),
   } as unknown as ethers.Signer;
 
   function installStatefulOperations() {
@@ -113,8 +142,10 @@ describe('bounded spend execution', () => {
     });
     serviceMock.TokenOperations.markSubmitted.mockImplementation(async (key: string, hash: string) => {
       const operation = operations.get(key);
-      operation.tx_hash = hash;
-      operation.status = 'submitted';
+      if (operation) {
+        operation.tx_hash = hash;
+        operation.status = 'submitted';
+      }
       return operation;
     });
     serviceMock.TokenOperations.markConfirmed.mockImplementation(async (key: string) => {
@@ -135,8 +166,27 @@ describe('bounded spend execution', () => {
     });
     serviceMock.TokenOperations.markUnknown.mockImplementation(async (key: string, message: string) => {
       const operation = operations.get(key);
-      operation.status = 'unknown';
-      operation.error_message = message;
+      if (operation) {
+        operation.status = 'unknown';
+        operation.error_message = message;
+      }
+      return operation;
+    });
+    serviceMock.TreasuryTransactions.markSubmitted.mockImplementation(async (key: string, hash: string) => {
+      const operation = operations.get(key);
+      if (operation) {
+        operation.tx_hash = hash;
+        operation.status = 'submitted';
+      }
+      return operation;
+    });
+    serviceMock.TreasuryTransactions.markUnknown.mockImplementation(async (key: string, diagnostic: any) => {
+      const operation = operations.get(key);
+      if (operation) {
+        operation.tx_hash = diagnostic.savedHash || operation.tx_hash;
+        operation.status = 'unknown';
+        operation.diagnostic_context = diagnostic;
+      }
       return operation;
     });
     serviceMock.TokenOperations.markPreflightFailed.mockImplementation(async (key: string, message: string) => {
@@ -160,6 +210,11 @@ describe('bounded spend execution', () => {
       hash: `0x${'b'.repeat(64)}`,
       wait: jest.fn().mockResolvedValue({ status: 1 }),
     });
+    (mockProvider.getTransactionCount as jest.Mock).mockResolvedValue(0);
+    (mockProvider.getFeeData as jest.Mock).mockResolvedValue({ maxFeePerGas: 100n, maxPriorityFeePerGas: 10n, gasPrice: null });
+    (mockProvider.estimateGas as jest.Mock).mockResolvedValue(100_000n);
+    (mockProvider.broadcastTransaction as jest.Mock).mockResolvedValue({ hash: `0x${'b'.repeat(64)}` });
+    (mockSigner.signTransaction as jest.Mock).mockResolvedValue('0x1234');
     (mockContract.transferFrom as any).staticCall = jest.fn().mockResolvedValue(true);
     (mockProvider.call as unknown as jest.Mock).mockImplementation(async (transaction: { data?: string }) => {
       const selector = (transaction.data || '').slice(0, 10);
@@ -219,7 +274,7 @@ describe('bounded spend execution', () => {
     const second = processSpend(request, mockSigner);
     const results = await Promise.all([first, second]);
 
-    expect(mockContract.transferFrom).toHaveBeenCalledTimes(1);
+    expect(mockProvider.broadcastTransaction).toHaveBeenCalledTimes(1);
     expect(results.some(result => result.success)).toBe(true);
     expect(results.some(result => result.pending)).toBe(true);
   });
@@ -236,7 +291,7 @@ describe('bounded spend execution', () => {
     const second = processSpend(keyedRequest, mockSigner);
     const results = await Promise.all([first, second]);
 
-    expect(mockContract.transferFrom).toHaveBeenCalledTimes(1);
+    expect(mockProvider.broadcastTransaction).toHaveBeenCalledTimes(1);
     expect(results.map(result => result.operationKey)).toEqual([
       spendOperationKey('contract-1', 'concurrent-caller-key'),
       spendOperationKey('contract-1', 'concurrent-caller-key'),
@@ -257,22 +312,41 @@ describe('bounded spend execution', () => {
     const replay = await processSpend(request, mockSigner);
     expect(replay.success).toBe(true);
     expect(replay.txHash).toBe(`0x${'b'.repeat(64)}`);
-    expect(mockContract.transferFrom).toHaveBeenCalledTimes(1);
+    expect(mockProvider.broadcastTransaction).toHaveBeenCalledTimes(1);
   });
 
-  it('keeps an ambiguous allowance-looking submission claimed and does not resubmit', async () => {
+  it('reconciles a saved spend hash after an HTTP 500 broadcast response without rebroadcasting', async () => {
     installStatefulOperations();
-    mockContract.transferFrom.mockRejectedValueOnce(new Error('insufficient allowance after broadcast'));
+    const evidenceMock = require('./spendEvidence').verifySpendEvidence as jest.Mock;
+    evidenceMock.mockResolvedValueOnce({
+      valid: false,
+      failure: {
+        code: 'PROVIDER_ERROR',
+        message: 'receipt lookup temporarily unavailable',
+        pending: true,
+      },
+    });
+    (mockProvider.broadcastTransaction as jest.Mock).mockRejectedValueOnce(Object.assign(
+      new Error('server response 500 https://rpc.example.test/?secret=redacted'),
+      { code: 'SERVER_ERROR', error: { code: 19, traceId: 'spend-trace-500' } },
+    ));
 
     const first = await processSpend(request, mockSigner);
     expect(first.success).toBe(false);
     expect(first.pending).toBe(true);
-    expect(first.requiresReview).toBe(true);
+    expect(first.requiresReview).toBe(false);
+    expect(first.txHash).toBe(`0x${'b'.repeat(64)}`);
+    expect(first.diagnostic).toMatchObject({
+      stage: 'receipt',
+      errorCode: 'RECEIPT_READ_UNAVAILABLE',
+      savedHash: `0x${'b'.repeat(64)}`,
+    });
 
     const replay = await processSpend(request, mockSigner);
-    expect(replay.success).toBe(false);
-    expect(replay.requiresReview).toBe(true);
-    expect(mockContract.transferFrom).toHaveBeenCalledTimes(1);
+    expect(replay.success).toBe(true);
+    expect(replay.operationStatus).toBe('projected');
+    expect(replay.txHash).toBe(`0x${'b'.repeat(64)}`);
+    expect(mockProvider.broadcastTransaction).toHaveBeenCalledTimes(1);
     const serviceMock = require('./database/service');
     expect(serviceMock.TokenOperations.markPreflightFailed).not.toHaveBeenCalled();
   });
@@ -311,6 +385,11 @@ describe('bounded spend execution', () => {
     expect(serviceMock.TokenOperations.markPreflightFailed).toHaveBeenCalledWith(
       request.operationKey,
       expect.stringContaining('SPEND_PREFLIGHT_UNAVAILABLE'),
+      expect.objectContaining({
+        stage: 'preflight',
+        errorCode: 'RPC_READ_UNAVAILABLE',
+        retryable: true,
+      }),
     );
     expect(serviceMock.TokenOperations.markUnknown).not.toHaveBeenCalled();
   });
@@ -333,6 +412,11 @@ describe('bounded spend execution', () => {
     expect(require('./database/service').TokenOperations.markPreflightFailed).toHaveBeenCalledWith(
       request.operationKey,
       expect.stringContaining('SPEND_PREFLIGHT_UNAVAILABLE'),
+      expect.objectContaining({
+        stage: 'preflight',
+        errorCode: 'RPC_READ_UNAVAILABLE',
+        retryable: true,
+      }),
     );
   });
 
@@ -355,7 +439,7 @@ describe('bounded spend execution', () => {
     const replay = await processSpend(request, mockSigner);
     expect(replay.success).toBe(true);
     expect(replay.operationKey).toBe(request.operationKey);
-    expect(mockContract.transferFrom).toHaveBeenCalledTimes(1);
+    expect(mockProvider.broadcastTransaction).toHaveBeenCalledTimes(1);
   });
 
   it('does not project a mined transaction when token evidence has no matching Transfer log', async () => {
@@ -396,7 +480,7 @@ describe('bounded spend execution', () => {
     const replay = await processSpend(request, mockSigner);
     expect(replay.success).toBe(true);
     expect(replay.txHash).toBe(`0x${'b'.repeat(64)}`);
-    expect(mockContract.transferFrom).toHaveBeenCalledTimes(1);
+    expect(mockProvider.broadcastTransaction).toHaveBeenCalledTimes(1);
   });
 
   it('retains the known spend operation when saving a failed evidence state fails', async () => {
@@ -515,7 +599,7 @@ describe('bounded spend execution', () => {
     expect(first.operationKey).toBeDefined();
     expect(replay.success).toBe(true);
     expect(replay.txHash).toBe(first.txHash);
-    expect(mockContract.transferFrom).toHaveBeenCalledTimes(1);
+    expect(mockProvider.broadcastTransaction).toHaveBeenCalledTimes(1);
   });
 
   it('derives one stable operation key from the exact caller idempotency key', async () => {
@@ -533,7 +617,34 @@ describe('bounded spend execution', () => {
     expect(first.operationKey).toBe(spendOperationKey('contract-1', ' caller-key '));
     expect(replay.success).toBe(true);
     expect(replay.operationKey).toBe(first.operationKey);
-    expect(mockContract.transferFrom).toHaveBeenCalledTimes(1);
+    expect(mockProvider.broadcastTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects a changed high-precision settlement context before replay reconciliation', async () => {
+    installStatefulOperations();
+    const serviceMock = require('./database/service');
+    const persist = serviceMock.SpendReservations.persistSettlementContext as jest.Mock;
+    persist.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error('RESERVATION_SETTLEMENT_CONTEXT_MISMATCH'));
+
+    const first = await processSpend({
+      ...request,
+      settlementContext: { reservationId: request.reservationId, deliveredKwh: 1.9999 },
+    }, mockSigner);
+    expect(first.success).toBe(true);
+
+    const replay = await processSpend({
+      ...request,
+      settlementContext: { reservationId: request.reservationId, deliveredKwh: 1.9998 },
+    }, mockSigner);
+    expect(replay).toMatchObject({
+      success: false,
+      requiresReview: true,
+      retryable: false,
+      movementOutcome: 'unknown',
+    });
+    expect(replay.error).toContain('RESERVATION_SETTLEMENT_CONTEXT_MISMATCH');
+    expect(serviceMock.TokenOperations.claim).toHaveBeenCalledTimes(1);
+    expect(mockProvider.broadcastTransaction).toHaveBeenCalledTimes(1);
   });
 
   it('recovers a saved spend by verifying its hash and projecting without a replacement transfer', async () => {

@@ -275,6 +275,11 @@ transaction hashes when known, policy revision, and safe `message` text. A
 normalisation or validation failure is `400` with the structured error above;
 authentication failures are `401`/`403`.
 
+When a dependency outage is proven to occur before reservation token movement,
+the endpoint returns `503` with `retryable: true`, `movementOutcome:
+"no_movement"`, and the original operation key. Retry the identical CDR and
+durable operation key rather than creating a replacement payment.
+
 Reward rules are persisted by policy revision. Each calculation uses one
 request-local snapshot. Charging eligibility uses the session start instant in
 the configured country IANA timezone; a session that crosses a window is not
@@ -325,8 +330,12 @@ durable and must not be inferred from a generic failed operation:
 | `unknown` | The result cannot prove movement or no movement; keep the original key/hash and review. |
 | `review` | A conflict or validation issue requires an operator. |
 
-A `202` keeps the original operation/key/hash for retry. A receipt persistence
+A `202` keeps the original operation/key/hash for retry. A dependency outage
+proven before movement returns `503` with `retryable: true` and
+`movementOutcome: "no_movement"`; retry the same key. A receipt persistence
 failure after confirmed movement is not permission to transfer again.
+An immutable saved-intent conflict returns `409` and requires operator review;
+it never submits a replacement transfer.
 
 ### Reservation flow
 
@@ -361,9 +370,22 @@ an external wallet; the user signs it, and the confirmed hash is passed to
 returns `reserved`, `settling`, `settled`, or `released`, the original
 session/provider, reserved/settled/released amounts, delivered kWh, token hash,
 `spendReceipt`, and `receiptStatus` (`not_created`, `pending`, `settled`, or
-`none`). A confirmed movement can remain `pending` until receipt persistence;
-polling does not create a new movement. Invalid UUIDs are `400`, another
-eMAID's reservation is not disclosed, and a missing reservation is `404`.
+`none`). It also returns the durable `operationKey`, operation status, movement
+outcome, and safe failure diagnostics when the reservation operation is still
+submitting, awaiting a receipt, or requires review. A confirmed movement can
+remain `pending` until receipt persistence; polling does not create a new
+movement. Invalid UUIDs are `400`, another eMAID's reservation is not
+disclosed, and a missing reservation is `404`.
+
+For a positive CDR settlement, the API persists `deliveredKwh` through the
+reservation service before calling the token spend executor. The reporting
+column keeps the conservative three-decimal value, while `settlement_context`
+retains the validated original decimal for recovery. Token settlement still
+uses the exact two-decimal token amount calculated from the CDR. Repeating the
+same value is idempotent, while a changed CDR returns HTTP `409` with
+`RESERVATION_CONTEXT_MISMATCH`, `requiresReview: true`, `retryable: false`, and
+`movementOutcome: "no_movement"`. No token submission is attempted after that
+conflict.
 
 ### Signed receipt verification: `POST /spend-receipts/verify`
 
@@ -408,9 +430,13 @@ locked-down deployment and prefer `/wallet/me`.
 
 The wallet mutation routes are:
 
-- `POST /wallet/:uid/mode`: `{ mode: "managed" | "custodial", walletAddress?, allowSplit? }`.
-  Switching with a non-zero source balance returns `409 SOURCE_WALLET_HAS_BALANCE`
-  unless `allowSplit` is explicitly used.
+- `POST /wallet/:uid/mode`: `{ mode: "managed" | "custodial", walletAddress?, allowSplit?, idempotencyKey? }`.
+  The mode action identity is optional because mode persistence is a user-state
+  mutation. Supply one stable value as `idempotencyKey` or the `Idempotency-Key`
+  header when the custodial allowance-revoke action must be retryable after an
+  uncertain response; reuse it only for the same request. Supplying both forms
+  requires them to match. Switching with a non-zero source balance returns
+  `409 SOURCE_WALLET_HAS_BALANCE` unless `allowSplit` is explicitly used.
 - `PATCH /wallet/:uid/profile`: optional `{ walletName?: string | null,
   walletAddress?: string }`.
 - `POST /wallet/:uid/contract-ids`: `{ contractId: eMAID }` (the legacy `uid`
@@ -420,11 +446,37 @@ The wallet mutation routes are:
 - `PATCH /wallet/:uid/linked-wallets/:walletAddress/profile`: `{ walletName? }`.
 - `DELETE /wallet/:uid/linked-wallets/:walletAddress`: `{ signature }`; signature
   proves unlink ownership.
-- `POST /wallet/:uid/move-funds`: `{ targetAddress }`; target must be a valid
-  address and the response includes the confirmed transfer hash/amount.
+- `POST /wallet/:uid/move-funds`: `{ targetAddress, idempotencyKey }`; target
+  must be a valid address and one stable request identity is required either in
+  the body or the `Idempotency-Key` header. Reuse the exact same value only to
+  retry this transfer after an uncertain response. A proven-unsent dependency
+  failure returns `503`; a saved token hash awaiting receipt confirmation
+  returns `202`; a conflict, allowance review, or unknown hashless outcome
+  returns `409`. The response includes the transfer hash only when it belongs
+  to this movement.
+
+For example, a caller can make a retryable move request with the same key on
+every retry:
+
+```json
+{
+  "targetAddress": "0x1111111111111111111111111111111111111111",
+  "idempotencyKey": "beia-3-move-2026-10-13-001"
+}
+```
+
+The same value can instead be sent as `Idempotency-Key`. Supplying both forms
+requires them to match. A changed target, wallet, asset, or mode is a new
+operation and must use a new key; an uncertain response must be reconciled or
+retried with its original key before any replacement movement is considered.
 
 These routes return a wallet payload on success and safe English validation
 messages on failure. They do not accept a token UID as an ownership substitute.
+Wallet transaction failures retain the original operation identity and expose a
+safe error code, retryability, and (when known) the operation's own transaction
+hash. A funding or allowance diagnostic is auxiliary evidence and never becomes
+the transfer `txHash`; do not submit a replacement transfer while the outcome is
+unknown or requires review.
 
 `GET /transactions?limit=50` returns `{ status: "ok", transactionCount,
 transactions }` for the recent award/spend history visible to the trusted API
@@ -467,14 +519,19 @@ returns `404` when it is absent. Writes are revisioned and durable.
   `not_ready`, counts, and checks. A `ready` response has zero failed and
   warning checks; `ready_with_warnings` has at least one matching warning and
   no failed checks. Missing `API_KEY` or alert webhook configuration can be
-  warnings while the target is being reviewed; missing `INGEST_API_KEY`, admin
-  credentials, token/signer configuration, or durable persistence checks is a
-  failure.
+  warnings while the target is being reviewed. CDR ingestion accepts the
+  configured dedicated `INGEST_API_KEY` when present and otherwise uses the
+  existing `API_KEY`/`BEIA_API_KEY` resolver; it fails readiness only when no
+  usable API key exists. Admin credentials, token/signer configuration, or
+  durable persistence checks remain failures when their paths are enabled.
 - `POST /admin/alerts/test` returns `202` for sent/queued or audited skipped
   delivery, and `502` when an attempted alert delivery fails. The response
   reflects the delivery result, not merely configuration presence.
 - `GET /admin/evidence-pack` returns a point-in-time readiness, configuration,
-  reconciliation, metrics, retry/warning/error, and alert evidence snapshot.
+  reconciliation, metrics, retry/warning/error, requires-review, and alert
+  evidence snapshot. The `audit.reviewRequired` list uses the same sanitized
+  presentation as `/admin/audit` and includes stable error codes and bounded
+  RPC diagnostics without raw provider errors, URLs, signed bytes, or secrets.
   If a dependency is unavailable it returns `EVIDENCE_PACK_UNAVAILABLE` with a
   safe retry message.
 
@@ -492,9 +549,11 @@ details.
 
 `GET /admin/operations` accepts bounded `scope`, `limit`, `offset`, and `emaid`
 filters. It returns server-derived operation fields, movement outcome, and a
-safe recovery decision/reason code; it never returns raw intent, CDR snapshots,
-provider errors, or sensitive fingerprints. A `uid` filter is not an alternate
-ownership selector.
+safe recovery decision/reason code. When the worker persisted a diagnostic, the
+response may include its allowlisted error code, lifecycle stage, RPC method/code,
+HTTP status, trace ID, saved hash, nonce, and retryability. It never returns raw
+intent, CDR snapshots, provider errors, signed bytes, private keys, or sensitive
+fingerprints. A `uid` filter is not an alternate ownership selector.
 
 `POST /admin/operations/recover` accepts exactly:
 
@@ -536,12 +595,32 @@ JSON parsing and request-size middleware return `INVALID_JSON` (`400`) and
 | `AWARD_CHARGING_SESSION_COLLISION_REVIEW` | A distinct CDR claimed a protected provider/physical-session tuple. |
 | `SPEND_RECEIPT_CONTEXT_MISMATCH` | Receipt evidence does not match the saved spend intent. |
 | `SPEND_RECEIPT_RECOVERY_PENDING` / `SPEND_RECEIPT_RECOVERY_BLOCKED` | Movement/projection is known but receipt recovery is pending or requires review. |
+| `RPC_READ_UNAVAILABLE` | A bounded chain/RPC read could not establish the operation context; no payment is implied. |
+| `RPC_SUBMISSION_UNAVAILABLE` | Preparation or submission could not be completed; follow the returned stage and original operation key. |
+| `TRANSACTION_CONFIRMATION_PENDING` | A known operation or hash is awaiting receipt confirmation; reconcile the saved hash. |
+| `CHAIN_OUTCOME_UNKNOWN` | The chain response was ambiguous; stop blind retries and use read-only recovery/review. |
+| `PROJECTION_PENDING` | Movement is confirmed or retained, but the database receipt/projection is pending. |
+| `RESERVATION_CONTEXT_MISMATCH` | A repeated CDR changed immutable delivered-energy context; operator review is required. |
+
+Financial failures include `errorCode`, `stage`, `retryable`,
+`requiresReview`, `operationKey`, `txHash`, and `movementOutcome`. Where known,
+`diagnostic` contains only `stage`, `rpcMethod`, `rpcCode`, `httpStatus`,
+`traceId`, `rpcEndpoint`, an ordered `rpcFailover` list of safe endpoint
+labels/outcomes, `errorCode`, `retryable`, `savedHash`, and `nonce`. Endpoint
+labels never contain URLs, query strings, or credentials. The public message
+remains safe and contains no provider body or URL. Core transaction stages are
+`asset_context`, `preflight`, `prepare`, `persist_hash`,
+`broadcast`, and `receipt`; API responses may additionally report
+`validation`, `projection`, or `recovery` while preserving the precise stage
+inside `diagnostic`.
 
 For a timeout or connection loss, retry only the identical saved CDR, stable
 manual idempotency key, operation key, custodial hash, or reservation poll. RPC
 receipt reads use a bounded read-only retry budget; broadcasts and approvals
 are never retried blindly. A response with `requiresReview`, `movementOutcome:
-"unknown"`, or an identity/session conflict must stop automated retries.
+"unknown"`, or an identity/session conflict must stop automated retries. A
+known hash is always reconciled read-only; it is never replaced by a new
+payment.
 
 ## 8. Configuration and release boundary
 
@@ -559,11 +638,37 @@ ADMIN_PASSWORD=...
 BEIA_ADMIN_EMAIL=...
 BEIA_ADMIN_PASSWORD=...
 DATABASE_URL=...
-ENABLE_TEST_UID_LOOKUP=false
+# ENABLE_TEST_UID_LOOKUP=true|false (target-owner policy)
 TREASURY_ADDRESS=0x...
 TREASURY_SIGNER_KEY_FILE=...
 ADMIN_ALERT_WEBHOOK_URL=https://...
+POLYGON_RPC_URL=https://polygon-amoy.drpc.org
+POLYGON_RPC_FALLBACK_URLS=https://polygon-amoy-bor-rpc.publicnode.com
 ```
+
+`POLYGON_RPC_URL` selects the primary Polygon RPC endpoint. The optional
+`POLYGON_RPC_FALLBACK_URLS` value is a comma-separated, ordered list of
+same-chain failover endpoints. `POLYGON_RPC_FALLBACK_URL` is the single-endpoint
+form for deployments that do not need a list; when both forms are supplied,
+the list takes precedence. Use endpoints for the same configured `CHAIN_ID`
+only. The example PublicNode endpoint is Polygon Amoy chain ID `80002`; it is
+the built-in fallback when the default dRPC Amoy primary is selected. A custom
+primary requires an explicitly configured same-chain backup. Startup/readiness
+and the provider adapter validate the chain identity before accepting a
+fallback, and diagnostics may expose only an allowlisted endpoint label or
+ordinal, never a URL, query string, or credential.
+
+Failover uses bounded, same-chain requests. Reads and preparation checks may
+advance to the next endpoint. For `eth_sendRawTransaction`, the adapter may
+retry only the exact already-signed bytes, which preserve the original hash and
+nonce, after a transient transport or RPC failure. It never re-signs, allocates
+a new nonce, creates a replacement, or replays a provider-managed
+`sendTransaction` through another endpoint. A lost submission or receipt
+response remains tied to the original operation key/hash and is reconciled
+against that durable identity. Fallback errors retain the sanitized RPC
+stage/code/status/trace and endpoint label so an operator can distinguish a
+primary outage from confirmation-pending or ambiguous broadcast. Do not place
+provider keys in this repository or in public API responses.
 
 Keep existing wallet derivation, database column names, and standards wire names
 unchanged. The additive policy, charging-session, and active-wallet schema work

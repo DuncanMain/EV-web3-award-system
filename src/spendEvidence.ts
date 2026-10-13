@@ -1,9 +1,12 @@
 import { ethers } from 'ethers';
 import {
+  extractRpcDiagnostic,
   RpcReadRetryOptions,
+  isTransientRpcReadError,
   withNullableRpcReadRetry,
   withRpcReadRetry,
 } from './rpcProvider';
+import type { TransactionDiagnostic } from './types';
 
 const TX_HASH_PATTERN = /^0x[0-9a-fA-F]{64}$/;
 const TRANSFER_TOPIC = ethers.id('Transfer(address,address,uint256)').toLowerCase();
@@ -42,6 +45,7 @@ export interface SpendEvidenceFailure {
   code: SpendEvidenceFailureCode;
   message: string;
   pending: boolean;
+  diagnostic?: Pick<TransactionDiagnostic, 'rpcMethod' | 'providerCode' | 'rpcCode' | 'httpStatus' | 'traceId' | 'rpcEndpoint' | 'rpcFailover' | 'retryable'>;
 }
 
 export interface SpendEvidenceRequest {
@@ -77,9 +81,18 @@ export type SpendEvidenceResult =
 function failure(
   code: SpendEvidenceFailureCode,
   message: string,
-  pending = false
+  pending = false,
+  diagnostic?: SpendEvidenceFailure['diagnostic'],
 ): SpendEvidenceResult {
-  return { valid: false, failure: { code, message, pending } };
+  return {
+    valid: false,
+    failure: {
+      code,
+      message,
+      pending,
+      ...(diagnostic ? { diagnostic } : {}),
+    },
+  };
 }
 
 function canonicalAddress(value: unknown, fieldName: string): string | SpendEvidenceFailure {
@@ -130,9 +143,38 @@ function parseAmountUnits(value: unknown): bigint | SpendEvidenceFailure {
   };
 }
 
+function boundedDiagnosticText(value: unknown, max = 96): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  const text = String(value).replace(/[\u0000-\u001f\u007f]/g, '').trim();
+  return text ? text.slice(0, max) : undefined;
+}
+
+function providerReadDiagnostic(
+  error: unknown,
+  rpcMethod: 'eth_chainId' | 'eth_getTransactionByHash' | 'eth_getTransactionReceipt',
+): SpendEvidenceFailure['diagnostic'] {
+  const details = extractRpcDiagnostic(error);
+  return {
+    rpcMethod,
+    ...(details.providerCode ? { providerCode: details.providerCode } : {}),
+    ...(details.rpcCode === undefined ? {} : { rpcCode: details.rpcCode }),
+    ...(details.httpStatus === undefined ? {} : { httpStatus: details.httpStatus }),
+    ...(details.traceId ? { traceId: details.traceId } : {}),
+    ...(details.endpointLabel ? { rpcEndpoint: details.endpointLabel } : {}),
+    ...(details.failover?.length ? { rpcFailover: details.failover } : {}),
+    retryable: isTransientRpcReadError(error),
+  };
+}
+
 function formatProviderError(operation: string, error: unknown): string {
-  const detail = error instanceof Error ? error.message : String(error);
-  return `${operation} failed while verifying spend evidence: ${detail}`;
+  const details = extractRpcDiagnostic(error);
+  const fields = [
+    details.providerCode,
+    details.rpcCode === undefined ? undefined : `rpc=${details.rpcCode}`,
+    details.httpStatus === undefined ? undefined : `http=${details.httpStatus}`,
+    details.traceId === undefined ? undefined : `trace=${details.traceId}`,
+  ].filter(Boolean).join(', ');
+  return `${operation} failed while verifying spend evidence${fields ? ` (${fields})` : ''}`;
 }
 
 /**
@@ -167,12 +209,16 @@ export async function verifySpendEvidence(
       () => input.provider.getNetwork(),
       input.readRetry,
     );
+  } catch (error) {
+    return failure('PROVIDER_ERROR', formatProviderError('chain-id lookup', error), false, providerReadDiagnostic(error, 'eth_chainId'));
+  }
+  try {
     transaction = await withNullableRpcReadRetry(
       () => input.provider.getTransaction(txHash),
       input.readRetry,
     );
   } catch (error) {
-    return failure('PROVIDER_ERROR', formatProviderError('transaction lookup', error));
+    return failure('PROVIDER_ERROR', formatProviderError('transaction lookup', error), false, providerReadDiagnostic(error, 'eth_getTransactionByHash'));
   }
 
   let actualChainId: bigint;
@@ -230,7 +276,7 @@ export async function verifySpendEvidence(
       input.readRetry,
     );
   } catch (error) {
-    return failure('PROVIDER_ERROR', formatProviderError('receipt lookup', error));
+    return failure('PROVIDER_ERROR', formatProviderError('receipt lookup', error), false, providerReadDiagnostic(error, 'eth_getTransactionReceipt'));
   }
   if (!receipt) {
     return failure('RECEIPT_PENDING', `transaction ${txHash} has no mined receipt yet`, true);

@@ -632,6 +632,21 @@ The component does not allow wallet switching by typed address alone.
 Used to switch between managed and custodial wallet mode after wallet ownership
 has been proven.
 
+Send a stable request identity in either the JSON `idempotencyKey` field or the
+`Idempotency-Key` header. The component reuses that exact value if the response
+is uncertain, while a new mode change uses a new value. The identity is passed
+to the allowance-revoke action so a retry cannot create a second gas or revoke
+operation. It does not change the allowance policy: switching to custodial
+still revokes the treasury allowance on the managed wallet when needed.
+
+`POST /wallet/:uid/move-funds` uses the same request identity contract. A caller
+must send `{ "targetAddress": "0x...", "idempotencyKey": "wallet-move-..." }`
+or the equivalent `Idempotency-Key` header. Retry the same value to recover the
+original movement. If the response reports an unknown or review state, inspect
+the saved operation and its known transfer hash before taking any follow-up;
+funding or allowance hashes in diagnostics are auxiliary and must not be used as
+the token movement hash.
+
 ## Authentication Notes
 
 The component always sends `x-contract-id`.

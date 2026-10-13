@@ -2,6 +2,8 @@ import type { Knex } from 'knex';
 
 export const TOKEN_OPERATIONS_TABLE = 'token_operations';
 export const APPROVAL_PREPARATIONS_TABLE = 'approval_preparations';
+export const TREASURY_TRANSACTION_LEASES_TABLE = 'treasury_transaction_leases';
+export const TREASURY_TRANSACTION_SIGNER_NONCE_INDEX = 'treasury_transaction_leases_signer_nonce_unique';
 /**
  * Nullable physical charging-session provenance. It is deliberately separate
  * from session_id, which remains the historical CDR/idempotency key field.
@@ -89,11 +91,45 @@ async function ensureApprovalPreparations(db: QueryableKnex): Promise<void> {
       table.string('treasury_address', 42).notNullable();
       table.string('status', 20).notNullable().index();
       table.string('funding_tx_hash', 66).nullable();
+      table.bigInteger('funding_tx_nonce').nullable();
+      table.jsonb('funding_tx_context').nullable();
+      // A funded row can later require one measured top-up.  Keep the
+      // active attempt identity/value alongside the old funding hash; the
+      // nonce lease table remains the immutable journal for every attempt.
+      table.string('funding_attempt_key', 280).nullable();
+      table.string('funding_attempt_value', 80).nullable();
       table.string('approval_tx_hash', 66).nullable();
+      table.jsonb('diagnostic_context').nullable();
       table.text('error_message').nullable();
       table.timestamp('created_at').notNullable().defaultTo(db.fn.now());
       table.timestamp('updated_at').notNullable().defaultTo(db.fn.now());
     });
+  } else {
+    if (!(await db.schema.hasColumn(APPROVAL_PREPARATIONS_TABLE, 'funding_tx_nonce'))) {
+      await db.schema.alterTable(APPROVAL_PREPARATIONS_TABLE, table => {
+        table.bigInteger('funding_tx_nonce').nullable();
+      });
+    }
+    if (!(await db.schema.hasColumn(APPROVAL_PREPARATIONS_TABLE, 'funding_tx_context'))) {
+      await db.schema.alterTable(APPROVAL_PREPARATIONS_TABLE, table => {
+        table.jsonb('funding_tx_context').nullable();
+      });
+    }
+    if (!(await db.schema.hasColumn(APPROVAL_PREPARATIONS_TABLE, 'funding_attempt_key'))) {
+      await db.schema.alterTable(APPROVAL_PREPARATIONS_TABLE, table => {
+        table.string('funding_attempt_key', 280).nullable();
+      });
+    }
+    if (!(await db.schema.hasColumn(APPROVAL_PREPARATIONS_TABLE, 'funding_attempt_value'))) {
+      await db.schema.alterTable(APPROVAL_PREPARATIONS_TABLE, table => {
+        table.string('funding_attempt_value', 80).nullable();
+      });
+    }
+    if (!(await db.schema.hasColumn(APPROVAL_PREPARATIONS_TABLE, 'diagnostic_context'))) {
+      await db.schema.alterTable(APPROVAL_PREPARATIONS_TABLE, table => {
+        table.jsonb('diagnostic_context').nullable();
+      });
+    }
   }
 
   // These constraints are deliberately strict for new durable state.  A
@@ -147,6 +183,21 @@ export async function ensureTokenOperationTables(db: QueryableKnex): Promise<voi
     } else {
       await db(TOKEN_OPERATIONS_TABLE).whereNull('movement_outcome').update({ movement_outcome: 'unknown' });
     }
+    if (!(await db.schema.hasColumn(TOKEN_OPERATIONS_TABLE, 'tx_nonce'))) {
+      await db.schema.alterTable(TOKEN_OPERATIONS_TABLE, table => {
+        table.bigInteger('tx_nonce').nullable();
+      });
+    }
+    if (!(await db.schema.hasColumn(TOKEN_OPERATIONS_TABLE, 'tx_context'))) {
+      await db.schema.alterTable(TOKEN_OPERATIONS_TABLE, table => {
+        table.jsonb('tx_context').nullable();
+      });
+    }
+    if (!(await db.schema.hasColumn(TOKEN_OPERATIONS_TABLE, 'diagnostic_context'))) {
+      await db.schema.alterTable(TOKEN_OPERATIONS_TABLE, table => {
+        table.jsonb('diagnostic_context').nullable();
+      });
+    }
   } else {
     await db.schema.createTable(TOKEN_OPERATIONS_TABLE, table => {
       table.uuid('id').primary().defaultTo(db.raw('gen_random_uuid()'));
@@ -164,6 +215,9 @@ export async function ensureTokenOperationTables(db: QueryableKnex): Promise<voi
       table.string('status', 20).notNullable().index();
       table.string('movement_outcome', 20).notNullable().defaultTo('unknown').index();
       table.string('tx_hash', 66).nullable().index();
+      table.bigInteger('tx_nonce').nullable();
+      table.jsonb('tx_context').nullable();
+      table.jsonb('diagnostic_context').nullable();
       table.text('error_message').nullable();
       table.timestamp('submitted_at').nullable();
       table.timestamp('confirmed_at').nullable();
@@ -186,6 +240,71 @@ export async function ensureTokenOperationTables(db: QueryableKnex): Promise<voi
     `create unique index if not exists "${TOKEN_OPERATION_KEY_INDEX}" on "${TOKEN_OPERATIONS_TABLE}" (operation_key)`,
   );
   await ensureApprovalPreparations(db);
+}
+
+/**
+ * Shared nonce leases for every transaction signed by the treasury wallet.
+ * A lease is written only after signing succeeds and before broadcast, while
+ * the signer/chain advisory lock is held. This table is intentionally
+ * separate from token_operations because approval gas funding is also a
+ * treasury transaction but has a different durable preparation row.
+ */
+export async function ensureTreasuryTransactionTables(db: QueryableKnex): Promise<void> {
+  if (!(await db.schema.hasTable(TREASURY_TRANSACTION_LEASES_TABLE))) {
+    await db.schema.createTable(TREASURY_TRANSACTION_LEASES_TABLE, table => {
+      table.uuid('id').primary().defaultTo(db.raw('gen_random_uuid()'));
+      table.string('operation_key', 280).notNullable().unique().index();
+      table.string('target_operation_key', 280).nullable().index();
+      table.string('target_type', 40).notNullable();
+      table.string('chain_id', 80).notNullable();
+      table.string('signer_address', 42).notNullable();
+      table.bigInteger('nonce').notNullable();
+      table.string('tx_hash', 66).notNullable();
+      table.jsonb('tx_context').notNullable();
+      table.string('status', 20).notNullable().defaultTo('prepared').index();
+      table.jsonb('diagnostic_context').nullable();
+      table.text('error_message').nullable();
+      table.timestamp('created_at').notNullable().defaultTo(db.fn.now());
+      table.timestamp('updated_at').notNullable().defaultTo(db.fn.now());
+      table.unique(['chain_id', 'signer_address', 'nonce']);
+    });
+  } else {
+    const columns: Array<[string, (table: Knex.AlterTableBuilder) => void]> = [
+      ['target_operation_key', table => table.string('target_operation_key', 280).nullable()],
+      ['target_type', table => table.string('target_type', 40).notNullable().defaultTo('standalone')],
+      ['chain_id', table => table.string('chain_id', 80).notNullable().defaultTo('0')],
+      ['signer_address', table => table.string('signer_address', 42).notNullable().defaultTo('')],
+      ['nonce', table => table.bigInteger('nonce').notNullable().defaultTo(0)],
+      ['tx_hash', table => table.string('tx_hash', 66).notNullable().defaultTo('0x' + '0'.repeat(64))],
+      ['tx_context', table => table.jsonb('tx_context').notNullable().defaultTo('{}')],
+      ['status', table => table.string('status', 20).notNullable().defaultTo('prepared')],
+      ['diagnostic_context', table => table.jsonb('diagnostic_context').nullable()],
+      ['error_message', table => table.text('error_message').nullable()],
+    ];
+    for (const [column, add] of columns) {
+      if (!(await db.schema.hasColumn(TREASURY_TRANSACTION_LEASES_TABLE, column))) {
+        await db.schema.alterTable(TREASURY_TRANSACTION_LEASES_TABLE, add);
+      }
+    }
+    await db.raw(
+      `create unique index if not exists "${TREASURY_TRANSACTION_SIGNER_NONCE_INDEX}" `
+        + `on "${TREASURY_TRANSACTION_LEASES_TABLE}" (chain_id, lower(signer_address), nonce)`,
+    );
+  }
+  await db.raw(
+    `create unique index if not exists "${TREASURY_TRANSACTION_SIGNER_NONCE_INDEX}" `
+      + `on "${TREASURY_TRANSACTION_LEASES_TABLE}" (chain_id, lower(signer_address), nonce)`,
+  );
+}
+
+/** Preserve the source CDR energy text alongside PostgreSQL's three-decimal projection. */
+export async function ensureSettlementContextColumn(db: QueryableKnex): Promise<void> {
+  if (await db.schema.hasTable('spend_reservations')
+    && !(await db.schema.hasColumn('spend_reservations', 'settlement_context'))) {
+    await db.schema.alterTable('spend_reservations', table => {
+      table.jsonb('settlement_context').nullable();
+    });
+  }
 }
 
 /**
@@ -322,6 +441,10 @@ export interface TokenOperationSchemaStatus {
   approvalOperationKeyUnique: boolean;
   projectionHashIndexes: boolean;
   hashChecks: boolean;
+  transactionReliabilityTable: boolean;
+  transactionReliabilityColumns: boolean;
+  treasurySignerNonceIndex: boolean;
+  settlementContextColumn: boolean;
   validDuplicateGroups: number;
   allDuplicateGroups: number;
   invalidLegacyRows: number;
@@ -333,11 +456,29 @@ export interface TokenOperationSchemaStatus {
 export async function getTokenOperationSchemaStatus(db: QueryableKnex): Promise<TokenOperationSchemaStatus> {
   const tokenOperationsTable = await db.schema.hasTable(TOKEN_OPERATIONS_TABLE);
   const approvalPreparationsTable = await db.schema.hasTable(APPROVAL_PREPARATIONS_TABLE);
+  const treasuryTransactionTable = await db.schema.hasTable(TREASURY_TRANSACTION_LEASES_TABLE);
+  const spendReservationsTable = await db.schema.hasTable('spend_reservations');
+  const tokenReliabilityColumns = tokenOperationsTable
+    && (await Promise.all(['tx_nonce', 'tx_context', 'diagnostic_context'].map(column => db.schema.hasColumn(TOKEN_OPERATIONS_TABLE, column)))).every(Boolean);
+  const approvalReliabilityColumns = approvalPreparationsTable
+    && (await Promise.all([
+      'funding_tx_nonce', 'funding_tx_context', 'funding_attempt_key', 'funding_attempt_value', 'diagnostic_context',
+    ].map(column => db.schema.hasColumn(APPROVAL_PREPARATIONS_TABLE, column)))).every(Boolean);
+  const treasuryReliabilityColumns = treasuryTransactionTable
+    && (await Promise.all([
+      'target_operation_key', 'target_type', 'chain_id', 'signer_address', 'nonce', 'tx_hash',
+      'tx_context', 'status', 'diagnostic_context', 'error_message',
+    ].map(column => db.schema.hasColumn(TREASURY_TRANSACTION_LEASES_TABLE, column)))).every(Boolean);
+  const transactionReliabilityTable = treasuryTransactionTable;
+  const transactionReliabilityColumns = Boolean(tokenReliabilityColumns && approvalReliabilityColumns && treasuryReliabilityColumns);
+  const settlementContextColumn = spendReservationsTable
+    && await db.schema.hasColumn('spend_reservations', 'settlement_context');
   const tokenIndexes = await scopedIndexNames(db, TOKEN_OPERATIONS_TABLE, [
     TOKEN_OPERATION_HASH_INDEX,
     TOKEN_OPERATION_KEY_INDEX,
   ]);
   const approvalIndexes = await scopedIndexNames(db, APPROVAL_PREPARATIONS_TABLE, [APPROVAL_OPERATION_KEY_INDEX]);
+  const treasuryIndexes = await scopedIndexNames(db, TREASURY_TRANSACTION_LEASES_TABLE, [TREASURY_TRANSACTION_SIGNER_NONCE_INDEX]);
   const awardIndexes = await scopedIndexNames(db, 'awards', [PROJECTION_HASH_INDEXES.awards, FULL_PROJECTION_HASH_INDEXES.awards]);
   const spendIndexes = await scopedIndexNames(db, 'spends', [PROJECTION_HASH_INDEXES.spends, FULL_PROJECTION_HASH_INDEXES.spends]);
   const receiptIndexes = await scopedIndexNames(db, 'spend_receipts', [PROJECTION_HASH_INDEXES.receipts, FULL_PROJECTION_HASH_INDEXES.receipts]);
@@ -381,6 +522,11 @@ export async function getTokenOperationSchemaStatus(db: QueryableKnex): Promise<
   if (!hasTokenHashCheck) missing.push(TOKEN_OPERATION_HASH_CHECK);
   if (!hasFundingHashCheck) missing.push(APPROVAL_FUNDING_HASH_CHECK);
   if (!hasApprovalHashCheck) missing.push(APPROVAL_APPROVAL_HASH_CHECK);
+  if (!transactionReliabilityTable) missing.push(TREASURY_TRANSACTION_LEASES_TABLE);
+  if (!transactionReliabilityColumns) missing.push('transaction reliability columns');
+  const treasurySignerNonceIndex = treasuryIndexes.has(TREASURY_TRANSACTION_SIGNER_NONCE_INDEX);
+  if (!treasurySignerNonceIndex) missing.push(TREASURY_TRANSACTION_SIGNER_NONCE_INDEX);
+  if (!settlementContextColumn) missing.push('spend_reservations.settlement_context');
   return {
     tokenOperationsTable,
     approvalPreparationsTable,
@@ -389,11 +535,15 @@ export async function getTokenOperationSchemaStatus(db: QueryableKnex): Promise<
     approvalOperationKeyUnique,
     projectionHashIndexes,
     hashChecks,
+    transactionReliabilityTable,
+    transactionReliabilityColumns,
+    treasurySignerNonceIndex,
+    settlementContextColumn,
     validDuplicateGroups,
     allDuplicateGroups,
     invalidLegacyRows,
     stagedReady: missing.length === 0 && validDuplicateGroups === 0,
-    strictMigrationReady: allDuplicateGroups === 0,
+    strictMigrationReady: missing.length === 0 && allDuplicateGroups === 0,
     missing,
   };
 }
@@ -413,6 +563,8 @@ export async function stageTokenOperationSchema(db: Knex): Promise<void> {
       );
     }
     await ensureTokenOperationTables(trx);
+    await ensureTreasuryTransactionTables(trx);
+    await ensureSettlementContextColumn(trx);
     await ensureValidProjectionHashIndexes(trx);
     const after = await getTokenOperationSchemaStatus(trx);
     if (!after.stagedReady) {

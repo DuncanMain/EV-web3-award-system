@@ -203,7 +203,12 @@ Flow:
 4. Component calls `POST /wallet/:uid/linked-wallets` with `walletAddress` and
    `signature`.
 5. After the backend verifies the signature, component calls
-   `POST /wallet/:uid/mode`.
+   `POST /wallet/:uid/mode` with a stable `idempotencyKey`. If the response is
+   uncertain, the component retries the same key; a new mode change gets a new
+   key. API callers may send the equivalent `Idempotency-Key` header. To make
+   that retry handle survive a remount or page reload, supply a persisted
+   `walletModeIdempotencyKey`; the component's generated fallback only lives
+   for the current mounted instance.
 
 The signed message is:
 
@@ -231,6 +236,7 @@ type SparkzChargingCardProps = {
   showWalletDetails?: boolean;
   hideAfterSpend?: boolean;
   hideAfterSkip?: boolean;
+  walletModeIdempotencyKey?: string; // caller-owned key persisted across remounts for mode retries
   polygonExplorerBaseUrl?: string;
   /** Deprecated for reservation flow; use onReservationSettlement. */
   onSpendSuccess?: (receipt: SparkzSpendReceipt) => void;

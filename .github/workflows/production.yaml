@@ -10,6 +10,10 @@ env:
   IMAGE_NAME: ${{ github.repository }}
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+concurrency:
+  group: neverflat-main-deploy
+  cancel-in-progress: false
+
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
@@ -42,6 +46,64 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
 
+      - name: Verify NEVERFLAT target before staging
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: root
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+            set -euo pipefail
+            DEPLOY_DIR=/root/neverflat
+            ENV_FILE="$DEPLOY_DIR/.env"
+            COMPOSE_DEST="$DEPLOY_DIR/compose.production.yaml"
+
+            canonical_deploy_dir="$(realpath -e -- "$DEPLOY_DIR" 2>/dev/null || true)"
+            [[ "$canonical_deploy_dir" == "/root/neverflat" ]] || {
+              echo "NEVERFLAT target must resolve to /root/neverflat" >&2
+              exit 1
+            }
+            [[ -f "$ENV_FILE" ]] || {
+              echo "existing NEVERFLAT .env is required" >&2
+              exit 1
+            }
+            canonical_env_file="$(realpath -e -- "$ENV_FILE" 2>/dev/null || true)"
+            case "$canonical_env_file" in
+              "$canonical_deploy_dir"/*) ;;
+              *) echo "NEVERFLAT .env resolves outside the canonical target" >&2; exit 1 ;;
+            esac
+
+            if [[ -L "$COMPOSE_DEST" ]]; then
+              echo "NEVERFLAT compose destination must not be a symlink" >&2
+              exit 1
+            fi
+            if [[ -e "$COMPOSE_DEST" ]]; then
+              canonical_compose_dest="$(realpath -e -- "$COMPOSE_DEST" 2>/dev/null || true)"
+              case "$canonical_compose_dest" in
+                "$canonical_deploy_dir"/*) ;;
+                *) echo "NEVERFLAT compose destination resolves outside the canonical target" >&2; exit 1 ;;
+              esac
+            fi
+
+            db_identity="$(docker inspect neverflat-db --format '{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}')"
+            [[ "$db_identity" == "neverflat|postgres" ]] || {
+              echo "neverflat-db is not the expected NEVERFLAT postgres service" >&2
+              exit 1
+            }
+            app_inspection=""
+            if app_inspection="$(docker inspect neverflat-app --format '{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}' 2>&1)"; then
+              [[ "$app_inspection" == "neverflat|app" ]] || {
+                echo "neverflat-app is not the expected NEVERFLAT app service" >&2
+                exit 1
+              }
+            elif [[ "$app_inspection" != *"No such object"* && "$app_inspection" != *"No such container"* ]]; then
+              echo "existing neverflat-app inspection failed" >&2
+              exit 1
+            fi
+
+            docker compose version >/dev/null
+            docker network inspect shared-proxy >/dev/null
+
       - name: Copy production compose file to server
         uses: appleboy/scp-action@v0.1.7
         with:
@@ -60,20 +122,111 @@ jobs:
           BEIA_API_KEY: ${{ secrets.BEIA_API_KEY }}
           BEIA_ADMIN_EMAIL: ${{ secrets.BEIA_ADMIN_EMAIL }}
           BEIA_ADMIN_PASSWORD: ${{ secrets.BEIA_ADMIN_PASSWORD }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ github.token }}
+          SOURCE_COMMIT: ${{ github.sha }}
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: root
           key: ${{ secrets.SERVER_SSH_KEY }}
           command_timeout: 10m
-          envs: ADMIN_EMAIL,ADMIN_PASSWORD,BEIA_API_KEY,BEIA_ADMIN_EMAIL,BEIA_ADMIN_PASSWORD
+          envs: ADMIN_EMAIL,ADMIN_PASSWORD,BEIA_API_KEY,BEIA_ADMIN_EMAIL,BEIA_ADMIN_PASSWORD,GHCR_USER,GHCR_TOKEN,SOURCE_COMMIT
           script: |
             set -euo pipefail
-            cd /root/neverflat
+            DEPLOY_DIR=/root/neverflat
+            cd "$DEPLOY_DIR"
+            ENV_FILE="$DEPLOY_DIR/.env"
+            COMPOSE_FILE="$DEPLOY_DIR/compose.production.yaml"
+            canonical_deploy_dir="$(realpath -e -- "$DEPLOY_DIR" 2>/dev/null || true)"
+            [[ "$canonical_deploy_dir" == "/root/neverflat" ]] || {
+              echo "NEVERFLAT target must resolve to /root/neverflat" >&2
+              exit 1
+            }
+            [[ "${SOURCE_COMMIT:-}" =~ ^[0-9a-fA-F]{40}$ ]] || {
+              echo "SOURCE_COMMIT must be a full source commit SHA" >&2
+              exit 1
+            }
+            [[ -f "$ENV_FILE" && -f "$COMPOSE_FILE" ]] || {
+              echo "NEVERFLAT .env and compose file are required" >&2
+              exit 1
+            }
+            canonical_env_file="$(realpath -e -- "$ENV_FILE" 2>/dev/null || true)"
+            case "$canonical_env_file" in
+              "$canonical_deploy_dir"/*) ;;
+              *) echo "NEVERFLAT .env resolves outside the canonical target" >&2; exit 1 ;;
+            esac
+            if [[ -L "$COMPOSE_FILE" ]]; then
+              echo "NEVERFLAT compose file must not be a symlink" >&2
+              exit 1
+            fi
+            canonical_compose_file="$(realpath -e -- "$COMPOSE_FILE" 2>/dev/null || true)"
+            case "$canonical_compose_file" in
+              "$canonical_deploy_dir"/*) ;;
+              *) echo "NEVERFLAT compose file resolves outside the canonical target" >&2; exit 1 ;;
+            esac
+            db_identity="$(docker inspect neverflat-db --format '{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}')"
+            [[ "$db_identity" == "neverflat|postgres" ]] || {
+              echo "neverflat-db is not the expected NEVERFLAT postgres service" >&2
+              exit 1
+            }
+            app_inspection=""
+            if app_inspection="$(docker inspect neverflat-app --format '{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}' 2>&1)"; then
+              [[ "$app_inspection" == "neverflat|app" ]] || {
+                echo "neverflat-app is not the expected NEVERFLAT app service" >&2
+                exit 1
+              }
+            elif [[ "$app_inspection" != *"No such object"* && "$app_inspection" != *"No such container"* ]]; then
+              echo "existing neverflat-app inspection failed" >&2
+              exit 1
+            fi
+            docker network inspect shared-proxy >/dev/null
             rm -f docker-compose.yaml docker-compose.yml docker-compose.dev.yaml \
               docker-compose.local.yml docker-compose.override.yml docker-stack.yml
-            echo ${{ github.token }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-            docker network create shared-proxy || true
-            touch .env
+
+            umask 077
+            backup_dir="$DEPLOY_DIR/backups"
+            [[ ! -L "$backup_dir" ]] || {
+              echo "NEVERFLAT backup directory must not be a symlink" >&2
+              exit 1
+            }
+            mkdir -p "$backup_dir"
+            canonical_backup_dir="$(realpath -e -- "$backup_dir" 2>/dev/null || true)"
+            case "$canonical_backup_dir" in
+              "$canonical_deploy_dir"/*) ;;
+              *) echo "NEVERFLAT backup directory resolves outside the canonical target" >&2; exit 1 ;;
+            esac
+            backup_file="$(mktemp "$backup_dir/nvf_award_${SOURCE_COMMIT}.XXXXXX.dump")"
+            if ! docker exec neverflat-db pg_dump --username=postgres --dbname=nvf_award --format=custom > "$backup_file"; then
+              rm -f -- "$backup_file"
+              echo "NEVERFLAT PostgreSQL backup failed" >&2
+              exit 1
+            fi
+            [[ -s "$backup_file" ]] || {
+              echo "NEVERFLAT PostgreSQL backup is empty" >&2
+              exit 1
+            }
+            docker exec -i neverflat-db pg_restore --list < "$backup_file" >/dev/null
+
+            docker_config_dir="$(mktemp -d "$DEPLOY_DIR/.docker-config.XXXXXX")"
+            cleanup_docker_config() {
+              local status=$?
+              if [[ -n "${docker_config_dir:-}" && -d "$docker_config_dir" && ! -L "$docker_config_dir" ]]; then
+                rm -rf -- "$docker_config_dir"
+              fi
+              exit "$status"
+            }
+            trap cleanup_docker_config EXIT
+            case "$docker_config_dir" in
+              "$DEPLOY_DIR"/.docker-config.*) ;;
+              *) echo "temporary Docker config escaped NEVERFLAT" >&2; exit 1 ;;
+            esac
+            chmod 700 "$docker_config_dir"
+            if [[ -d /root/.docker/cli-plugins ]]; then
+              ln -s /root/.docker/cli-plugins "$docker_config_dir/cli-plugins"
+            fi
+            export DOCKER_CONFIG="$docker_config_dir"
+            printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin >/dev/null
+
             python3 - <<'PY'
             import os
             from pathlib import Path
@@ -91,5 +244,17 @@ jobs:
             kept.extend(f'{key}={value}' for key, value in updates.items())
             path.write_text('\n'.join(kept) + '\n')
             PY
-            docker compose -f compose.production.yaml pull app
-            docker compose -f compose.production.yaml up -d --remove-orphans
+            docker compose -p neverflat -f compose.production.yaml pull app
+            docker compose -p neverflat -f compose.production.yaml up -d --no-deps app
+            healthy=0
+            for _attempt in $(seq 1 24); do
+              if curl --fail --silent --show-error --max-time 5 http://127.0.0.1:3005/ingest/health >/dev/null; then
+                healthy=1
+                break
+              fi
+              sleep 5
+            done
+            if (( healthy != 1 )); then
+              echo "Neverflat /ingest/health did not become ready" >&2
+              exit 1
+            fi

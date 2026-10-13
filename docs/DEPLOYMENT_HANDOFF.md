@@ -1,131 +1,75 @@
 # Deployment handoff
 
-The deployed main baseline is merge commit `87b35bdf4e0d9bde7b4d8c4cbb93ab459b0f321a`
-(PR #6, 6 October 2026). This handoff records the operational procedures,
-current verification evidence, and target facts required before a production
-rollout.
+This handoff describes the automatic Neverflat test-environment deployment
+that runs after a push to main. It keeps the existing build, image tags,
+Compose file, secret resolver, and Dockerfile migration entrypoint. A manual
+release dispatch and a repository approval record are not part of this flow.
 
-## Branch and automation boundary
+## Automation boundary
 
-The existing ZentrixLab/neverflat `development` branch is used for integration.
-A push to `main` publishes an immutable Docker image only. A separate
-`workflow_dispatch` from `main` references the `production` environment and
-consumes that source commit and exact digest after the target-owned release
-gate has been recorded. Required environment reviewers and branch protections
-are repository settings that must be configured and verified separately. The
-dispatch uses the current `main` revision; older-image rollback is a separate,
-schema-reviewed runbook decision. The target record and the operational
-safeguards are defined in [`DEPLOYMENT.md`](../DEPLOYMENT.md); any environment
-approval alone does not attest the database work.
+The single build-and-deploy job builds the existing Dockerfile and pushes
+ghcr.io/zentrixlab/neverflat:latest plus the commit tag. It then performs a
+read-only SSH target check, copies compose.production.yaml, and runs the
+target-side backup, registry login, pull, app-only start, and loopback health
+check.
 
-## Verified local evidence
+Before SCP, /root/neverflat must resolve to the canonical Neverflat directory.
+The existing .env must be inside that directory, the Compose destination must
+not be a symlink or escaped path, neverflat-db must carry Compose labels
+neverflat|postgres, and any existing neverflat-app must carry neverflat|app.
+The check reads shared-proxy and verifies Compose without creating a network or
+touching a service.
 
-The exact command results are consolidated in
-[RELEASE_VERIFICATION_2026-10-01.md](RELEASE_VERIFICATION_2026-10-01.md):
+The deploy step validates the forwarded full source SHA, rechecks the
+canonical .env, compose file, database, app labels, and shared-proxy before
+removing legacy compose names or changing the target. It then writes a private
+mode-600 pg_dump for database nvf_award as role postgres, and verifies the dump
+with pg_restore --list before app launch. GHCR login uses a temporary DOCKER_CONFIG
+below /root/neverflat; the workflow carries forward any existing root Docker
+CLI plugin directory and removes only its owned temporary directory. It then
+runs:
 
-These results are the dated historical local candidate record; they are not
-target acceptance evidence for the current source.
+~~~bash
+docker compose -p neverflat -f compose.production.yaml pull app
+docker compose -p neverflat -f compose.production.yaml up -d --no-deps app
+~~~
 
-- backend build passed;
-- 17 Jest suites passed with 321 tests passed and 6 opt-in tests skipped;
-- disposable PostgreSQL checks passed 15 tests across 2 suites;
-- HTTP contract matrix passed 178/178 cases;
-- admin HTTP matrix passed 199/199 cases;
-- frontend build and focused TypeScript checks passed; and
-- the BEIA package checks passed 12 tests with no publication.
+The bounded /ingest/health poll must succeed after app launch. The workflow
+does not create shared-proxy, use --remove-orphans, start PostgreSQL,
+recreate the database, or print secrets or dump contents. The existing target
+secret resolver remains scoped to the Neverflat process.
 
-These are local/disposable results. They do not verify target credentials,
-target data, target restore, live RPC/provider behavior, post-start health or
-readiness, or partner webhook delivery. Package publication and partner
-handoff remain unclaimed.
+## Local evidence
 
-The current package artifact was repacked after the reproducible build
-instructions were changed to `npm ci`. Its SHA-256 is
-`1E7B4666445AC129FA00299F1F5BA9A784DD61DDD3565527AC962784B3AD4AFE`.
-The 6 October 2026 source-verification record reported Node 22 backend
-verification with 19 Jest suites, 327 tests, 12 opt-in tests skipped, and 21
-real PostgreSQL integration checks. It also recorded 12 charging-card tests,
-frontend/package audits, a portable Node 22 `v22.23.3` probe, and a combined
-Node 22.23.3 root/frontend/Sparkz `npm run ci:check` with zero audit findings.
-The 8 October 2026 verification used the official portable Node `v22.23.3`.
-The full `npm.cmd run ci:check` passed: root, frontend, and Sparkz audits
-reported 0 vulnerabilities, the backend had 19 suites pass with 3 skipped and
-329 tests pass with 20 opt-in tests skipped, and the frontend and Sparkz builds
-passed. A fresh maintained PostgreSQL 16.15 runner passed the full migrations
-and compiled migration-entrypoint proof, plus 29 schema, policy, and wallet
-tests, including 14 wallet tests. The offline deployment helper suite passed
-25 focused tests, including offline Compose checks; this does not provide
-live post-start acceptance evidence.
+The focused offline checks are:
 
-## Required target gate before deployment
+~~~powershell
+python scripts/test_production_deployment.py
+python scripts/test_production_workflow.py
+~~~
 
-1. Freeze and record the reviewed source commit and immutable image digest.
-2. Confirm the target host, proxy, secret owner, database identity, chain,
-   token contract, treasury address, signer source, API/ingest/admin keys,
-   alert ownership, and maintenance window without placing secrets in Git.
-3. Quiesce API ingestion, manual spend, reservation settlement, policy writes,
-   scheduled jobs, and partner replay.
-4. Take a fresh physical PostgreSQL backup, verify its manifest, restore it to
-   an isolated copy, and capture before row counts and content digests for
-   users, balances, awards, spends, receipts, operations, approvals,
-   reservations, policy, reconciliation, and linked-wallet tables.
-5. Inspect target history for duplicate `(uid, lower(wallet_address))` pairs,
-   confirm migration 008's scoped uniqueness and removal of the obsolete global
-   UID constraint, and review migration 015 duplicate transaction hashes.
-   Approve a target-specific additive migration procedure for policy 016,
-   session guard 017, and standalone active-wallet migration 022. Campaign
-   migrations 018–021 remain outside this release.
-6. Apply the reviewed migration with the API stopped, verify schema/index
-   readiness, leave the existing app container stopped, and compare the
-   preservation snapshot. Preflight rejects a running or restarting app and
-   never stops it automatically. Do not use local
-   loopback migration runners against a target.
-7. Start the approved immutable image and run health, readiness, identity,
-   preview, reservation/receipt, reconciliation, alert, and evidence checks.
-   `GET` reconciliation is read-only; the reconciliation `POST` writes an
-   audit/report record and must be an explicitly approved operational check.
-8. Record the approver, UTC time, backup/restore result, migration result,
-   digest comparison, smoke evidence, and rollback decision.
+They exercise the helper and workflow behavior with disposable local fixtures
+and fake Docker/PostgreSQL commands. They do not provide live target
+acceptance, provider health, partner delivery, or financial-chain evidence.
 
-The target-owned record binds the full source SHA and image digest to the
-existing Compose project, PostgreSQL container, database, role, and volume.
-It carries explicit backup, restore, writer-quiescence, migration, and
-preservation attestations with a bounded UTC expiry. Production Compose starts
-the API with `node dist/api.js` after the reviewed migration phase; the default
-local image entrypoint's migration command is not an implicit target migration.
+## Data and runtime boundary
 
-## Invariants and rollback
+The Dockerfile entrypoint runs the checked-in migration chain before the API
+listens, including active-wallet migration 022 and transaction-reliability
+migration 023. The target backup is taken before the new app is launched; it is
+not a license to restore over the target or edit financial rows. Preserve the
+existing eMAID, wallet, balance, award, spend, receipt, reservation, operation,
+signer, chain, and token identities.
 
-Preserve eMAID ownership and all existing wallet derivation, wallet mappings,
-balances, awards, spends, receipts, reservations, operation rows, signer,
-token contract, and chain identity. Do not relink wallets, rotate keys, reset
-the database, or clean historical duplicate rows as part of this handoff.
+The RPC fallback documented in API.md is same-chain and bounded. Raw-send
+failover may retry only identical already-signed bytes and retains the original
+operation identity. It never re-signs, allocates a new nonce, or creates a
+replacement.
 
-Migration 022 retains historical wallet rows while persisting the explicitly
-active wallet. A rollback to an older image must review active-wallet selection
-and pending financial operations; it must not automatically drop the selection
-or rewrite mappings or financial rows.
+## Open target facts
 
-The deployed baseline's startup chain can restore migration 005's global UID
-uniqueness rule. With multiple wallets for one UID, an older rollback image may
-fail on duplicate data or ignore `is_active` and select the oldest row. Use an
-image with reviewed schema/data compatibility; never delete or deduplicate
-wallet/history rows to make an older image start. Any data restore remains an
-explicit operator decision with pending token-operation reconciliation.
-
-If a rollout fails, stop writers and follow the approved application rollback
-plan. Do not roll back the database over chain activity and do not replay or
-compensate a token transfer merely because an application image was reverted.
-Unknown movement remains review-only until its existing operation evidence is
-resolved.
-
-## Open release facts
-
-The production workflow and mirror results for the deployed baseline are
-recorded in the root deployment documentation. A `main` push publishes the
-image; production target mutation requires the separate dispatch and target
-record described above. The built image digest and target post-start
-acceptance response for the baseline run are not captured here. The source
-revision, image digest, target database/backup record, restore result,
-migration decision, maintenance window, target secret owners, and final
-approval remain target-specific handoff fields.
+Before treating a run as accepted, the operator still records the target host,
+proxy route, PostgreSQL backup and restore result, image/build revision, chain
+identity, signer source, configured credentials, health/readiness response, and
+any pending transaction or migration evidence. A local or CI success does not
+verify those target-specific facts.

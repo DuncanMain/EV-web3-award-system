@@ -81,6 +81,21 @@ type AdminOperation = {
   movementOutcome: string;
   transactionHash: string | null;
   errorMessage: string | null;
+  errorCode: string | null;
+  failureStage: string | null;
+  diagnostic: {
+    stage: string;
+    rpcMethod?: string;
+    rpcCode?: string;
+    httpStatus?: number;
+    traceId?: string;
+    rpcEndpoint?: string;
+    rpcFailover?: Array<{ label: string; outcome: 'success' | 'failed' | 'null' }>;
+    errorCode: string;
+    retryable: boolean;
+    savedHash?: string;
+    nonce?: string;
+  } | null;
   submittedAt: string | null;
   confirmedAt: string | null;
   projectedAt: string | null;
@@ -128,6 +143,19 @@ type AdminRecoveryResponse = {
   audit?: { status?: string; message?: string };
 };
 
+function operationDiagnosticLabel(operation: AdminOperation): string {
+  if (operation.status === 'projected' || operation.movementOutcome === 'confirmed') {
+    return 'confirmed/projected';
+  }
+  if (operation.status === 'unknown' || operation.movementOutcome === 'unknown' || operation.movementOutcome === 'review') {
+    return 'operator review';
+  }
+  if (operation.diagnostic?.retryable) {
+    return 'dependency retryable';
+  }
+  return 'automatic retry unavailable';
+}
+
 function recoveryFeedbackForResponse(
   response: Response,
   data: AdminRecoveryResponse,
@@ -146,17 +174,22 @@ function recoveryFeedbackForResponse(
     };
   }
 
-  const receiptPending = ['pending', 'missing', 'not_attempted', 'not_created'].includes(receiptStatus);
+  const receiptPending = ['pending', 'missing'].includes(receiptStatus);
   const recoveryPending = response.status === 202
     || recoveryStatus === 'pending'
     || recoveryStatus === 'audit_pending'
     || projectionStatus === 'pending'
     || receiptPending;
   if (recoveryPending && recoveryStatus !== 'blocked') {
+    const message = operation.diagnostic?.retryable && operation.movementOutcome === 'no_movement'
+      ? 'The dependency is temporarily unavailable; retry the same operation key after it recovers. No replacement transfer will be submitted.'
+      : operation.status === 'unknown' || operation.movementOutcome === 'unknown'
+        ? 'The existing chain outcome is still pending confirmation. Reconcile the saved operation and do not create a new transfer.'
+        : data.message || 'Saved operation recovery is still pending; keep the same operation key and do not create a new transfer.';
     return {
       operationKey: operation.operationKey,
       kind: 'pending',
-      message: `${data.message || 'Recovery is still pending confirmation. Keep the same operation key and do not create a new operation.'} ${detail}`,
+      message: `${message} ${detail}`,
     };
   }
 
@@ -811,6 +844,16 @@ function AdminOperationsPanel({
                   <dt>Provider</dt><dd>{operation.providerId || 'Not recorded'}</dd>
                   <dt>Reservation</dt><dd>{operation.reservationId || 'Not recorded'}</dd>
                   <dt>Transaction hash</dt><dd>{operation.transactionHash || 'Not recorded'}</dd>
+                  {operation.errorCode && <><dt>Error code</dt><dd>{operation.errorCode}</dd></>}
+                  {operation.failureStage && <><dt>Failure stage</dt><dd>{operation.failureStage}</dd></>}
+                  {operation.diagnostic && (
+                    <>
+                      <dt>RPC diagnostic</dt>
+                      <dd>
+                        {[operation.diagnostic.rpcMethod, operation.diagnostic.rpcCode && `code ${operation.diagnostic.rpcCode}`, operation.diagnostic.httpStatus && `HTTP ${operation.diagnostic.httpStatus}`, operation.diagnostic.traceId && `trace ${operation.diagnostic.traceId}`, operation.diagnostic.rpcEndpoint && `endpoint ${operation.diagnostic.rpcEndpoint}`, operation.diagnostic.rpcFailover?.length && `failover ${operation.diagnostic.rpcFailover.map(endpoint => `${endpoint.label}:${endpoint.outcome}`).join(', ')}`, operationDiagnosticLabel(operation)].filter(Boolean).join(' · ')}
+                      </dd>
+                    </>
+                  )}
                   <dt>Updated</dt><dd>{formatOperationTimestamp(operation.updatedAt)}</dd>
                   <dt>Recovery</dt><dd>{operation.recovery?.reason || 'Eligibility unavailable; investigate before any follow-up.'}{(operation.recovery?.reasonCode || operation.recovery?.code) ? ` (${operation.recovery.reasonCode || operation.recovery.code})` : ''}</dd>
                   {operation.errorMessage && <><dt>Recorded reason</dt><dd>{operation.errorMessage}</dd></>}

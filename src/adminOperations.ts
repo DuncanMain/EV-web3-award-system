@@ -43,6 +43,9 @@ export interface AdminOperationRow {
   movementOutcome: NonNullable<TokenOperationRecord['movement_outcome']>;
   transactionHash: string | null;
   errorMessage: string | null;
+  errorCode: string | null;
+  failureStage: string | null;
+  diagnostic: AdminOperationDiagnostic | null;
   submittedAt: string | null;
   confirmedAt: string | null;
   projectedAt: string | null;
@@ -50,6 +53,29 @@ export interface AdminOperationRow {
   updatedAt: string | null;
   nextAction: string;
   recovery: AdminOperationRecoveryStatus;
+}
+
+export interface AdminOperationDiagnostic {
+  stage: string;
+  rpcMethod?: string;
+  rpcCode?: string;
+  httpStatus?: number;
+  traceId?: string;
+  /** Safe configured endpoint label; never a provider URL. */
+  rpcEndpoint?: string;
+  /** Ordered safe endpoint evidence for an idempotent read. */
+  rpcFailover?: Array<{
+    label: string;
+    outcome: 'success' | 'failed' | 'null';
+    providerCode?: string;
+    rpcCode?: string;
+    httpStatus?: number;
+    traceId?: string;
+  }>;
+  errorCode: string;
+  retryable: boolean;
+  savedHash?: string;
+  nonce?: string;
 }
 
 export interface AdminOperationsResponse {
@@ -163,6 +189,135 @@ function safeText(value: unknown, maxLength = 255): string | null {
   return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
 }
 
+function safeDiagnosticToken(value: unknown, maxLength = 80): string | null {
+  if (typeof value !== 'string' && typeof value !== 'number') return null;
+  const text = String(value).trim();
+  return /^[A-Za-z0-9_.:-]{1,80}$/.test(text) ? text.slice(0, maxLength) : null;
+}
+
+function safeDiagnosticErrorCode(value: unknown): string | null {
+  const text = safeDiagnosticToken(value, 64)?.toUpperCase();
+  return text && /^[A-Z][A-Z0-9_.-]{2,63}$/.test(text) ? text : null;
+}
+
+function safeDiagnosticStage(value: unknown): string | null {
+  const text = typeof value === 'string' ? value.toLowerCase() : '';
+  return [
+    'asset_context',
+    'preflight',
+    'prepare',
+    'persist_hash',
+    'broadcast',
+    'receipt',
+    'projection',
+    'recovery',
+    'validation',
+  ].includes(text) ? text : null;
+}
+
+function safeRpcFailover(value: unknown): AdminOperationDiagnostic['rpcFailover'] {
+  if (!Array.isArray(value)) return undefined;
+  const entries = value.flatMap(entry => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
+    const record = entry as Record<string, unknown>;
+    const label = safeDiagnosticToken(record.label, 40);
+    const outcome: 'success' | 'failed' | 'null' | undefined = record.outcome === 'success' || record.outcome === 'failed' || record.outcome === 'null'
+      ? record.outcome
+      : undefined;
+    if (!label || !outcome) return [];
+    const providerCode = safeDiagnosticToken(record.providerCode, 48);
+    const rpcCode = safeDiagnosticToken(record.rpcCode ?? record.providerCode, 32);
+    const httpStatus = typeof record.httpStatus === 'number'
+      && Number.isInteger(record.httpStatus)
+      && record.httpStatus >= 100
+      && record.httpStatus <= 599
+      ? record.httpStatus
+      : undefined;
+    const traceId = safeDiagnosticToken(record.traceId ?? record.requestId);
+    return [{
+      label,
+      outcome,
+      ...(providerCode ? { providerCode } : {}),
+      ...(rpcCode ? { rpcCode } : {}),
+      ...(httpStatus === undefined ? {} : { httpStatus }),
+      ...(traceId ? { traceId } : {}),
+    }];
+  });
+  return entries.length ? entries : undefined;
+}
+
+function canonicalDiagnosticHash(value: unknown): string | null {
+  return typeof value === 'string' && /^0x[0-9a-fA-F]{64}$/.test(value.trim())
+    ? value.trim().toLowerCase()
+    : null;
+}
+
+function mapOperationDiagnostic(record: TokenOperationRecord): {
+  errorCode: string | null;
+  failureStage: string | null;
+  diagnostic: AdminOperationDiagnostic | null;
+} {
+  const candidate = record as TokenOperationRecord & {
+    error_code?: unknown;
+    errorCode?: unknown;
+    failure_stage?: unknown;
+    failureStage?: unknown;
+    diagnostic_context?: unknown;
+    diagnostic?: unknown;
+  };
+  const intent = record.intent_context && typeof record.intent_context === 'object'
+    ? record.intent_context as Record<string, unknown>
+    : {};
+  const source = candidate.diagnostic_context && typeof candidate.diagnostic_context === 'object'
+    ? candidate.diagnostic_context as unknown as Record<string, unknown>
+    : candidate.diagnostic && typeof candidate.diagnostic === 'object'
+      ? candidate.diagnostic as unknown as Record<string, unknown>
+      : intent.diagnostic && typeof intent.diagnostic === 'object'
+        ? intent.diagnostic as Record<string, unknown>
+        : undefined;
+  // Persisted diagnostic context carries the precise transaction stage. A
+  // legacy top-level failureStage/errorCode may still say only "execution" or
+  // "failed", so it must not hide the nested operator evidence.
+  const failureStage = safeDiagnosticStage(source?.stage)
+    || safeDiagnosticStage(candidate.failure_stage ?? candidate.failureStage);
+  const errorCode = safeDiagnosticErrorCode(source?.errorCode)
+    || safeDiagnosticErrorCode(candidate.error_code ?? candidate.errorCode);
+  if (!source && !failureStage && !errorCode) {
+    return { errorCode: null, failureStage: null, diagnostic: null };
+  }
+  const diagnosticStage = failureStage || safeDiagnosticStage(source?.stage) || 'recovery';
+  const diagnosticErrorCode = errorCode || safeDiagnosticErrorCode(source?.errorCode) || 'OPERATION_FAILED';
+  const diagnostic: AdminOperationDiagnostic = {
+    stage: diagnosticStage,
+    errorCode: diagnosticErrorCode,
+    retryable: typeof source?.retryable === 'boolean' ? source.retryable : false,
+  };
+  const rpcMethod = safeDiagnosticToken(source?.rpcMethod);
+  const rpcCode = safeDiagnosticToken(source?.rpcCode ?? source?.providerCode, 32);
+  const traceId = safeDiagnosticToken(source?.traceId ?? source?.requestId);
+  const rpcEndpoint = safeDiagnosticToken(source?.rpcEndpoint ?? source?.endpointLabel, 40);
+  const rpcFailover = safeRpcFailover(source?.rpcFailover ?? source?.failover);
+  const savedHash = canonicalDiagnosticHash(source?.savedHash);
+  const nonce = source?.nonce !== undefined && /^(?:0|[1-9]\d*)$/.test(String(source.nonce))
+    ? String(source.nonce)
+    : null;
+  const httpStatus = typeof source?.httpStatus === 'number'
+    && Number.isInteger(source.httpStatus)
+    && source.httpStatus >= 100
+    && source.httpStatus <= 599
+    ? source.httpStatus
+    : null;
+  if (rpcMethod) diagnostic.rpcMethod = rpcMethod;
+  if (rpcCode) diagnostic.rpcCode = rpcCode;
+  if (httpStatus !== null) diagnostic.httpStatus = httpStatus;
+  if (traceId) diagnostic.traceId = traceId;
+  if (rpcEndpoint) diagnostic.rpcEndpoint = rpcEndpoint;
+  if (rpcFailover) diagnostic.rpcFailover = rpcFailover;
+  if (savedHash) diagnostic.savedHash = savedHash;
+  if (nonce) diagnostic.nonce = nonce;
+  return { errorCode: errorCode || null, failureStage: failureStage || null, diagnostic };
+}
+
 /** Return an allowlisted operational category instead of exposing raw DB/provider errors. */
 export function safeOperationErrorCategory(value: unknown): string | null {
   const text = safeText(value, 2_000);
@@ -189,7 +344,9 @@ function isoTimestamp(value: unknown): string | null {
 }
 
 /** Give operators a safe, state-based next step without offering a mutation. */
-export function getAdminOperationNextAction(record: Pick<TokenOperationRecord, 'status' | 'movement_outcome' | 'tx_hash'>): string {
+export function getAdminOperationNextAction(record: Pick<TokenOperationRecord, 'status' | 'movement_outcome' | 'tx_hash'> & {
+  diagnostic?: Pick<AdminOperationDiagnostic, 'retryable'> | null;
+}): string {
   if (record.status === 'projected') {
     return 'Verify projection and receipt state; the operation is projected.';
   }
@@ -202,9 +359,15 @@ export function getAdminOperationNextAction(record: Pick<TokenOperationRecord, '
       : 'Operator review required; the chain outcome is unknown.';
   }
   if (record.status === 'failed' && record.movement_outcome === 'no_movement') {
+    if (record.diagnostic?.retryable) {
+      return 'The chain dependency is temporarily unavailable; retry the same operation key after it recovers.';
+    }
     return 'Review the failure; no chain movement was recorded.';
   }
   if (record.status === 'failed') {
+    if (record.movement_outcome === 'confirmed') {
+      return 'Chain movement is recorded; verify projection and receipt state before any follow-up.';
+    }
     return 'Review the failure and confirm chain state before any follow-up.';
   }
   if (record.status === 'submitting' || record.status === 'submitted') {
@@ -259,6 +422,21 @@ export function getAdminOperationRecoveryStatus(record: TokenOperationRecord): A
       reason: 'The award projection is already complete; no administrator recovery action is required.',
     };
   }
+  const persistedDiagnostic = mapOperationDiagnostic(record).diagnostic;
+  if (record.status === 'failed' && record.movement_outcome === 'no_movement' && persistedDiagnostic?.retryable) {
+    return {
+      eligible: false,
+      reasonCode: 'DEPENDENCY_RETRY_REQUIRED',
+      reason: 'No chain movement was recorded because a dependency was unavailable; retry the same operation key after it recovers. No replacement transfer is authorized.',
+    };
+  }
+  if (record.status === 'failed' && record.movement_outcome === 'confirmed') {
+    return {
+      eligible: false,
+      reasonCode: 'CHAIN_MOVEMENT_CONFIRMED',
+      reason: 'Chain movement is confirmed; inspect the projection and receipt state before any follow-up.',
+    };
+  }
   if (record.status === 'failed') {
     return {
       eligible: false,
@@ -297,6 +475,7 @@ export function getAdminOperationRecoveryStatus(record: TokenOperationRecord): A
 /** Map a database row to the allowlisted admin response shape. */
 export function mapTokenOperationRecord(record: TokenOperationRecord): AdminOperationRow {
   const movementOutcome = record.movement_outcome || 'unknown';
+  const diagnostic = mapOperationDiagnostic(record);
   return {
     id: safeText(record.id, 128) || '',
     operationKey: safeText(record.operation_key, 255) || '',
@@ -311,6 +490,9 @@ export function mapTokenOperationRecord(record: TokenOperationRecord): AdminOper
     movementOutcome,
     transactionHash: safeText(record.tx_hash, 255),
     errorMessage: safeOperationErrorCategory(record.error_message),
+    errorCode: diagnostic.errorCode,
+    failureStage: diagnostic.failureStage,
+    diagnostic: diagnostic.diagnostic,
     submittedAt: isoTimestamp(record.submitted_at),
     confirmedAt: isoTimestamp(record.confirmed_at),
     projectedAt: isoTimestamp(record.projected_at),
@@ -320,6 +502,7 @@ export function mapTokenOperationRecord(record: TokenOperationRecord): AdminOper
       status: record.status,
       movement_outcome: movementOutcome,
       tx_hash: record.tx_hash,
+      diagnostic: diagnostic.diagnostic,
     }),
     recovery: getAdminOperationRecoveryStatus(record),
   };
@@ -364,6 +547,7 @@ const OPERATION_COLUMNS = [
   'status',
   'movement_outcome',
   'intent_context',
+  'diagnostic_context',
   'tx_hash',
   'error_message',
   'submitted_at',

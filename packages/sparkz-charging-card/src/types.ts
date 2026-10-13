@@ -142,6 +142,12 @@ export type SparkzChargingCardProps = {
   showWalletDetails?: boolean;
   hideAfterSpend?: boolean;
   hideAfterSkip?: boolean;
+  /**
+   * Stable caller-owned identity for retrying an uncertain wallet-mode switch.
+   * Persist this value outside the component when retries must survive a
+   * remount or page reload.
+   */
+  walletModeIdempotencyKey?: string;
   polygonExplorerBaseUrl?: string;
   /**
    * @deprecated The reservation flow does not emit an immediate spend receipt.

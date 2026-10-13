@@ -124,7 +124,12 @@ function sendRewardPolicyUnavailable(res: Response, error: unknown, operation: '
   res.status(503).json({
     status: 'error',
     code: 'REWARD_POLICY_UNAVAILABLE',
+    errorCode: 'REWARD_POLICY_UNAVAILABLE',
+    stage: operation === 'calculation' ? 'preflight' : 'recovery',
     retryable: true,
+    requiresReview: false,
+    operationKey: null,
+    txHash: null,
     message: 'The durable reward policy is temporarily unavailable. Try again later.',
   });
 }
@@ -138,7 +143,12 @@ function sendTokenOperationRecoveryUnavailable(
   res.status(503).json({
     status: 'error',
     code: 'TOKEN_OPERATION_RECOVERY_UNAVAILABLE',
+    errorCode: 'TOKEN_OPERATION_RECOVERY_UNAVAILABLE',
+    stage: 'recovery',
     retryable: true,
+    requiresReview: false,
+    operationKey: null,
+    txHash: null,
     message: 'Unable to check token operation recovery state right now. Retry the same request shortly.',
   });
 }
@@ -268,8 +278,14 @@ async function getReadinessChecks(): Promise<Array<{
     });
   };
 
-  addCheck('api_key', 'General API key', Boolean(API_KEY), 'API_KEY configured', 'API_KEY is not configured', 'warn');
-  addCheck('ingest_api_key', 'Ingest API key', Boolean(INGEST_API_KEY), 'INGEST_API_KEY configured', 'INGEST_API_KEY is not configured');
+  addCheck('api_key', 'General API key', Boolean(API_KEY || BEIA_API_KEY), 'API_KEY or BEIA_API_KEY configured', 'API_KEY or BEIA_API_KEY is not configured', 'warn');
+  addCheck(
+    'ingest_api_key',
+    'Ingest API key',
+    Boolean(INGEST_API_KEY || API_KEY || BEIA_API_KEY),
+    INGEST_API_KEY ? 'INGEST_API_KEY configured' : 'Ingest uses the configured API key fallback',
+    'No API key is configured for CDR ingestion',
+  );
   addCheck('admin_email', 'Admin email login', Boolean(getRegisteredAdminEmail()), 'Admin email configured', 'Set ADMIN_EMAIL to the registered admin email address');
   addCheck('admin_password', 'Admin password', Boolean(ADMIN_PASSWORD), 'ADMIN_PASSWORD configured', 'ADMIN_PASSWORD is not configured');
   addCheck('manual_uid_lookup', 'Manual contract lookup', !ENABLE_TEST_UID_LOOKUP, 'Manual /wallet/:uid lookup disabled', 'ENABLE_TEST_UID_LOOKUP should be false in pilot/production', 'warn');
@@ -447,6 +463,371 @@ function canonicalTxHash(value: unknown): string | undefined {
     : undefined;
 }
 
+type PublicFailureStage =
+  | 'validation'
+  | 'asset_context'
+  | 'preflight'
+  | 'prepare'
+  | 'persist_hash'
+  | 'broadcast'
+  | 'receipt'
+  | 'projection'
+  | 'recovery';
+
+type PublicMovementOutcome = 'confirmed' | 'no_movement' | 'unknown' | 'review';
+
+type PublicRpcEndpointEvidence = {
+  label: string;
+  outcome: 'success' | 'failed' | 'null';
+  providerCode?: string;
+  rpcCode?: string | number;
+  httpStatus?: number;
+  traceId?: string;
+};
+
+type PublicDiagnosticCategory =
+  | 'rpc_unavailable'
+  | 'confirmation_pending'
+  | 'database_unavailable'
+  | 'review_required';
+
+interface PublicFailureFields {
+  errorCode: string;
+  stage: PublicFailureStage;
+  retryable: boolean;
+  requiresReview: boolean;
+  operationKey: string | null;
+  txHash: string | null;
+  /** Native gas-funding hash, when present; never a token-movement hash. */
+  fundingTxHash: string | null;
+  movementOutcome: PublicMovementOutcome;
+  diagnostic?: {
+    stage: PublicFailureStage;
+    rpcMethod?: string;
+    rpcCode?: string | number;
+    httpStatus?: number;
+    traceId?: string;
+    /** Safe configured endpoint label; never a URL or query string. */
+    rpcEndpoint?: string;
+    /** Ordered safe evidence for endpoints tried by a read. */
+    rpcFailover?: PublicRpcEndpointEvidence[];
+    errorCode: string;
+    retryable: boolean;
+    savedHash?: string;
+    nonce?: number;
+  };
+}
+
+type ApiSpendExecutionResult = ReliableSpendExecutionResult & {
+  /** Auxiliary native gas-funding hash from managed-wallet preparation. */
+  fundingTxHash?: string;
+};
+
+function asUnknownRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function safeDiagnosticText(value: unknown, maxLength = 80): string | undefined {
+  if (typeof value !== 'string' && typeof value !== 'number') return undefined;
+  const text = String(value).trim();
+  return /^[A-Za-z0-9_.:-]{1,80}$/.test(text) ? text.slice(0, maxLength) : undefined;
+}
+
+function safeErrorCode(value: unknown): string | undefined {
+  const text = safeDiagnosticText(value, 64)?.toUpperCase();
+  return text && /^[A-Z][A-Z0-9_.-]{2,63}$/.test(text) ? text : undefined;
+}
+
+function safeRpcCode(value: unknown): string | number | undefined {
+  if (typeof value === 'number' && Number.isSafeInteger(value) && Math.abs(value) <= 1_000_000) {
+    return value;
+  }
+  return safeDiagnosticText(value, 32);
+}
+
+function safeRpcEndpointLabel(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const text = value.trim();
+  return /^[A-Za-z0-9_.:-]{1,40}$/.test(text) ? text : undefined;
+}
+
+function safeRpcFailoverEvidence(value: unknown): PublicRpcEndpointEvidence[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap(entry => {
+    const record = asUnknownRecord(entry);
+    if (!record) return [];
+    const label = safeRpcEndpointLabel(record.label);
+    const outcome = record.outcome === 'success' || record.outcome === 'failed' || record.outcome === 'null'
+      ? record.outcome
+      : undefined;
+    if (!label || !outcome) return [];
+    const providerCode = safeDiagnosticText(record.providerCode, 48);
+    const rpcCode = safeRpcCode(record.rpcCode ?? record.providerCode);
+    const httpStatus = typeof record.httpStatus === 'number'
+      && Number.isInteger(record.httpStatus)
+      && record.httpStatus >= 100
+      && record.httpStatus <= 599
+      ? record.httpStatus
+      : undefined;
+    const traceId = safeDiagnosticText(record.traceId ?? record.requestId, 80);
+    return [{
+      label,
+      outcome,
+      ...(providerCode ? { providerCode } : {}),
+      ...(rpcCode === undefined ? {} : { rpcCode }),
+      ...(httpStatus === undefined ? {} : { httpStatus }),
+      ...(traceId ? { traceId } : {}),
+    }];
+  });
+}
+
+function normalisePublicFailureStage(value: unknown, fallback: PublicFailureStage): PublicFailureStage {
+  const text = typeof value === 'string' ? value.toLowerCase() : '';
+  if (text === 'validation' || text === 'normalisation' || text === 'normalization') return 'validation';
+  if (text === 'asset_context' || text === 'asset-context') return 'asset_context';
+  if (text === 'preflight' || text === 'calculation') return 'preflight';
+  if (text === 'prepare' || text === 'approval') return 'prepare';
+  if (text === 'persist_hash' || text === 'persist-hash') return 'persist_hash';
+  if (text === 'submission' || text === 'execution' || text === 'submitting' || text === 'submitted' || text === 'broadcast') return 'broadcast';
+  if (text === 'confirmation' || text === 'confirmed' || text === 'receipt') return 'receipt';
+  if (text === 'projection' || text === 'projected' || text === 'complete') return 'projection';
+  if (text === 'recovery' || text === 'unknown') return 'recovery';
+  return fallback;
+}
+
+function normaliseMovementOutcome(value: unknown, fallback: PublicMovementOutcome): PublicMovementOutcome {
+  return value === 'confirmed' || value === 'no_movement' || value === 'unknown' || value === 'review'
+    ? value
+    : fallback;
+}
+
+function diagnosticCategoryFor(
+  errorCode: string,
+  stage: PublicFailureStage,
+  requiresReview: boolean,
+): PublicDiagnosticCategory | undefined {
+  if (requiresReview || errorCode === 'CHAIN_OUTCOME_UNKNOWN' || errorCode === 'OPERATION_REVIEW_REQUIRED') {
+    return 'review_required';
+  }
+  if (errorCode === 'TRANSACTION_CONFIRMATION_PENDING' || stage === 'receipt') {
+    return 'confirmation_pending';
+  }
+  if (errorCode.startsWith('RPC_') || errorCode === 'CHAIN_CONTEXT_UNAVAILABLE' || stage === 'asset_context' || stage === 'preflight') {
+    return 'rpc_unavailable';
+  }
+  if (errorCode.includes('DATABASE') || errorCode.includes('PERSISTENCE')) {
+    return 'database_unavailable';
+  }
+  return undefined;
+}
+
+function inferPublicErrorCode(
+  input: unknown,
+  error: unknown,
+  stage: PublicFailureStage,
+  movementOutcome: PublicMovementOutcome,
+  requiresReview: boolean,
+): string {
+  const record = asUnknownRecord(input);
+  const source = asUnknownRecord(record?.diagnostic ?? record?.diagnostics ?? record?.diagnostic_context);
+  const diagnosticCode = safeErrorCode(source?.errorCode);
+  if (diagnosticCode) return diagnosticCode;
+  const explicitCandidates = [record?.errorCode, record?.error_code, record?.failureCode, record?.code];
+  for (const candidate of explicitCandidates) {
+    const explicit = safeErrorCode(candidate);
+    // ExecutionResult.stage is still exposed by a few legacy callers as a
+    // generic code-like value. It must not hide the precise nested diagnostic.
+    if (explicit && !['EXECUTION', 'SUBMITTED', 'SUBMITTING', 'BROADCAST', 'CONFIRMED', 'UNKNOWN'].includes(explicit)) {
+      return explicit;
+    }
+  }
+  const text = getErrorMessage(error).toLowerCase();
+  if (text.includes('token_operation_intent_mismatch')) return 'TOKEN_OPERATION_INTENT_MISMATCH';
+  if (text.includes('allowance') || text.includes('transferfrom')) {
+    return 'MANAGED_WALLET_ALLOWANCE_UNAVAILABLE';
+  }
+  if (text.includes('settlement_context_reservation_mismatch')) return 'SETTLEMENT_CONTEXT_RESERVATION_MISMATCH';
+  if (text.includes('reservation_settlement_context_mismatch') || text.includes('reservation_context_mismatch')) {
+    return 'RESERVATION_CONTEXT_MISMATCH';
+  }
+  if (text.includes('preflight_unavailable') || text.includes('chain_context_unavailable')
+    || text.includes('temporary internal error') || text.includes('code 19') || text.includes('http 5')) {
+    return stage === 'broadcast' || stage === 'persist_hash' ? 'RPC_SUBMISSION_UNAVAILABLE' : 'RPC_READ_UNAVAILABLE';
+  }
+  if (text.includes('submission outcome is unknown') || text.includes('hash could not be durably saved')) {
+    return 'CHAIN_OUTCOME_UNKNOWN';
+  }
+  if (text.includes('confirmation') && text.includes('pending')) return 'TRANSACTION_CONFIRMATION_PENDING';
+  if (text.includes('projection') && text.includes('pending')) return 'PROJECTION_PENDING';
+  if (requiresReview || movementOutcome === 'review') return 'OPERATION_REVIEW_REQUIRED';
+  if (movementOutcome === 'unknown') return 'CHAIN_OUTCOME_UNKNOWN';
+  if (stage === 'preflight') return 'RPC_READ_UNAVAILABLE';
+  if (stage === 'prepare') return 'APPROVAL_FAILED';
+  if (stage === 'broadcast' || stage === 'persist_hash') return 'RPC_SUBMISSION_UNAVAILABLE';
+  if (stage === 'receipt') return 'TRANSACTION_CONFIRMATION_PENDING';
+  if (stage === 'projection') return 'PROJECTION_PENDING';
+  return 'OPERATION_FAILED';
+}
+
+function safeFailureDiagnostic(
+  input: unknown,
+  errorCode: string,
+  stage: PublicFailureStage,
+  requiresReview: boolean,
+  retryable: boolean,
+): PublicFailureFields['diagnostic'] {
+  const record = asUnknownRecord(input);
+  const source = asUnknownRecord(record?.diagnostic ?? record?.diagnostics ?? record?.diagnostic_context);
+  const category = source?.category === 'rpc_unavailable'
+    || source?.category === 'confirmation_pending'
+    || source?.category === 'database_unavailable'
+    || source?.category === 'review_required'
+    ? source.category
+    : diagnosticCategoryFor(errorCode, stage, requiresReview);
+  if (!category && !source) return undefined;
+  const rpcMethod = safeDiagnosticText(source?.rpcMethod, 80);
+  const rpcCode = safeRpcCode(source?.rpcCode ?? source?.providerCode);
+  const httpStatus = typeof source?.httpStatus === 'number'
+    && Number.isInteger(source.httpStatus)
+    && source.httpStatus >= 100
+    && source.httpStatus <= 599
+    ? source.httpStatus
+    : undefined;
+  const traceId = safeDiagnosticText(source?.traceId ?? source?.requestId, 80);
+  const rpcEndpoint = safeRpcEndpointLabel(source?.rpcEndpoint ?? source?.endpointLabel);
+  const rpcFailover = safeRpcFailoverEvidence(source?.rpcFailover ?? source?.failover);
+  const fundingTxHash = canonicalTxHash(
+    record?.fundingTxHash ?? record?.funding_tx_hash ?? source?.fundingTxHash ?? source?.funding_tx_hash,
+  );
+  // A funding hash is auxiliary evidence. It must not be exposed as the
+  // diagnostic savedHash, whose meaning is the original token operation hash.
+  const savedHash = fundingTxHash ? undefined : canonicalTxHash(source?.savedHash);
+  const nonce = source?.nonce !== undefined && source?.nonce !== null
+    && ((typeof source.nonce === 'number' && Number.isSafeInteger(source.nonce) && source.nonce >= 0)
+      || (typeof source.nonce === 'string' && /^(?:0|[1-9]\d*)$/.test(source.nonce) && Number.isSafeInteger(Number(source.nonce))))
+    ? Number(source.nonce)
+    : undefined;
+  return {
+    stage: normalisePublicFailureStage(source?.stage, stage),
+    ...(rpcMethod ? { rpcMethod } : {}),
+    ...(rpcCode ? { rpcCode } : {}),
+    ...(httpStatus ? { httpStatus } : {}),
+    ...(traceId ? { traceId } : {}),
+    ...(rpcEndpoint ? { rpcEndpoint } : {}),
+    ...(rpcFailover.length ? { rpcFailover } : {}),
+    errorCode: safeErrorCode(source?.errorCode) || errorCode,
+    // A review-required or hashless-unknown operation must never advertise an
+    // automatic retry, even if a legacy nested field was left optimistic.
+    // The public top-level field is the final policy decision. Reuse it here
+    // so legacy top-level/nested shapes cannot contradict one another.
+    retryable: requiresReview ? false : retryable,
+    ...(savedHash ? { savedHash } : {}),
+    ...(nonce === undefined ? {} : { nonce }),
+  };
+}
+
+/** Map worker results/errors to a stable, sanitized financial failure shape. */
+function publicFailureFields(
+  input: unknown,
+  fallback: {
+    stage: PublicFailureStage;
+    operationKey?: string | null;
+    txHash?: string | null;
+    movementOutcome?: PublicMovementOutcome;
+    pending?: boolean;
+    retryable?: boolean;
+    requiresReview?: boolean;
+    error?: unknown;
+  },
+): PublicFailureFields {
+  const record = asUnknownRecord(input);
+  const error = fallback.error ?? record?.error ?? input;
+  const source = asUnknownRecord(record?.diagnostic ?? record?.diagnostics ?? record?.diagnostic_context);
+  const rawMovementOutcome = record?.movementOutcome ?? record?.movement_outcome;
+  const pending = typeof record?.pending === 'boolean'
+    ? record.pending
+    : Boolean(fallback.pending);
+  const operationKey = typeof (record?.operationKey ?? fallback.operationKey) === 'string'
+    ? String(record?.operationKey ?? fallback.operationKey)
+    : null;
+  const fundingTxHash = canonicalTxHash(
+    record?.fundingTxHash ?? record?.funding_tx_hash ?? source?.fundingTxHash ?? source?.funding_tx_hash,
+  ) || null;
+  // Core's durable operation wrapper normally exposes the original token
+  // hash at the top level.  Some preparation/broadcast paths can only carry
+  // it in the sanitized diagnostic until the wrapper is reconstructed.  Use
+  // that hash as the primary movement identity when it is available, but
+  // never let an auxiliary native funding hash masquerade as the token move.
+  const explicitPrimaryTxHash = canonicalTxHash(
+    record?.primaryTxHash
+      ?? record?.primary_tx_hash
+      ?? source?.primaryTxHash
+      ?? source?.primary_tx_hash,
+  );
+  const diagnosticPrimaryTxHash = fundingTxHash ? undefined : canonicalTxHash(source?.savedHash);
+  const txHash = explicitPrimaryTxHash
+    || canonicalTxHash(record?.txHash ?? record?.transactionHash ?? record?.tx_hash ?? fallback.txHash)
+    || diagnosticPrimaryTxHash
+    || null;
+  const stage = normalisePublicFailureStage(
+    source?.stage ?? record?.failureStage ?? record?.failure_stage ?? record?.stage,
+    fallback.stage,
+  );
+  // A failure before the broadcast stage proves that this token operation did
+  // not move funds. Preserve that fact even when an older caller omitted its
+  // top-level preflightFailure/movementOutcome fields.
+  const preBroadcastNoMovement = ['asset_context', 'preflight', 'prepare', 'persist_hash'].includes(stage);
+  const provisionalRequiresReview = record?.requiresReview === true
+    || fallback.requiresReview === true
+    || source?.category === 'review_required'
+    || rawMovementOutcome === 'review';
+  const fallbackMovementOutcome: PublicMovementOutcome = provisionalRequiresReview
+    ? 'review'
+    : preBroadcastNoMovement || record?.preflightFailure === true
+      ? 'no_movement'
+      : 'unknown';
+  const movementOutcome = normaliseMovementOutcome(
+    rawMovementOutcome,
+    fallback.movementOutcome || fallbackMovementOutcome,
+  );
+  const provisionalErrorCode = inferPublicErrorCode(record, error, stage, movementOutcome, provisionalRequiresReview);
+  const diagnosticRequiresReview = source?.category === 'review_required'
+    || provisionalErrorCode === 'CHAIN_OUTCOME_UNKNOWN'
+    || provisionalErrorCode === 'OPERATION_REVIEW_REQUIRED';
+  const hashlessUnknown = !txHash
+    && movementOutcome === 'unknown'
+    && (rawMovementOutcome === 'unknown' || record?.status === 'unknown' || source?.errorCode === 'CHAIN_OUTCOME_UNKNOWN');
+  const requiresReview = record?.requiresReview === true
+    || fallback.requiresReview === true
+    || diagnosticRequiresReview
+    || hashlessUnknown;
+  const errorCode = inferPublicErrorCode(record, error, stage, movementOutcome, requiresReview);
+  const retryableCandidate = typeof record?.retryable === 'boolean'
+    ? record.retryable
+    : typeof source?.retryable === 'boolean'
+      ? source.retryable
+      : fallback.retryable !== undefined
+        ? fallback.retryable
+        : pending && !requiresReview;
+  const retryable = requiresReview ? false : Boolean(retryableCandidate);
+  const diagnostic = safeFailureDiagnostic(record, errorCode, stage, requiresReview, Boolean(retryable));
+  const finalStage = diagnostic ? diagnostic.stage : stage;
+  const finalErrorCode = diagnostic?.errorCode || errorCode;
+  return {
+    errorCode: finalErrorCode,
+    stage: finalStage,
+    retryable,
+    requiresReview,
+    operationKey,
+    txHash,
+    fundingTxHash,
+    movementOutcome,
+    ...(diagnostic ? { diagnostic } : {}),
+  };
+}
+
 function normaliseOptionalContext(value: unknown): string | null {
   return value === undefined || value === null ? null : String(value);
 }
@@ -467,6 +848,51 @@ function spendValidationError(res: Response, code: string, message: string, extr
 
 function isStableSpendKey(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
+}
+
+function getStableWalletActionKey(req: Request): { key?: string; code?: string; message?: string } {
+  const bodyKey = req.body?.idempotencyKey;
+  const headerKey = req.get('Idempotency-Key') || req.get('X-Idempotency-Key');
+  if (bodyKey !== undefined && !isStableSpendKey(bodyKey)) {
+    return {
+      code: 'INVALID_OPERATION_KEY',
+      message: 'idempotencyKey must be a non-empty string when provided',
+    };
+  }
+  if (headerKey !== undefined && !isStableSpendKey(headerKey)) {
+    return {
+      code: 'INVALID_OPERATION_KEY',
+      message: 'Idempotency-Key must be a non-empty header value when provided',
+    };
+  }
+  if (isStableSpendKey(bodyKey) && isStableSpendKey(headerKey) && bodyKey.trim() !== headerKey.trim()) {
+    return {
+      code: 'TOKEN_OPERATION_INTENT_MISMATCH',
+      message: 'idempotencyKey and Idempotency-Key must contain the same request identity',
+    };
+  }
+  const key = isStableSpendKey(bodyKey) ? bodyKey.trim() : isStableSpendKey(headerKey) ? headerKey.trim() : undefined;
+  if (!key) {
+    return {
+      code: 'IDEMPOTENCY_KEY_REQUIRED',
+      message: 'A stable idempotencyKey or Idempotency-Key header is required for wallet transaction retries',
+    };
+  }
+  if (key.length > 240) {
+    return {
+      code: 'INVALID_OPERATION_KEY',
+      message: 'Wallet transaction idempotency keys must be 240 characters or fewer',
+    };
+  }
+  return { key };
+}
+
+function getOptionalWalletActionKey(req: Request): { key?: string; code?: string; message?: string } {
+  const parsed = getStableWalletActionKey(req);
+  // Mode persistence is a user-state mutation; callers may omit a retry key.
+  // When supplied, still validate and forward it so the custodial allowance
+  // revoke can resume the same durable action after an uncertain response.
+  return parsed.code === 'IDEMPOTENCY_KEY_REQUIRED' ? {} : parsed;
 }
 
 function tokenCapError(res: Response, operation: 'award' | 'spend', requestedAmount: number) {
@@ -738,6 +1164,10 @@ function isNetworkIssue(error?: unknown): boolean {
     || normalized.includes('timeout')
     || normalized.includes('rpc')
     || normalized.includes('server error')
+    || normalized.includes('temporary internal error')
+    || normalized.includes('http 5')
+    || normalized.includes('code 19')
+    || normalized.includes('drpc')
     || normalized.includes('connection')
     || normalized.includes('temporarily unavailable');
 }
@@ -781,6 +1211,18 @@ function toServerAuditDiagnostic(error: unknown): string {
 function toUserFacingSpendError(error?: unknown): string {
   const text = error instanceof Error ? error.message : String(error || '');
   const normalized = text.toLowerCase();
+  if (normalized.includes('token_operation_intent_mismatch') || normalized.includes('asset context no longer matches')) {
+    return 'The saved spend intent does not match this request. No replacement transfer was submitted; use the original operation key or contact support.';
+  }
+  if (normalized.includes('reservation_context_mismatch') || normalized.includes('settlement_context')) {
+    return 'The saved settlement context does not match this request. No replacement transfer was submitted; use the original CDR or contact support.';
+  }
+  if (normalized.includes('rpc_read_unavailable') || normalized.includes('spend_preflight_unavailable')) {
+    return 'The token network could not be read, so no SPARKZ were spent. Wait for the network to recover and retry this same operation.';
+  }
+  if (normalized.includes('rpc_submission_unavailable')) {
+    return 'The token submission service is temporarily unavailable. Retry this same operation and do not create a replacement payment.';
+  }
   if (normalized.includes('spend_preflight_unavailable')) {
     return 'The token network could not be read, so no SPARKZ were spent. Wait for the network to recover and retry this same spend.';
   }
@@ -809,6 +1251,11 @@ function toUserFacingSpendError(error?: unknown): string {
 }
 
 function toUserFacingWalletError(error?: unknown): string {
+  const record = asUnknownRecord(error);
+  const diagnostic = asUnknownRecord(record?.diagnostic ?? record?.diagnostics ?? record?.diagnostic_context);
+  const structuredCode = safeErrorCode(
+    record?.errorCode ?? record?.error_code ?? record?.code ?? diagnostic?.errorCode,
+  );
   const text = getErrorMessage(error);
   const normalized = text.toLowerCase();
   if (normalized.includes('wallet address is not linked')) {
@@ -822,6 +1269,12 @@ function toUserFacingWalletError(error?: unknown): string {
   }
   if (normalized.includes('managed wallet balance is already zero')) {
     return 'The managed wallet has no SPARKZ to move.';
+  }
+  if (structuredCode === 'MANAGED_WALLET_ALLOWANCE_UNAVAILABLE'
+    || normalized.includes('allowance')
+    || normalized.includes('transferfrom')
+    || normalized.includes('treasury permission is insufficient')) {
+    return 'The managed wallet allowance is zero or unavailable. Confirm that this wallet is in managed mode and use the approved wallet-mode flow before retrying the same move key.';
   }
   if (isNetworkIssue(error) || normalized.includes('provider')) {
     return 'The wallet service is temporarily unavailable. Please retry shortly.';
@@ -902,9 +1355,13 @@ async function processSpendWithAutoApproval(input: {
   reservationId?: string;
   operationKey?: string;
   idempotencyKey?: string;
+  settlementContext?: {
+    reservationId: string;
+    deliveredKwh: number;
+  };
   auditContext: string;
   onApprovalFailure: (approvalErr: unknown) => Promise<void>;
-}): Promise<ReliableSpendExecutionResult> {
+}): Promise<ApiSpendExecutionResult> {
   // One logical request must use one operation key across an approval retry.
   // New manual requests must bring a stable key. Reservation settlement
   // supplies its durable reservation operation key explicitly.
@@ -946,7 +1403,8 @@ async function processSpendWithAutoApproval(input: {
     reservationId: input.reservationId,
     operationKey,
     idempotencyKey: input.idempotencyKey,
-  };
+    ...(input.settlementContext ? { settlementContext: input.settlementContext } : {}),
+  } as SpendOperationRequest;
   let spendResult = await processSpend(
     spendRequest,
     treasurySigner
@@ -985,18 +1443,49 @@ async function processSpendWithAutoApproval(input: {
       await auditTreasuryGasWarning(`spend.${input.auditContext}.auto_approval_failure`, approvalErr);
     }
     await input.onApprovalFailure(approvalErr);
+    const approvalRecord = asUnknownRecord(approvalErr);
+    const approvalFailure = publicFailureFields(approvalErr, {
+      stage: 'prepare',
+      pending: typeof approvalRecord?.pending === 'boolean' ? approvalRecord.pending : true,
+      retryable: typeof approvalRecord?.retryable === 'boolean' ? approvalRecord.retryable : false,
+      requiresReview: typeof approvalRecord?.requiresReview === 'boolean' ? approvalRecord.requiresReview : true,
+      error: approvalErr,
+    });
+    const approvalRequiresReview = typeof approvalRecord?.requiresReview === 'boolean'
+      ? approvalRecord.requiresReview
+      : true;
+    const approvalPending = typeof approvalRecord?.pending === 'boolean'
+      ? approvalRecord.pending
+      : (approvalRequiresReview || approvalFailure.retryable);
+    const approvalRetryable = approvalRequiresReview ? false : approvalFailure.retryable;
+    const approvalMovementOutcome = normaliseMovementOutcome(
+      approvalRecord?.movementOutcome ?? approvalRecord?.movement_outcome,
+      approvalFailure.movementOutcome,
+    );
+    const approvalDiagnostic = approvalRecord?.diagnostic && typeof approvalRecord.diagnostic === 'object'
+      ? approvalRecord.diagnostic as ReliableSpendExecutionResult['diagnostic']
+      : undefined;
     // Approval preparation persists funding/approval state before any wallet
-    // transaction.  An error after that claim is not a safe preflight
-    // rejection: the next request must recover the same operation rather than
-    // release its key and attempt another approval or spend.
+    // transaction. A structured pre-broadcast outage remains a safe retry of
+    // the same spend key; an ambiguous funding/approval result remains review.
     return {
       ...spendResult,
       success: false,
-      pending: true,
-      requiresReview: true,
-      preflightFailure: false,
-      operationStatus: 'unknown',
-      error: `Spend approval recovery requires operator review: ${getErrorMessage(approvalErr)}`,
+      pending: approvalPending,
+      requiresReview: approvalRequiresReview,
+      preflightFailure: typeof approvalRecord?.preflightFailure === 'boolean'
+        ? approvalRecord.preflightFailure
+        : false,
+      operationStatus: typeof approvalRecord?.operationStatus === 'string'
+        ? approvalRecord.operationStatus
+        : approvalRequiresReview ? 'unknown' : 'failed',
+      movementOutcome: approvalMovementOutcome,
+      retryable: approvalRetryable,
+      ...(approvalDiagnostic ? { diagnostic: approvalDiagnostic } : {}),
+      ...(approvalFailure.fundingTxHash ? { fundingTxHash: approvalFailure.fundingTxHash } : {}),
+      error: approvalRequiresReview
+        ? `Spend approval recovery requires operator review: ${getErrorMessage(approvalErr)}`
+        : `Spend approval preparation failed: ${approvalFailure.errorCode}: ${getErrorMessage(approvalErr)}`,
     };
   }
 
@@ -1005,6 +1494,110 @@ async function processSpendWithAutoApproval(input: {
 
 function makeTokenRecoveryError(message: string, details: Record<string, unknown> = {}): Error & Record<string, unknown> {
   return Object.assign(new Error(message), details);
+}
+
+type SettlementContext = {
+  reservationId: string;
+  deliveredKwh: number;
+};
+
+type SavedSettlementDelivery = {
+  value?: number;
+  invalid: boolean;
+  source: 'settlement_context' | 'legacy_delivered_kwh' | 'missing';
+};
+
+/**
+ * Read the immutable full-precision delivery value used by settlement
+ * recovery. `delivered_kwh` is intentionally retained at three decimals for
+ * legacy reporting, so it cannot be the source of truth when the durable
+ * settlement context is present.
+ */
+function readSavedSettlementDelivery(reservation: unknown): SavedSettlementDelivery {
+  const record = asUnknownRecord(reservation);
+  const context = asUnknownRecord(record?.settlement_context);
+  if (context && Object.prototype.hasOwnProperty.call(context, 'deliveredKwh')) {
+    const raw = context.deliveredKwh;
+    const text = typeof raw === 'number' ? String(raw) : typeof raw === 'string' ? raw.trim() : '';
+    if (!/^\d+(?:\.\d{1,12})?$/.test(text)) {
+      return { invalid: true, source: 'settlement_context' };
+    }
+    const value = Number(text);
+    return Number.isFinite(value) && value >= 0
+      ? { value, invalid: false, source: 'settlement_context' }
+      : { invalid: true, source: 'settlement_context' };
+  }
+
+  const legacy = record?.delivered_kwh;
+  if (legacy === undefined || legacy === null || legacy === '') {
+    return { invalid: false, source: 'missing' };
+  }
+  const text = typeof legacy === 'number' ? String(legacy) : typeof legacy === 'string' ? legacy.trim() : '';
+  if (!/^\d+(?:\.\d{1,12})?$/.test(text)) {
+    return { invalid: true, source: 'legacy_delivered_kwh' };
+  }
+  const value = Number(text);
+  return Number.isFinite(value) && value >= 0
+    ? { value, invalid: false, source: 'legacy_delivered_kwh' }
+    : { invalid: true, source: 'legacy_delivered_kwh' };
+}
+
+/**
+ * Persist the immutable CDR delivery context before a reservation can reach
+ * the token submission path.  The worker-owned service supplies this helper;
+ * a missing helper blocks positive settlement rather than silently falling
+ * back to the old post-transfer write order.
+ */
+async function persistReservationSettlementContext(
+  reservation: { id: string },
+  deliveredKwh: number,
+  settledAmount: number,
+): Promise<SettlementContext> {
+  const saver = (SpendReservations as typeof SpendReservations & {
+    persistSettlementContext?: (id: string, deliveredKwh: number) => Promise<unknown>;
+  }).persistSettlementContext;
+  if (!saver) {
+    if (settledAmount > 0) {
+      throw makeTokenRecoveryError(
+        'Reservation settlement context persistence is unavailable; no token movement was attempted.',
+        {
+          pending: true,
+          settlementPending: true,
+          retryable: true,
+          requiresReview: false,
+          reservationId: reservation.id,
+          movementOutcome: 'no_movement',
+          financialStatus: 'unknown',
+          errorCode: 'RESERVATION_CONTEXT_PERSISTENCE_UNAVAILABLE',
+          stage: 'recovery',
+        },
+      );
+    }
+    return { reservationId: reservation.id, deliveredKwh };
+  }
+
+  try {
+    await saver(reservation.id, deliveredKwh);
+  } catch (err) {
+    const mismatch = getErrorMessage(err).toUpperCase().includes('MISMATCH');
+    throw makeTokenRecoveryError(
+      mismatch
+        ? 'Reservation delivered-energy context differs from the original CDR; operator review is required.'
+        : 'Reservation settlement context could not be persisted before token submission.',
+      {
+        pending: true,
+        settlementPending: true,
+        retryable: !mismatch,
+        requiresReview: mismatch,
+        reservationId: reservation.id,
+        movementOutcome: 'no_movement',
+        financialStatus: 'unknown',
+        errorCode: mismatch ? 'RESERVATION_CONTEXT_MISMATCH' : 'RESERVATION_CONTEXT_PERSISTENCE_UNAVAILABLE',
+        stage: 'recovery',
+      },
+    );
+  }
+  return { reservationId: reservation.id, deliveredKwh };
 }
 
 /**
@@ -1311,6 +1904,7 @@ async function settleReservationFromCdr(session: NormalisedSession) {
   const deliveredKwh = session.energyDirection === 'CHARGE' ? session.energyKWh : 0;
   const { settledAmount: amount } = calculateReservationSettlement(Number(reservation.reserved_amount), deliveredKwh);
   try {
+    const settlementContext = await persistReservationSettlementContext(reservation, deliveredKwh, amount);
     if (amount === 0) {
       await ensureZeroSettlementOperation(session, reservation, reservationSessionId);
       try {
@@ -1337,6 +1931,7 @@ async function settleReservationFromCdr(session: NormalisedSession) {
         uid: session.uid, userAddress: reservation.wallet_address, amount,
         sessionId: reservationSessionId, providerId: session.providerId,
         reservationId: reservation.id, operationKey: reservationOperationKey(reservation.id),
+        settlementContext,
         auditContext: 'reservation_settlement',
         onApprovalFailure: async () => undefined,
       })
@@ -1344,16 +1939,43 @@ async function settleReservationFromCdr(session: NormalisedSession) {
         userAddress: reservation.wallet_address, amount, sessionId: reservationSessionId,
         uid: session.uid, providerId: session.providerId,
         reservationId: reservation.id, operationKey: reservationOperationKey(reservation.id),
-      }, treasurySigner);
+        settlementContext,
+      } as SpendOperationRequest, treasurySigner);
     if (!spendResult.success || !spendResult.txHash) {
       await SpendReservations.retry(reservation.id, spendResult.error || 'Reservation settlement pending');
+      const diagnosticResult = spendResult as ReliableSpendExecutionResult & {
+        errorCode?: string;
+        stage?: PublicFailureStage;
+      };
       const requiresReview = spendResult.requiresReview === true
         || (spendResult.requiresReview === undefined
           && !spendResult.pending
           && !spendResult.preflightFailure
           && !spendResult.txHash);
       const preflightFailure = Boolean(spendResult.preflightFailure);
-      const retryable = preflightFailure || Boolean(spendResult.pending && !requiresReview);
+      const diagnosticRetryable = typeof diagnosticResult.retryable === 'boolean'
+        ? diagnosticResult.retryable
+        : diagnosticResult.diagnostic?.retryable;
+      const retryable = requiresReview
+        ? false
+        : diagnosticRetryable !== undefined
+          ? diagnosticRetryable
+          : preflightFailure || Boolean(spendResult.pending);
+      const failureMessage = getErrorMessage(spendResult.error).toLowerCase();
+      const diagnosticStage = diagnosticResult.diagnostic?.stage;
+      const legacyStageValue = typeof diagnosticResult.stage === 'string'
+        ? diagnosticResult.stage.toLowerCase()
+        : undefined;
+      const legacyStage = diagnosticResult.stage && legacyStageValue !== 'execution'
+        ? diagnosticResult.stage
+        : undefined;
+      const failureStage: PublicFailureStage = diagnosticStage
+        || legacyStage
+        || (preflightFailure
+          ? 'preflight'
+          : failureMessage.includes('asset context') || failureMessage.includes('intent mismatch')
+            ? 'asset_context'
+            : spendResult.txHash ? 'receipt' : 'broadcast');
       throw makeTokenRecoveryError(spendResult.error || 'Reservation settlement pending', {
         pending: Boolean(spendResult.pending || preflightFailure),
         spendPending: Boolean(spendResult.pending),
@@ -1365,6 +1987,11 @@ async function settleReservationFromCdr(session: NormalisedSession) {
         txHash: spendResult.txHash,
         movementOutcome: spendResult.movementOutcome,
         financialStatus: spendResult.txHash ? 'confirmed_or_pending' : 'unknown',
+        ...((diagnosticResult.errorCode || diagnosticResult.diagnostic?.errorCode)
+          ? { errorCode: diagnosticResult.errorCode || diagnosticResult.diagnostic?.errorCode }
+          : {}),
+        stage: failureStage,
+        ...(diagnosticResult.diagnostic ? { diagnostic: diagnosticResult.diagnostic } : {}),
       });
     }
 
@@ -2327,6 +2954,14 @@ function buildOpenApiSpec(req: Request) {
                 },
               },
             },
+            503: {
+              description: 'A dependency outage occurred before reservation token movement could be attempted. Retry the identical CDR and durable operation key.',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/CdrResponse' },
+                },
+              },
+            },
             400: invalidCdrResponse,
             401: errorResponse,
             403: errorResponse,
@@ -2380,6 +3015,22 @@ function buildOpenApiSpec(req: Request) {
             },
             202: {
               description: 'Spend or receipt recovery is pending. Retry with the same idempotencyKey or returned operationKey.',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/SpendResponse' },
+                },
+              },
+            },
+            409: {
+              description: 'The request conflicts with the immutable saved spend intent; no replacement transfer was submitted.',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/SpendResponse' },
+                },
+              },
+            },
+            503: {
+              description: 'A dependency outage occurred before token movement could be attempted. Retry the same idempotencyKey or operationKey.',
               content: {
                 'application/json': {
                   schema: { $ref: '#/components/schemas/SpendResponse' },
@@ -2637,8 +3288,12 @@ function buildOpenApiSpec(req: Request) {
         post: {
           tags: ['Wallets'],
           summary: 'Switch active wallet mode',
+          description: 'idempotencyKey or Idempotency-Key is optional for mode persistence. Supply a stable value when the custodial allowance-revoke action must be retryable after an uncertain response; reuse it only for the same request.',
           security: apiKeySecurity,
-          parameters: [{ $ref: '#/components/parameters/UidPath' }],
+          parameters: [
+            { $ref: '#/components/parameters/UidPath' },
+            { $ref: '#/components/parameters/IdempotencyKeyHeader' },
+          ],
           requestBody: {
             required: true,
             content: {
@@ -2658,13 +3313,19 @@ function buildOpenApiSpec(req: Request) {
             },
             400: errorResponse,
             409: {
-              description: 'Source wallet still has SPARKZ balance',
+              description: 'Source wallet still has SPARKZ balance, or the saved wallet operation requires review',
               content: {
                 'application/json': {
-                  schema: { $ref: '#/components/schemas/SourceWalletBalanceResponse' },
+                  schema: {
+                    oneOf: [
+                      { $ref: '#/components/schemas/SourceWalletBalanceResponse' },
+                      { $ref: '#/components/schemas/ErrorResponse' },
+                    ],
+                  },
                 },
               },
             },
+            503: errorResponse,
           },
         },
       },
@@ -2814,8 +3475,12 @@ function buildOpenApiSpec(req: Request) {
         post: {
           tags: ['Wallets'],
           summary: 'Move all SPARKZ from managed wallet to target address',
+          description: 'Supply one stable idempotencyKey body field or Idempotency-Key header. Reuse the exact key only to retry the same transfer after an uncertain response.',
           security: apiKeySecurity,
-          parameters: [{ $ref: '#/components/parameters/UidPath' }],
+          parameters: [
+            { $ref: '#/components/parameters/UidPath' },
+            { $ref: '#/components/parameters/IdempotencyKeyHeader' },
+          ],
           requestBody: {
             required: true,
             content: {
@@ -2834,6 +3499,8 @@ function buildOpenApiSpec(req: Request) {
               },
             },
             400: errorResponse,
+            409: errorResponse,
+            503: errorResponse,
           },
         },
       },
@@ -3060,6 +3727,13 @@ function buildOpenApiSpec(req: Request) {
           required: true,
           schema: { type: 'string', example: '000' },
         },
+        IdempotencyKeyHeader: {
+          name: 'Idempotency-Key',
+          in: 'header',
+          required: false,
+          description: 'Stable caller identity for retrying the same wallet transaction. It may be supplied instead of body idempotencyKey.',
+          schema: { type: 'string', minLength: 1, example: 'wallet-move-2026-10-13-001' },
+        },
         WalletAddressPath: {
           name: 'walletAddress',
           in: 'path',
@@ -3095,6 +3769,16 @@ function buildOpenApiSpec(req: Request) {
               description: 'Safe processing-failure detail suitable for display or logging.',
               example: 'The reward network is temporarily unavailable. Please retry the request shortly.',
             },
+            errorCode: { type: 'string', description: 'Stable financial failure code; retry the same operation key only when retryable is true.' },
+            stage: { type: 'string', enum: ['validation', 'asset_context', 'preflight', 'prepare', 'persist_hash', 'broadcast', 'receipt', 'projection', 'recovery'] },
+            operationKey: { type: 'string', nullable: true, description: 'Original durable operation key. Reuse it for recovery; do not create a new payment.' },
+            txHash: { type: 'string', nullable: true, description: 'Known canonical transaction hash, when one was saved.' },
+            fundingTxHash: { type: 'string', nullable: true, description: 'Auxiliary native gas-funding hash; never use it as the token movement hash.' },
+            movementOutcome: { type: 'string', enum: ['confirmed', 'no_movement', 'unknown', 'review'], nullable: true },
+            pending: { type: 'boolean', nullable: true },
+            retryable: { type: 'boolean', nullable: true },
+            requiresReview: { type: 'boolean', nullable: true },
+            diagnostic: { $ref: '#/components/schemas/TransactionDiagnostic' },
           },
           anyOf: [
             { required: ['message'] },
@@ -3107,12 +3791,45 @@ function buildOpenApiSpec(req: Request) {
             status: { type: 'string', example: 'ok' },
           },
         },
+        TransactionDiagnostic: {
+          type: 'object',
+          required: ['stage', 'errorCode', 'retryable'],
+          properties: {
+            stage: { type: 'string', enum: ['asset_context', 'preflight', 'prepare', 'persist_hash', 'broadcast', 'receipt', 'projection', 'recovery', 'validation'] },
+            rpcMethod: { type: 'string', description: 'Allowlisted RPC method name, when known.' },
+            rpcCode: { oneOf: [{ type: 'string' }, { type: 'integer' }], description: 'Provider/RPC error code without raw provider text.' },
+            httpStatus: { type: 'integer', minimum: 100, maximum: 599 },
+            traceId: { type: 'string', description: 'Provider trace identifier without credentials or URL data.' },
+            rpcEndpoint: { type: 'string', pattern: '^[A-Za-z0-9_.:-]{1,40}$', description: 'Safe configured RPC endpoint label; never a URL.' },
+            rpcFailover: {
+              type: 'array',
+              description: 'Ordered safe evidence for RPC endpoints tried by one bounded same-chain request; labels only, never URLs.',
+              items: {
+                type: 'object',
+                required: ['label', 'outcome'],
+                properties: {
+                  label: { type: 'string', pattern: '^[A-Za-z0-9_.:-]{1,40}$' },
+                  outcome: { type: 'string', enum: ['success', 'failed', 'null'] },
+                  providerCode: { type: 'string' },
+                  rpcCode: { oneOf: [{ type: 'string' }, { type: 'integer' }] },
+                  httpStatus: { type: 'integer', minimum: 100, maximum: 599 },
+                  traceId: { type: 'string' },
+                },
+              },
+            },
+            errorCode: { type: 'string' },
+            retryable: { type: 'boolean' },
+            savedHash: { type: 'string', description: 'Canonical saved hash used for read-only recovery.' },
+            nonce: { type: 'integer', minimum: 0 },
+          },
+        },
         MessageResponse: {
           type: 'object',
           properties: {
             status: { type: 'string', example: 'success' },
             uid: { type: 'string', example: '000' },
             txHash: { type: 'string', example: '0xabc...' },
+            fundingTxHash: { type: 'string', nullable: true, description: 'Auxiliary native gas-funding hash; never use it as the token movement hash.' },
             receiptStatus: { type: 'string', nullable: true },
             pending: { type: 'boolean', nullable: true },
             retryable: { type: 'boolean', nullable: true },
@@ -3281,6 +3998,11 @@ function buildOpenApiSpec(req: Request) {
             eligible: { type: 'boolean', example: true },
             tokensAwarded: { type: 'number', example: 10 },
             txHash: { type: 'string', example: '0xabc...' },
+            errorCode: { type: 'string', nullable: true, description: 'Stable financial failure code when processing did not complete.' },
+            stage: { type: 'string', nullable: true, enum: ['validation', 'asset_context', 'preflight', 'prepare', 'persist_hash', 'broadcast', 'receipt', 'projection', 'recovery'] },
+            operationKey: { type: 'string', nullable: true, description: 'Original durable operation key. Reuse it for recovery; do not create a new payment.' },
+            diagnostic: { $ref: '#/components/schemas/TransactionDiagnostic' },
+            movementOutcome: { type: 'string', enum: ['confirmed', 'no_movement', 'unknown', 'review'], nullable: true },
             awardTxHash: { type: 'string', nullable: true, description: 'Award transaction hash when reservation recovery has a separate pending hash.' },
             reservationId: { type: 'string', nullable: true },
             reservationTxHash: { type: 'string', nullable: true },
@@ -3458,6 +4180,9 @@ function buildOpenApiSpec(req: Request) {
             tokensSpent: { type: 'number', example: 5 },
             txHash: { type: 'string', example: '0xabc...' },
             operationKey: { type: 'string', nullable: true },
+            errorCode: { type: 'string', nullable: true },
+            stage: { type: 'string', nullable: true },
+            diagnostic: { $ref: '#/components/schemas/TransactionDiagnostic' },
             operationStatus: { type: 'string', nullable: true },
             movementOutcome: { type: 'string', enum: ['unknown', 'confirmed', 'no_movement', 'review'], nullable: true, description: 'Durable token-movement classification; do not infer it from operationStatus.' },
             pending: { type: 'boolean' },
@@ -3509,6 +4234,16 @@ function buildOpenApiSpec(req: Request) {
             deliveredKwh: { type: 'string', nullable: true, example: '3.000' },
             freeKwh: { type: 'string', example: '3.00' },
             txHash: { type: 'string', nullable: true },
+            operationKey: { type: 'string', nullable: true },
+            operationStatus: { type: 'string', nullable: true },
+            errorCode: { type: 'string', nullable: true },
+            stage: { type: 'string', nullable: true },
+            movementOutcome: { type: 'string', enum: ['confirmed', 'no_movement', 'unknown', 'review'], nullable: true },
+            pending: { type: 'boolean', nullable: true },
+            retryable: { type: 'boolean', nullable: true },
+            requiresReview: { type: 'boolean', nullable: true },
+            error: { type: 'string', nullable: true, description: 'Safe recovery guidance for an unresolved reservation operation.' },
+            diagnostic: { $ref: '#/components/schemas/TransactionDiagnostic' },
             spendReceipt: { type: 'object', nullable: true, additionalProperties: true },
             receiptStatus: { type: 'string', enum: ['not_created', 'pending', 'settled', 'none'] },
             updatedAt: { type: 'string', format: 'date-time' },
@@ -3565,11 +4300,13 @@ function buildOpenApiSpec(req: Request) {
         },
         WalletModeRequest: {
           type: 'object',
+          description: 'Mode persistence accepts an optional idempotencyKey. Supply it, or the Idempotency-Key header, when the custodial allowance revoke must be retried after an uncertain response.',
           required: ['mode'],
           properties: {
             mode: { type: 'string', enum: ['managed', 'custodial'] },
             walletAddress: { type: 'string', example: '0x281cdB9F9407Ad029a6d7d5d9989a8362CDb7A59' },
             allowSplit: { type: 'boolean', example: false },
+            idempotencyKey: { type: 'string', minLength: 1, description: 'Stable caller identity. Reuse the exact key only to retry this mode request.' },
           },
         },
         WalletModeResponse: {
@@ -3635,9 +4372,11 @@ function buildOpenApiSpec(req: Request) {
         },
         MoveFundsRequest: {
           type: 'object',
+          description: 'A stable idempotencyKey body field or Idempotency-Key header is required before a managed-wallet transfer can be attempted; reuse the same identity only for the same target.',
           required: ['targetAddress'],
           properties: {
             targetAddress: { type: 'string', example: '0x281cdB9F9407Ad029a6d7d5d9989a8362CDb7A59' },
+            idempotencyKey: { type: 'string', minLength: 1, description: 'Stable caller identity. Reuse the exact key only to retry this transfer.' },
           },
         },
         MoveFundsResponse: {
@@ -4073,6 +4812,15 @@ app.post('/ingest/cdr', validateIngestApiKey, async (req: Request, res: Response
       : await processAwardFromCDR(cdr, treasurySigner);
 
     if (!result.success) {
+      const awardFailure = publicFailureFields(result, {
+        stage: 'broadcast',
+        operationKey: awardOperationKey(providerId, sessionId),
+        txHash: result.txHash,
+        pending: result.pending,
+        retryable: Boolean(result.pending && !result.requiresReview),
+        requiresReview: result.requiresReview,
+        error: result.error,
+      });
       if (isTreasuryGasIssue(result.error)) {
         await auditTreasuryGasWarning('award.ingest.failure', result.error);
       }
@@ -4082,32 +4830,45 @@ app.post('/ingest/cdr', validateIngestApiKey, async (req: Request, res: Response
         actorId: String(providerId),
         targetType: 'award_dedup_key',
         targetId: result.dedupKey || dedupKey,
-          status: result.requiresReview
+          status: awardFailure.requiresReview
             ? 'requires_review'
-            : (result.stage === 'execution' ? 'retry_required' : 'error'),
+            : (awardFailure.retryable || result.pending ? 'retry_required' : 'error'),
           metadata: {
           sessionId,
           providerId,
           uid: result.uid || contractId,
           normalisation,
-          stage: result.stage,
-          error: result.error,
+          operationKey: awardFailure.operationKey,
+          txHash: awardFailure.txHash,
+          errorCode: awardFailure.errorCode,
+          stage: awardFailure.stage,
+          movementOutcome: awardFailure.movementOutcome,
+          ...(awardFailure.diagnostic ? { diagnostic: awardFailure.diagnostic } : {}),
         },
       });
       const chargingSessionCollision = typeof result.error === 'string'
         && result.error.startsWith('AWARD_CHARGING_SESSION_COLLISION_REVIEW:');
-      return res.status(result.pending ? 202 : 400).json({
+      const noMovementRetry = awardFailure.retryable
+        && awardFailure.movementOutcome === 'no_movement'
+        && !awardFailure.txHash;
+      const awardResponseStatus = noMovementRetry ? 503 : result.pending ? 202 : awardFailure.requiresReview ? 409 : 400;
+      return res.status(awardResponseStatus).json({
         status: result.pending ? 'pending' : 'error',
         ...(chargingSessionCollision ? { code: 'AWARD_CHARGING_SESSION_COLLISION_REVIEW' } : {}),
+        errorCode: chargingSessionCollision ? 'AWARD_CHARGING_SESSION_COLLISION_REVIEW' : awardFailure.errorCode,
         sessionId,
         providerId,
         normalisation,
-        txHash: result.txHash || null,
+        txHash: awardFailure.txHash,
+        operationKey: awardFailure.operationKey,
           operationStatus: result.operationStatus || null,
+          stage: awardFailure.stage,
+          movementOutcome: awardFailure.movementOutcome,
           pending: Boolean(result.pending),
-          retryable: Boolean(result.pending && !result.requiresReview),
-          requiresReview: Boolean(result.requiresReview),
-        error: toUserFacingAwardError(result.error, result.stage),
+          retryable: awardFailure.retryable,
+          requiresReview: awardFailure.requiresReview,
+          ...(awardFailure.diagnostic ? { diagnostic: awardFailure.diagnostic } : {}),
+        error: toUserFacingAwardError(result.error, awardFailure.stage),
       });
     }
 
@@ -4149,30 +4910,55 @@ app.post('/ingest/cdr', validateIngestApiKey, async (req: Request, res: Response
         requiresReview?: boolean;
       };
       if (recovery.pending || recovery.settlementPending || recovery.reservationId || recovery.txHash) {
-        const errorText = getErrorMessage(err);
-        const requiresReview = recovery.requiresReview === undefined
+        const fallbackRequiresReview = recovery.requiresReview === undefined
           ? (!recovery.txHash && recovery.financialStatus === 'unknown')
           : recovery.requiresReview;
-        const retryable = recovery.retryable === undefined
-          ? (!requiresReview && (Boolean(recovery.pending) || Boolean(recovery.txHash)))
+        const fallbackRetryable = recovery.retryable === undefined
+          ? (!fallbackRequiresReview && (Boolean(recovery.pending) || Boolean(recovery.txHash)))
           : recovery.retryable;
+        const reservationFailure = publicFailureFields(recovery, {
+          stage: 'recovery',
+          operationKey: recovery.reservationId ? reservationOperationKey(recovery.reservationId) : null,
+          txHash: recovery.txHash,
+          movementOutcome: recovery.movementOutcome === 'confirmed'
+            || recovery.movementOutcome === 'no_movement'
+            || recovery.movementOutcome === 'unknown'
+            || recovery.movementOutcome === 'review'
+            ? recovery.movementOutcome
+            : undefined,
+          pending: Boolean(recovery.pending || recovery.settlementPending),
+          retryable: Boolean(fallbackRetryable),
+          requiresReview: fallbackRequiresReview,
+          error: err,
+        });
         await safeAuditLog({
           eventType: 'spend.reservation_recovery_pending',
           actorType: 'ingest_client',
           actorId: String(providerId),
           targetType: 'spend_reservation',
           targetId: recovery.reservationId || null,
-          status: requiresReview ? 'requires_review' : 'retry_required',
+          status: reservationFailure.requiresReview ? 'requires_review' : 'retry_required',
           metadata: {
-            error: errorText,
             txHash: recovery.txHash || null,
             awardTxHash: result.txHash || null,
-            requiresReview,
-            retryable,
+            operationKey: reservationFailure.operationKey,
+            errorCode: reservationFailure.errorCode,
+            stage: reservationFailure.stage,
+            movementOutcome: reservationFailure.movementOutcome,
+            ...(reservationFailure.diagnostic ? { diagnostic: reservationFailure.diagnostic } : {}),
+            requiresReview: reservationFailure.requiresReview,
+            retryable: reservationFailure.retryable,
           },
         });
-        return res.status(202).json({
-          status: 'pending',
+        const noMovementRetry = reservationFailure.retryable
+          && reservationFailure.movementOutcome === 'no_movement'
+          && !reservationFailure.txHash;
+        const reservationContextConflict = reservationFailure.errorCode === 'RESERVATION_CONTEXT_MISMATCH';
+        const effectiveRequiresReview = reservationFailure.requiresReview;
+        const effectiveRetryable = reservationFailure.retryable;
+        const responseStatus = reservationContextConflict ? 409 : noMovementRetry ? 503 : 202;
+        return res.status(responseStatus).json({
+          status: reservationContextConflict ? 'error' : 'pending',
           sessionId,
           providerId,
           uid: result.uid,
@@ -4181,18 +4967,24 @@ app.post('/ingest/cdr', validateIngestApiKey, async (req: Request, res: Response
           eligible: result.eligible,
           tokensAwarded: result.amount,
           awardTxHash: result.txHash || null,
-          txHash: recovery.txHash || result.txHash || null,
+          // The award and reservation transfers are separate operations. Never
+          // make an award hash look like evidence for the failed reservation.
+          txHash: reservationFailure.txHash || null,
+          operationKey: reservationFailure.operationKey,
+          errorCode: reservationFailure.errorCode,
+          stage: reservationFailure.stage,
           operationStatus: result.operationStatus || null,
           reservationId: recovery.reservationId || null,
           reservationTxHash: recovery.txHash || null,
-          movementOutcome: recovery.movementOutcome || null,
+          movementOutcome: reservationFailure.movementOutcome,
           financialStatus: recovery.financialStatus || 'pending',
-          pending: true,
-          retryable,
-          requiresReview,
+          pending: reservationContextConflict ? false : Boolean(recovery.pending || recovery.settlementPending),
+          retryable: effectiveRetryable,
+          requiresReview: effectiveRequiresReview,
           spendPending: Boolean(recovery.spendPending),
           preflightFailure: Boolean(recovery.preflightFailure),
-          error: requiresReview
+          ...(reservationFailure.diagnostic ? { diagnostic: reservationFailure.diagnostic } : {}),
+          error: effectiveRequiresReview
             ? 'Award outcome is known but reservation settlement requires operator review.'
             : 'Award outcome is known but reservation settlement is pending recovery. Retry the same CDR or poll the reservation status.',
         });
@@ -4220,6 +5012,16 @@ app.post('/ingest/cdr', validateIngestApiKey, async (req: Request, res: Response
     if (isTreasuryGasIssue(err)) {
       await auditTreasuryGasWarning('award.ingest.unhandled_error', err);
     }
+    const awardFailure = publicFailureFields(err, {
+      stage: 'recovery',
+      pending: isNetworkIssue(err),
+      retryable: isNetworkIssue(err),
+      requiresReview: false,
+      error: err,
+    });
+    const awardPending = typeof asUnknownRecord(err)?.pending === 'boolean'
+      ? Boolean(asUnknownRecord(err)?.pending)
+      : awardFailure.retryable;
     await safeAuditLog({
       eventType: 'award.unhandled_error',
       actorType: 'ingest_client',
@@ -4228,11 +5030,24 @@ app.post('/ingest/cdr', validateIngestApiKey, async (req: Request, res: Response
       targetId: '/ingest/cdr',
       status: 'error',
       metadata: {
-        error: err instanceof Error ? err.message : String(err),
+        errorCode: awardFailure.errorCode,
+        stage: awardFailure.stage,
+        movementOutcome: awardFailure.movementOutcome,
+        ...(awardFailure.diagnostic ? { diagnostic: awardFailure.diagnostic } : {}),
       },
     });
-    res.status(500).json({
-      status: 'error',
+    const awardErrorStatus = awardFailure.requiresReview ? 409 : awardFailure.retryable ? 503 : 500;
+    res.status(awardErrorStatus).json({
+      status: awardFailure.requiresReview ? 'error' : awardPending ? 'pending' : 'error',
+      errorCode: awardFailure.errorCode,
+      stage: awardFailure.stage,
+      operationKey: awardFailure.operationKey,
+      txHash: awardFailure.txHash,
+      movementOutcome: awardFailure.movementOutcome,
+      pending: awardPending,
+      retryable: awardFailure.retryable,
+      requiresReview: awardFailure.requiresReview,
+      ...(awardFailure.diagnostic ? { diagnostic: awardFailure.diagnostic } : {}),
       error: toUserFacingAwardError(err),
     });
   }
@@ -4533,25 +5348,62 @@ app.post('/spend', validateApiKey, async (req: Request, res: Response) => {
       idempotencyKey: typeof idempotencyKey === 'string' ? idempotencyKey : undefined,
       auditContext: 'legacy',
       onApprovalFailure: async approvalErr => {
+        const approvalRecord = asUnknownRecord(approvalErr);
+        const approvalFailure = publicFailureFields(approvalErr, {
+          stage: 'prepare',
+          pending: typeof approvalRecord?.pending === 'boolean' ? approvalRecord.pending : true,
+          retryable: typeof approvalRecord?.retryable === 'boolean' ? approvalRecord.retryable : false,
+          requiresReview: typeof approvalRecord?.requiresReview === 'boolean' ? approvalRecord.requiresReview : true,
+          error: approvalErr,
+        });
         await safeAuditLog({
           eventType: 'spend.auto_approval_failed',
           actorType: 'api_client',
           actorId: normalizedUid,
           targetType: 'wallet',
           targetId: userAddress,
-          status: 'retry_required',
+          status: approvalFailure.requiresReview
+            ? 'requires_review'
+            : approvalFailure.retryable
+              ? 'retry_required'
+              : 'error',
           metadata: {
             uid: normalizedUid,
             amount,
             sessionId,
             providerId,
-            error: getErrorMessage(approvalErr),
+            errorCode: approvalFailure.errorCode,
+            stage: approvalFailure.stage,
+            fundingTxHash: approvalFailure.fundingTxHash,
+            ...(approvalFailure.diagnostic ? { diagnostic: approvalFailure.diagnostic } : {}),
           },
         });
       },
     });
 
     if (!spendResult.success) {
+      const spendErrorText = getErrorMessage(spendResult.error).toLowerCase();
+      const spendFallbackStage: PublicFailureStage = spendResult.preflightFailure
+        ? 'preflight'
+        : spendResult.operationStatus === 'projected'
+          ? 'projection'
+          : spendResult.operationStatus === 'submitted' || spendResult.operationStatus === 'confirmed'
+            ? 'receipt'
+            : spendErrorText.includes('asset context') || spendErrorText.includes('intent mismatch')
+              ? 'asset_context'
+              : spendResult.requiresReview && !spendResult.txHash
+                ? 'prepare'
+                : 'broadcast';
+      const spendFailure = publicFailureFields(spendResult, {
+        stage: spendFallbackStage,
+        operationKey: spendResult.operationKey || requestedOperationKey || null,
+        txHash: spendResult.txHash,
+        movementOutcome: spendResult.movementOutcome,
+        pending: spendResult.pending,
+        retryable: Boolean(spendResult.pending && !spendResult.requiresReview),
+        requiresReview: spendResult.requiresReview,
+        error: spendResult.error,
+      });
       if (isTreasuryGasIssue(spendResult.error)) {
         await auditTreasuryGasWarning('spend.legacy.failure', spendResult.error);
       }
@@ -4561,27 +5413,49 @@ app.post('/spend', validateApiKey, async (req: Request, res: Response) => {
         actorId: normalizedUid,
         targetType: 'wallet',
         targetId: userAddress,
-        status: 'retry_required',
+        status: spendFailure.requiresReview
+          ? 'requires_review'
+          : spendFailure.retryable
+            ? 'retry_required'
+            : 'error',
         metadata: {
           uid: normalizedUid,
           amount,
           sessionId,
           providerId,
-          movementOutcome: spendResult.movementOutcome || null,
-          error: spendResult.error,
+          operationKey: spendFailure.operationKey,
+          txHash: spendFailure.txHash,
+          fundingTxHash: spendFailure.fundingTxHash,
+          errorCode: spendFailure.errorCode,
+          stage: spendFailure.stage,
+          movementOutcome: spendFailure.movementOutcome,
+          ...(spendFailure.diagnostic ? { diagnostic: spendFailure.diagnostic } : {}),
         },
       });
-      return res.status(spendResult.pending ? 202 : 400).json({
+      const immutableConflict = [
+        'TOKEN_OPERATION_INTENT_MISMATCH',
+        'SETTLEMENT_CONTEXT_RESERVATION_MISMATCH',
+        'RESERVATION_CONTEXT_MISMATCH',
+      ].includes(spendFailure.errorCode);
+      const noMovementRetry = spendFailure.retryable
+        && spendFailure.movementOutcome === 'no_movement'
+        && !spendFailure.txHash;
+      const responseStatus = immutableConflict ? 409 : noMovementRetry ? 503 : spendResult.pending ? 202 : 400;
+      return res.status(responseStatus).json({
         status: spendResult.pending ? 'pending' : 'error',
         uid: normalizedUid,
-        txHash: spendResult.txHash || null,
-        operationKey: spendResult.operationKey || null,
+        txHash: spendFailure.txHash,
+        fundingTxHash: spendFailure.fundingTxHash,
+        operationKey: spendFailure.operationKey,
+        errorCode: spendFailure.errorCode,
+        stage: spendFailure.stage,
         operationStatus: spendResult.operationStatus || null,
-        movementOutcome: spendResult.movementOutcome || null,
+        movementOutcome: spendFailure.movementOutcome,
         pending: Boolean(spendResult.pending),
-        retryable: Boolean(spendResult.pending && !spendResult.requiresReview),
-        requiresReview: Boolean(spendResult.requiresReview),
+        retryable: spendFailure.retryable,
+        requiresReview: spendFailure.requiresReview,
         preflightFailure: Boolean(spendResult.preflightFailure),
+        ...(spendFailure.diagnostic ? { diagnostic: spendFailure.diagnostic } : {}),
         error: toUserFacingSpendError(spendResult.error),
       });
     }
@@ -4599,34 +5473,61 @@ app.post('/spend', validateApiKey, async (req: Request, res: Response) => {
     } catch (err) {
       const recovery = err as Error & { receiptConflict?: boolean; requiresReview?: boolean; receiptPending?: boolean };
       if (recovery.receiptConflict || recovery.requiresReview) {
-        return res.status(409).json({
-          status: 'error',
-          code: 'SPEND_RECEIPT_CONTEXT_MISMATCH',
-          uid: normalizedUid,
+        const receiptFailure = publicFailureFields(recovery, {
+          stage: 'projection',
+          operationKey: spendResult.operationKey || requestedOperationKey || null,
           txHash: spendResult.txHash,
           movementOutcome: spendResult.movementOutcome || 'confirmed',
-          receiptStatus: 'invalid',
           pending: false,
           retryable: false,
           requiresReview: true,
+          error: err,
+        });
+        return res.status(409).json({
+          status: 'error',
+          code: 'SPEND_RECEIPT_CONTEXT_MISMATCH',
+          errorCode: receiptFailure.errorCode,
+          stage: receiptFailure.stage,
+          uid: normalizedUid,
+          txHash: receiptFailure.txHash,
+          operationKey: receiptFailure.operationKey,
+          movementOutcome: receiptFailure.movementOutcome,
+          receiptStatus: 'invalid',
+          pending: false,
+          retryable: receiptFailure.retryable,
+          requiresReview: receiptFailure.requiresReview,
+          ...(receiptFailure.diagnostic ? { diagnostic: receiptFailure.diagnostic } : {}),
           error: toUserFacingReceiptError(err),
         });
       }
       if (!recovery.receiptPending) throw err;
+      const receiptPendingFailure = publicFailureFields(recovery, {
+        stage: 'projection',
+        operationKey: spendResult.operationKey || requestedOperationKey || null,
+        txHash: spendResult.txHash,
+        movementOutcome: spendResult.movementOutcome || 'confirmed',
+        pending: true,
+        retryable: true,
+        requiresReview: false,
+        error: err,
+      });
       return res.status(202).json({
         status: 'pending',
         uid: normalizeUid(String(req.body.uid || '')),
         sessionId,
         providerId,
         tokensSpent: spendResult.amount,
-        txHash: spendResult.txHash,
-        operationKey: spendResult.operationKey || null,
-        movementOutcome: spendResult.movementOutcome || 'confirmed',
+        txHash: receiptPendingFailure.txHash,
+        operationKey: receiptPendingFailure.operationKey,
+        errorCode: receiptPendingFailure.errorCode,
+        stage: receiptPendingFailure.stage,
+        movementOutcome: receiptPendingFailure.movementOutcome,
         financialStatus: 'confirmed',
         receiptStatus: 'pending',
         pending: true,
-        retryable: true,
-        requiresReview: false,
+        retryable: receiptPendingFailure.retryable,
+        requiresReview: receiptPendingFailure.requiresReview,
+        ...(receiptPendingFailure.diagnostic ? { diagnostic: receiptPendingFailure.diagnostic } : {}),
         error: 'The spend is confirmed but its receipt is pending persistence. Retry with the same idempotencyKey or returned operationKey.',
       });
     }
@@ -4666,19 +5567,48 @@ app.post('/spend', validateApiKey, async (req: Request, res: Response) => {
     if (isTreasuryGasIssue(err)) {
       await auditTreasuryGasWarning('spend.legacy.unhandled_error', err);
     }
+    const spendFailure = publicFailureFields(err, {
+      stage: 'recovery',
+      pending: isNetworkIssue(err),
+      retryable: isNetworkIssue(err),
+      requiresReview: false,
+      error: err,
+    });
+    const spendPending = typeof asUnknownRecord(err)?.pending === 'boolean'
+      ? Boolean(asUnknownRecord(err)?.pending)
+      : spendFailure.retryable;
     await safeAuditLog({
       eventType: 'spend.unhandled_error',
       actorType: 'api_client',
       actorId: null,
       targetType: 'endpoint',
       targetId: '/spend',
-      status: 'error',
+      status: spendFailure.requiresReview
+        ? 'requires_review'
+        : spendFailure.retryable
+          ? 'retry_required'
+          : 'error',
       metadata: {
-        error: err instanceof Error ? err.message : String(err),
+        errorCode: spendFailure.errorCode,
+        stage: spendFailure.stage,
+        movementOutcome: spendFailure.movementOutcome,
+        fundingTxHash: spendFailure.fundingTxHash,
+        ...(spendFailure.diagnostic ? { diagnostic: spendFailure.diagnostic } : {}),
       },
     });
-    res.status(500).json({
-      status: 'error',
+    const spendErrorStatus = spendFailure.requiresReview ? 409 : spendFailure.retryable ? 503 : 500;
+    res.status(spendErrorStatus).json({
+      status: spendFailure.requiresReview ? 'error' : spendPending ? 'pending' : 'error',
+      errorCode: spendFailure.errorCode,
+      stage: spendFailure.stage,
+      operationKey: spendFailure.operationKey,
+      txHash: spendFailure.txHash,
+      fundingTxHash: spendFailure.fundingTxHash,
+      movementOutcome: spendFailure.movementOutcome,
+      pending: spendPending,
+      retryable: spendFailure.retryable,
+      requiresReview: spendFailure.requiresReview,
+      ...(spendFailure.diagnostic ? { diagnostic: spendFailure.diagnostic } : {}),
       error: toUserFacingSpendError(err),
     });
   }
@@ -4950,19 +5880,46 @@ app.post('/spend/me', validateApiKey, async (req: Request, res: Response) => {
     if (isTreasuryGasIssue(err)) {
       await auditTreasuryGasWarning('spend.identity.unhandled_error', err);
     }
+    const spendFailure = publicFailureFields(err, {
+      stage: 'recovery',
+      pending: isNetworkIssue(err),
+      retryable: isNetworkIssue(err),
+      requiresReview: false,
+      error: err,
+    });
+    const spendPending = typeof asUnknownRecord(err)?.pending === 'boolean'
+      ? Boolean(asUnknownRecord(err)?.pending)
+      : spendFailure.retryable;
     await safeAuditLog({
       eventType: 'spend.unhandled_error',
       actorType: 'contract_identity',
       actorId: null,
       targetType: 'endpoint',
       targetId: '/spend/me',
-      status: 'error',
+      status: spendFailure.requiresReview
+        ? 'requires_review'
+        : spendFailure.retryable
+          ? 'retry_required'
+          : 'error',
       metadata: {
-        error: err instanceof Error ? err.message : String(err),
+        errorCode: spendFailure.errorCode,
+        stage: spendFailure.stage,
+        movementOutcome: spendFailure.movementOutcome,
+        ...(spendFailure.diagnostic ? { diagnostic: spendFailure.diagnostic } : {}),
       },
     });
-    res.status(500).json({
-      status: 'error',
+    const spendErrorStatus = spendFailure.requiresReview ? 409 : spendFailure.retryable ? 503 : 500;
+    res.status(spendErrorStatus).json({
+      status: spendFailure.requiresReview ? 'error' : spendPending ? 'pending' : 'error',
+      errorCode: spendFailure.errorCode,
+      stage: spendFailure.stage,
+      operationKey: spendFailure.operationKey,
+      txHash: spendFailure.txHash,
+      movementOutcome: spendFailure.movementOutcome,
+      pending: spendPending,
+      retryable: spendFailure.retryable,
+      requiresReview: spendFailure.requiresReview,
+      ...(spendFailure.diagnostic ? { diagnostic: spendFailure.diagnostic } : {}),
       error: toUserFacingSpendError(err),
     });
   }
@@ -4996,6 +5953,36 @@ app.get('/spend/reservations/:reservationId', validateApiKey, async (req: Reques
       });
     }
 
+    const operationKey = reservationOperationKey(reservation.id);
+    let reservationOperation: TokenOperationRecord | undefined;
+    try {
+      reservationOperation = await TokenOperations.findByKey(operationKey);
+    } catch (err) {
+      const failure = publicFailureFields(err, {
+        stage: 'recovery',
+        operationKey,
+        txHash: reservation.tx_hash,
+        pending: true,
+        retryable: true,
+        requiresReview: false,
+        error: err,
+      });
+      return res.status(503).json({
+        status: 'pending',
+        reservationId: reservation.id,
+        operationKey,
+        errorCode: failure.errorCode,
+        stage: failure.stage,
+        txHash: failure.txHash,
+        movementOutcome: failure.movementOutcome,
+        pending: true,
+        retryable: failure.retryable,
+        requiresReview: failure.requiresReview,
+        ...(failure.diagnostic ? { diagnostic: failure.diagnostic } : {}),
+        error: 'The reservation operation state is temporarily unavailable. Retry shortly.',
+      });
+    }
+
     const receiptRecord = reservation.tx_hash
       ? await SpendReceipts.findByTxHash(reservation.tx_hash)
       : undefined;
@@ -5021,6 +6008,28 @@ app.get('/spend/reservations/:reservationId', validateApiKey, async (req: Reques
           ? 'pending'
           : 'not_created';
 
+    const operationStatus = reservationOperation?.status || null;
+    const operationTxHash = canonicalTxHash(reservationOperation?.tx_hash || reservation.tx_hash) || null;
+    const operationPending = operationStatus === 'submitting'
+      || operationStatus === 'submitted'
+      || operationStatus === 'unknown';
+    const operationRequiresReview = reservationOperation?.movement_outcome === 'review'
+      || (operationStatus === 'unknown' && !operationTxHash);
+    const operationFailure = reservationOperation && (operationPending || operationRequiresReview || reservationOperation.status === 'failed' || reservationOperation.error_message)
+      ? publicFailureFields({
+        ...reservationOperation,
+        error: reservationOperation.error_message,
+      }, {
+        stage: operationStatus === 'submitting' || operationStatus === 'submitted' ? 'broadcast' : operationStatus === 'unknown' ? 'recovery' : 'projection',
+        operationKey,
+        txHash: operationTxHash,
+        pending: operationPending,
+        retryable: operationPending && !operationRequiresReview,
+        requiresReview: operationRequiresReview,
+        error: reservationOperation.error_message,
+      })
+      : undefined;
+
     return res.status(200).json({
       status: reservation.status,
       reservationId: reservation.id,
@@ -5031,15 +6040,52 @@ app.get('/spend/reservations/:reservationId', validateApiKey, async (req: Reques
       releasedSparkz: reservation.released_amount || null,
       deliveredKwh: reservation.delivered_kwh || null,
       freeKwh: reservation.settled_amount || '0.00',
-      txHash: reservation.tx_hash || null,
+      txHash: operationTxHash,
+      operationKey,
+      operationStatus,
+      movementOutcome: reservationOperation?.movement_outcome || (reservation.status === 'settled' ? 'confirmed' : reservation.status === 'released' ? 'no_movement' : 'unknown'),
+      ...(operationFailure ? {
+        errorCode: operationFailure.errorCode,
+        stage: operationFailure.stage,
+        pending: operationFailure.retryable || operationFailure.movementOutcome === 'unknown',
+        retryable: operationFailure.retryable,
+        requiresReview: operationFailure.requiresReview,
+        error: operationFailure.requiresReview
+          ? 'The reservation operation requires operator review before any replacement movement.'
+          : operationFailure.retryable && operationFailure.movementOutcome === 'no_movement'
+            ? 'The reservation dependency is temporarily unavailable; retry the same operation key after it recovers.'
+            : operationFailure.movementOutcome === 'unknown'
+              ? 'The reservation chain outcome is still pending confirmation; reconcile the saved operation before any new request.'
+              : 'The reservation operation failed; automatic retry is unavailable. Inspect the saved operation before any follow-up.',
+        ...(operationFailure.diagnostic ? { diagnostic: operationFailure.diagnostic } : {}),
+      } : {}),
       spendReceipt,
       receiptStatus,
       updatedAt: reservation.updated_at,
     });
   } catch (err) {
     console.error('Reservation status error:', err);
-    return res.status(500).json({
-      status: 'error',
+    const failure = publicFailureFields(err, {
+      stage: 'recovery',
+      pending: isNetworkIssue(err),
+      retryable: isNetworkIssue(err),
+      error: err,
+    });
+    const reservationPending = typeof asUnknownRecord(err)?.pending === 'boolean'
+      ? Boolean(asUnknownRecord(err)?.pending)
+      : failure.retryable;
+    const reservationErrorStatus = failure.requiresReview ? 409 : failure.retryable ? 503 : 500;
+    return res.status(reservationErrorStatus).json({
+      status: failure.requiresReview ? 'error' : reservationPending ? 'pending' : 'error',
+      errorCode: failure.errorCode,
+      stage: failure.stage,
+      operationKey: failure.operationKey,
+      txHash: failure.txHash,
+      movementOutcome: failure.movementOutcome,
+      pending: reservationPending,
+      retryable: failure.retryable,
+      requiresReview: failure.requiresReview,
+      ...(failure.diagnostic ? { diagnostic: failure.diagnostic } : {}),
       error: toUserFacingSpendError(err),
     });
   }
@@ -5062,6 +6108,19 @@ app.post('/wallet/:uid/mode', validateApiKey, async (req: Request, res: Response
       return res.status(400).json({
         status: 'error',
         message: 'Missing or invalid fields: uid and mode (managed or custodial) are required',
+      });
+    }
+
+    const walletAction = getOptionalWalletActionKey(req);
+    if (walletAction.code) {
+      const statusCode = walletAction.code === 'TOKEN_OPERATION_INTENT_MISMATCH' ? 409 : 400;
+      return res.status(statusCode).json({
+        status: 'error',
+        code: walletAction.code,
+        errorCode: walletAction.code,
+        retryable: false,
+        requiresReview: false,
+        message: walletAction.message,
       });
     }
 
@@ -5109,9 +6168,46 @@ app.post('/wallet/:uid/mode', validateApiKey, async (req: Request, res: Response
     if (mode === 'custodial' && TREASURY_ADDRESS) {
       (async () => {
         try {
-          await revokeAllowanceOnManagedWallet(normalizedUid, treasurySigner, TREASURY_ADDRESS);
+          await revokeAllowanceOnManagedWallet(normalizedUid, treasurySigner, TREASURY_ADDRESS, walletAction.key);
         } catch (revokeErr) {
-          console.error(`⚠️  Failed to revoke managed wallet allowance for user ${normalizedUid}:`, revokeErr instanceof Error ? revokeErr.message : String(revokeErr));
+          const revokeRecord = asUnknownRecord(revokeErr);
+          const revokeFailure = publicFailureFields(revokeErr, {
+            stage: 'prepare',
+            pending: typeof revokeRecord?.pending === 'boolean' ? revokeRecord.pending : false,
+            retryable: typeof revokeRecord?.retryable === 'boolean' ? revokeRecord.retryable : isNetworkIssue(revokeErr),
+            requiresReview: typeof revokeRecord?.requiresReview === 'boolean' ? revokeRecord.requiresReview : true,
+            error: revokeErr,
+          });
+          console.error('Managed-wallet allowance revoke failed:', {
+            uid: normalizedUid,
+            errorCode: revokeFailure.errorCode,
+            stage: revokeFailure.stage,
+            movementOutcome: revokeFailure.movementOutcome,
+            diagnostic: revokeFailure.diagnostic,
+          });
+          await safeAuditLog({
+            eventType: 'wallet.mode_allowance_revoke_failed',
+            actorType: 'api_client',
+            actorId: normalizedUid,
+            targetType: 'wallet',
+            targetId: result.walletAddress,
+            status: revokeFailure.requiresReview
+              ? 'requires_review'
+              : revokeFailure.retryable
+                ? 'retry_required'
+                : 'error',
+            metadata: {
+              uid: normalizedUid,
+              mode,
+              actionKey: walletAction.key,
+              errorCode: revokeFailure.errorCode,
+              stage: revokeFailure.stage,
+              movementOutcome: revokeFailure.movementOutcome,
+              txHash: revokeFailure.txHash,
+              fundingTxHash: revokeFailure.fundingTxHash,
+              ...(revokeFailure.diagnostic ? { diagnostic: revokeFailure.diagnostic } : {}),
+            },
+          });
         }
       })();
     }
@@ -5123,9 +6219,50 @@ app.post('/wallet/:uid/mode', validateApiKey, async (req: Request, res: Response
       tokenContractAddress: TOKEN_CONTRACT_ADDRESS,
     });
   } catch (err) {
-    res.status(400).json({
-      status: 'error',
-      message: toUserFacingWalletError(err),
+    const failure = publicFailureFields(err, {
+      stage: 'broadcast',
+      pending: Boolean(asUnknownRecord(err)?.pending),
+      retryable: typeof asUnknownRecord(err)?.retryable === 'boolean'
+        ? Boolean(asUnknownRecord(err)?.retryable)
+        : isNetworkIssue(err),
+      requiresReview: typeof asUnknownRecord(err)?.requiresReview === 'boolean'
+        ? Boolean(asUnknownRecord(err)?.requiresReview)
+        : false,
+      error: err,
+    });
+    const allowanceUnavailable = failure.errorCode === 'MANAGED_WALLET_ALLOWANCE_UNAVAILABLE';
+    const intentConflict = failure.errorCode === 'TOKEN_OPERATION_INTENT_MISMATCH';
+    const knownHashPending = Boolean(failure.txHash)
+      && !failure.requiresReview
+      && (failure.stage === 'receipt'
+        || failure.errorCode === 'TRANSACTION_CONFIRMATION_PENDING'
+        || failure.errorCode === 'RECEIPT_PENDING'
+        || failure.errorCode === 'RECEIPT_READ_UNAVAILABLE'
+        || failure.movementOutcome === 'unknown');
+    const pending = knownHashPending
+      || failure.retryable
+      || (failure.movementOutcome === 'unknown' && !allowanceUnavailable && !intentConflict);
+    const statusCode = failure.requiresReview || allowanceUnavailable || intentConflict
+      ? 409
+      : knownHashPending
+        ? 202
+      : failure.retryable
+        ? 503
+        : 400;
+    return res.status(statusCode).json({
+      status: failure.requiresReview ? 'error' : pending ? 'pending' : 'error',
+      code: failure.errorCode,
+      errorCode: failure.errorCode,
+      stage: failure.stage,
+      operationKey: failure.operationKey,
+      txHash: failure.txHash,
+      fundingTxHash: failure.fundingTxHash,
+      movementOutcome: failure.movementOutcome,
+      pending,
+      retryable: failure.retryable,
+      requiresReview: failure.requiresReview,
+      ...(failure.diagnostic ? { diagnostic: failure.diagnostic } : {}),
+      error: toUserFacingWalletError(err),
     });
   }
 });
@@ -5347,18 +6484,70 @@ app.post('/wallet/:uid/move-funds', validateApiKey, async (req: Request, res: Re
       return res.status(400).json({ status: 'error', message: 'Missing or invalid targetAddress' });
     }
 
+    const walletAction = getStableWalletActionKey(req);
+    if (!walletAction.key) {
+      const statusCode = walletAction.code === 'TOKEN_OPERATION_INTENT_MISMATCH' ? 409 : 400;
+      return res.status(statusCode).json({
+        status: 'error',
+        code: walletAction.code,
+        errorCode: walletAction.code,
+        retryable: false,
+        requiresReview: false,
+        message: walletAction.message,
+      });
+    }
+
     const { txHash, amount } = await moveFundsFromManagedWallet(
       normalizedUid,
       targetAddress,
       treasurySigner,
-      TOKEN_CONTRACT_ADDRESS
+      TOKEN_CONTRACT_ADDRESS,
+      walletAction.key,
     );
 
     return res.status(200).json({ status: 'success', txHash, amount, targetAddress });
   } catch (err) {
-    res.status(400).json({
-      status: 'error',
-      message: toUserFacingWalletError(err),
+    const record = asUnknownRecord(err);
+    const failure = publicFailureFields(err, {
+      stage: 'broadcast',
+      pending: typeof record?.pending === 'boolean' ? record.pending : false,
+      retryable: typeof record?.retryable === 'boolean' ? record.retryable : isNetworkIssue(err),
+      requiresReview: typeof record?.requiresReview === 'boolean' ? record.requiresReview : false,
+      error: err,
+    });
+    const allowanceUnavailable = failure.errorCode === 'MANAGED_WALLET_ALLOWANCE_UNAVAILABLE';
+    const intentConflict = failure.errorCode === 'TOKEN_OPERATION_INTENT_MISMATCH';
+    const knownHashPending = Boolean(failure.txHash)
+      && !failure.requiresReview
+      && (failure.stage === 'receipt'
+        || failure.errorCode === 'TRANSACTION_CONFIRMATION_PENDING'
+        || failure.errorCode === 'RECEIPT_PENDING'
+        || failure.errorCode === 'RECEIPT_READ_UNAVAILABLE'
+        || failure.movementOutcome === 'unknown');
+    const pending = knownHashPending
+      || failure.retryable
+      || (failure.movementOutcome === 'unknown' && !allowanceUnavailable && !intentConflict);
+    const statusCode = failure.requiresReview || allowanceUnavailable || intentConflict
+      ? 409
+      : knownHashPending
+        ? 202
+        : failure.retryable
+        ? 503
+        : 400;
+    return res.status(statusCode).json({
+      status: failure.requiresReview ? 'error' : pending ? 'pending' : 'error',
+      code: failure.errorCode,
+      errorCode: failure.errorCode,
+      stage: failure.stage,
+      operationKey: failure.operationKey,
+      txHash: failure.txHash,
+      fundingTxHash: failure.fundingTxHash,
+      movementOutcome: failure.movementOutcome,
+      pending,
+      retryable: failure.retryable,
+      requiresReview: failure.requiresReview,
+      ...(failure.diagnostic ? { diagnostic: failure.diagnostic } : {}),
+      error: toUserFacingWalletError(err),
     });
   }
 });
@@ -6404,6 +7593,7 @@ async function executeAdminOperationRecovery(operationKey: string, actorId: stri
   }
 
   let reservation: Awaited<ReturnType<typeof SpendReservations.findByIdForUid>> | undefined;
+  let deliveredKwh: number | undefined;
   if (operation.operation_type === 'spend' && operation.reservation_id) {
     try {
       reservation = await SpendReservations.findByIdForUid(operation.reservation_id, operation.uid);
@@ -6439,12 +7629,10 @@ async function executeAdminOperationRecovery(operationKey: string, actorId: stri
       && reservation.provider_id === operation.provider_id
       && reservationHash === operationHash);
     const safeTerminalReservation = reservation?.status === 'settled' || reservation?.status === 'released';
-    const deliveredKwh = reservation?.delivered_kwh === undefined || reservation.delivered_kwh === null
-      ? undefined
-      : Number(reservation.delivered_kwh);
-    const validDeliveredKwh = deliveredKwh === undefined
-      || (Number.isFinite(deliveredKwh) && deliveredKwh >= 0);
-    const hasSavedDeliveredKwh = deliveredKwh !== undefined && Number.isFinite(deliveredKwh) && deliveredKwh >= 0;
+    const savedDelivery = readSavedSettlementDelivery(reservation);
+    deliveredKwh = savedDelivery.value;
+    const validDeliveredKwh = !savedDelivery.invalid;
+    const hasSavedDeliveredKwh = deliveredKwh !== undefined;
     const operationAmount = canonicalTokenAmount(operation.amount);
     const settledAmount = canonicalTokenAmount(reservation?.settled_amount);
     const reservedAmount = canonicalTokenAmount(reservation?.reserved_amount);
@@ -6500,12 +7688,11 @@ async function executeAdminOperationRecovery(operationKey: string, actorId: stri
 
     const recoveredTxHash = result.txHash;
     if (operation.operation_type === 'spend' && result.success && recoveredTxHash) {
-      if (reservation && reservation.status === 'settling'
-        && reservation.delivered_kwh !== undefined && reservation.delivered_kwh !== null) {
+      if (reservation && reservation.status === 'settling' && deliveredKwh !== undefined) {
         try {
           const completedReservation = await SpendReservations.complete(
             reservation.id,
-            Number(reservation.delivered_kwh),
+            deliveredKwh,
             result.amount,
             recoveredTxHash,
           );
@@ -7015,6 +8202,7 @@ app.get('/admin/evidence-pack', validateAdmin, async (_req: Request, res: Respon
     const recentRetryEvents = await AuditLogs.getRecent(25, { status: 'retry_required' });
     const recentWarningEvents = await AuditLogs.getRecent(25, { status: 'warning' });
     const recentErrorEvents = await AuditLogs.getRecent(25, { status: 'error' });
+    const recentReviewEvents = await AuditLogs.getRecent(25, { status: 'requires_review' });
     const recentAlertEvents = await AuditLogs.getRecent(25, { eventType: 'admin_alert.delivered' });
     const pilotMetrics = await getPilotMetrics(24);
 
@@ -7042,10 +8230,11 @@ app.get('/admin/evidence-pack', validateAdmin, async (_req: Request, res: Respon
       },
       pilotMetrics,
       audit: {
-        retryRequired: recentRetryEvents,
-        warnings: recentWarningEvents,
-        errors: recentErrorEvents,
-        deliveredAlerts: recentAlertEvents,
+        retryRequired: recentRetryEvents.map(toSafeAdminAuditEvent),
+        warnings: recentWarningEvents.map(toSafeAdminAuditEvent),
+        errors: recentErrorEvents.map(toSafeAdminAuditEvent),
+        reviewRequired: recentReviewEvents.map(toSafeAdminAuditEvent),
+        deliveredAlerts: recentAlertEvents.map(toSafeAdminAuditEvent),
       },
     });
   } catch (err) {

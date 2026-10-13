@@ -64,6 +64,18 @@ performs one idempotent projection without submitting another transfer.
 Existing/raced receipts are checked against the same frozen context before
 reuse. A historical spend row without a matching receipt remains review-only.
 
+Before a positive reservation settlement can enter the token executor, the API
+calls `SpendReservations.persistSettlementContext(reservationId, deliveredKwh)`.
+The service row-locks the reservation, keeps a three-decimal reporting value,
+and retains the validated original decimal in `settlement_context`. Recovery
+uses that original value while the token amount remains at two-decimal
+precision; for example, `1.9999` kWh still settles `1.99` SPARKZ. Repeating the
+same value is idempotent. A later CDR with a different value raises
+`RESERVATION_SETTLEMENT_CONTEXT_MISMATCH`; the API returns HTTP `409` with a
+review-required, no-movement result and does not call the spend executor. The
+same `{ reservationId, deliveredKwh }` context is passed into the durable spend
+operation so recovery can prove which physical settlement was used.
+
 Reservation recovery applies the same rule to the durable reservation spend
 operation: the original owner, amount, reservation ID, session/provider, hash,
 and captured token asset context must still match. If the operation or its
@@ -147,8 +159,19 @@ the matching reservation. A duplicate award still performs missing reservation
 or receipt recovery. If award settlement is known but reservation recovery is
 pending, the response keeps `awardTxHash`/`tokensAwarded` separate from the
 reservation `txHash`, returns HTTP 202, and marks ambiguous pre-hash outcomes
-for review rather than instructing an unsafe blind retry. A changed CDR or
-owner must therefore fail before any reservation debit.
+for review rather than instructing an unsafe blind retry. A dependency outage
+proven before reservation movement returns HTTP 503 with `retryable: true` and
+`movementOutcome: "no_movement"`; retry the identical CDR and operation key. A
+changed CDR or owner must therefore fail before any reservation debit.
+
+Financial chain failures expose a stable `errorCode`, lifecycle `stage`,
+`retryable`, `requiresReview`, original `operationKey`, known `txHash`, and
+`movementOutcome`. The optional diagnostic is sanitized to the worker's
+`TransactionDiagnostic` fields: stage, RPC method/code, HTTP status, provider
+trace ID, error code, retryability, saved hash, and nonce. A lost response with
+a saved hash is a receipt/recovery problem and must use read-only reconciliation;
+it must never trigger a second payment. A hashless unknown outcome remains
+review-only until an operator establishes whether movement occurred.
 
 Managed-wallet approval preparation is also fail-closed. If funding or
 allowance preparation has an ambiguous or review-required state, `/spend`

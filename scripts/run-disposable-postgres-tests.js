@@ -145,6 +145,7 @@ async function main() {
     database: { host: '127.0.0.1', name: DB_NAME, container: DB_CONTAINER },
     suites: [
       'src/database/tokenOperationSchema.test.ts',
+      'src/database/transactionReliability.postgres.test.ts',
       'src/config/policyPersistence.postgres.test.ts',
       'src/database/walletSelection.postgres.test.ts',
     ],
@@ -200,12 +201,15 @@ async function main() {
     const test = await runCommand(npmCommand, [
       'test', '--', '--runInBand',
       'src/database/tokenOperationSchema.test.ts',
+      'src/database/transactionReliability.postgres.test.ts',
       'src/config/policyPersistence.postgres.test.ts',
       'src/database/walletSelection.postgres.test.ts',
     ], {
       env: {
         ...process.env,
         RUN_LOCAL_SCHEMA_TESTS: '1',
+        RUN_LOCAL_TRANSACTION_RELIABILITY_TESTS: '1',
+        TRANSACTION_RELIABILITY_DATABASE_URL: databaseUrl,
         RUN_LOCAL_POLICY_TESTS: '1',
         SCHEMA_DATABASE_URL: databaseUrl,
         POLICY_DATABASE_URL: databaseUrl,
@@ -213,7 +217,7 @@ async function main() {
         RUN_LOCAL_WALLET_TESTS: '1',
         // Keep these suites explicit about their target; the normal .env
         // DATABASE_URL is not used by either disposable suite.
-        DATABASE_URL: '',
+        DATABASE_URL: databaseUrl,
       },
       timeoutMs: 120_000,
     });

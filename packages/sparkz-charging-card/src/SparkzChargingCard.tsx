@@ -48,6 +48,14 @@ type SpendOperationContext = {
   providerId: string;
 };
 
+type WalletModeRequestIdentity = {
+  contractId: string;
+  apiBaseUrl: string;
+  mode: 'managed' | 'custodial';
+  walletAddress?: string;
+  key: string;
+};
+
 class StaleSpendOperationError extends Error {
   constructor() {
     super('The charging session changed before the reservation could be completed.');
@@ -91,6 +99,13 @@ function contractHeaders(contractId: string): HeadersInit {
     'Content-Type': 'application/json',
     'x-contract-id': contractId,
   };
+}
+
+function createWalletModeRequestKey(contractId: string, mode: 'managed' | 'custodial'): string {
+  // This identity is a retry handle, not a credential. Keep it bounded so the
+  // API can safely persist it as the standalone allowance action suffix.
+  const owner = contractId.slice(0, 64);
+  return `wallet-mode:${owner}:${mode}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2)}`.slice(0, 220);
 }
 
 function money(value: number | string | undefined): string {
@@ -150,6 +165,7 @@ export default function SparkzChargingCard({
   showWalletDetails = true,
   hideAfterSpend = true,
   hideAfterSkip = true,
+  walletModeIdempotencyKey,
   polygonExplorerBaseUrl = 'https://amoy.polygonscan.com',
   onSpendSuccess,
   onReservationSuccess,
@@ -194,6 +210,7 @@ export default function SparkzChargingCard({
   });
   const activeOperationTokenRef = useRef(0);
   const activeWalletOperationTokenRef = useRef(0);
+  const walletModeRequestIdentityRef = useRef<WalletModeRequestIdentity | null>(null);
   const mountedRef = useRef(true);
   const [dismissed, setDismissed] = useState(false);
   const [activeTab, setActiveTab] = useState<'activity' | 'account' | 'about'>('activity');
@@ -761,6 +778,25 @@ export default function SparkzChargingCard({
         if (!isCurrent()) throw new StaleSpendOperationError();
       }
 
+      const previousRequest = walletModeRequestIdentityRef.current;
+      const configuredRequestKey = walletModeIdempotencyKey?.trim() || undefined;
+      const sameRequest = previousRequest
+        && previousRequest.contractId === contractId
+        && previousRequest.apiBaseUrl === normalizedApiBaseUrl
+        && previousRequest.mode === mode
+        && previousRequest.walletAddress?.toLowerCase() === walletAddress?.toLowerCase()
+        && (!configuredRequestKey || previousRequest.key === configuredRequestKey);
+      const requestIdentity = sameRequest
+        ? previousRequest
+        : {
+          contractId,
+          apiBaseUrl: normalizedApiBaseUrl,
+          mode,
+          ...(walletAddress ? { walletAddress } : {}),
+          key: configuredRequestKey || createWalletModeRequestKey(contractId, mode),
+        };
+      walletModeRequestIdentityRef.current = requestIdentity;
+
       const res = await fetch(apiUrl(normalizedApiBaseUrl, `/wallet/${encodeURIComponent(contractId)}/mode`), {
         method: 'POST',
         headers: contractHeaders(contractId),
@@ -768,9 +804,11 @@ export default function SparkzChargingCard({
           mode,
           walletAddress,
           allowSplit: true,
+          idempotencyKey: requestIdentity.key,
         }),
       });
       await readJson<{ status: 'success' }>(res);
+      walletModeRequestIdentityRef.current = null;
       if (!isCurrent()) throw new StaleSpendOperationError();
       const walletData = await loadWalletProfile(operationOwnerGeneration, operationToken);
       invokeHostCallback(() => onWalletModeChange?.(walletData), (callbackError) => {

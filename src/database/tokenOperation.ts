@@ -1,6 +1,7 @@
 import { createHash } from 'crypto';
 import { ethers } from 'ethers';
 import { NormalisedSession } from '../types';
+import { withRpcReadRetry } from '../rpcProvider';
 
 /**
  * Transaction hashes are the chain-level idempotency key.  Keep this check
@@ -109,7 +110,7 @@ export async function getTokenAssetContext(
   const configuredChainId = process.env.CHAIN_ID;
   let chainId = configuredChainId || '80002';
   try {
-    const providerChainId = (await signer.provider.getNetwork()).chainId.toString();
+    const providerChainId = (await withRpcReadRetry(() => signer.provider!.getNetwork())).chainId.toString();
     if (configuredChainId && providerChainId !== configuredChainId) {
       throw new Error(`CONFIGURED_CHAIN_MISMATCH: configured chain ${configuredChainId} differs from provider chain ${providerChainId}`);
     }

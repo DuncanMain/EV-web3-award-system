@@ -164,6 +164,7 @@ jest.mock('./database/service', () => {
       findByUid: jest.fn().mockResolvedValue(undefined),
       findByUidAndWallet: jest.fn().mockResolvedValue(undefined),
       findAllByWallet: jest.fn().mockResolvedValue([]),
+      activateWallet: jest.fn(),
       linkContractId: jest.fn(),
       linkLinkedWallet: jest.fn(),
       unlinkLinkedWallet: jest.fn(),
@@ -190,6 +191,7 @@ jest.mock('./database/service', () => {
       getActiveTotal: jest.fn().mockResolvedValue(0),
       reserve: jest.fn(),
       claimForSettlement: jest.fn().mockResolvedValue(undefined),
+      persistSettlementContext: jest.fn().mockResolvedValue(undefined),
       complete: jest.fn(),
       retry: jest.fn(),
     },
@@ -319,13 +321,13 @@ describe('api integration contracts', () => {
     mockProviderReceipts.clear();
     const mockedService = jest.requireMock('./database/service') as {
       Awards: { findByUser: jest.Mock };
-      Users: { findByUid: jest.Mock; findByUidAndWallet: jest.Mock; findAllByWallet: jest.Mock };
+      Users: { findByUid: jest.Mock; findByUidAndWallet: jest.Mock; findAllByWallet: jest.Mock; activateWallet: jest.Mock };
       Balances: { findByUser: jest.Mock };
       LinkedWallets: { findByUid: jest.Mock };
       Spends: { findByTxHash: jest.Mock; findByUser: jest.Mock };
       SpendReceipts: { findByTxHash: jest.Mock; create: jest.Mock };
       TokenOperations: { findByKey: jest.Mock; claim: jest.Mock; markConfirmed: jest.Mock; markProjected: jest.Mock };
-      SpendReservations: { findBySession: jest.Mock; claimForSettlement: jest.Mock; complete: jest.Mock };
+      SpendReservations: { findBySession: jest.Mock; claimForSettlement: jest.Mock; persistSettlementContext: jest.Mock; complete: jest.Mock };
     };
     mockedService.Awards.findByUser.mockReset().mockResolvedValue([]);
     mockedService.Spends.findByUser.mockReset().mockResolvedValue([]);
@@ -333,12 +335,19 @@ describe('api integration contracts', () => {
     mockedService.Spends.findByTxHash.mockReset().mockResolvedValue(undefined);
     mockedService.Users.findByUidAndWallet.mockReset().mockResolvedValue(undefined);
     mockedService.Users.findAllByWallet.mockReset().mockResolvedValue([]);
+    mockedService.Users.activateWallet.mockReset().mockImplementation(async (uid: string, walletAddress: string) => ({
+      id: 'user-wallet-mode',
+      uid,
+      wallet_address: walletAddress,
+      wallet_name: null,
+    }));
     mockedService.Balances.findByUser.mockReset().mockResolvedValue(undefined);
     mockedService.LinkedWallets.findByUid.mockReset().mockResolvedValue([{ wallet_address: linkedWallet.address }]);
     mockedService.SpendReceipts.findByTxHash.mockReset().mockResolvedValue(undefined);
     mockedService.SpendReceipts.create.mockReset().mockResolvedValue(undefined);
     mockedService.SpendReservations.findBySession.mockReset().mockResolvedValue(undefined);
     mockedService.SpendReservations.claimForSettlement.mockReset().mockResolvedValue(undefined);
+    mockedService.SpendReservations.persistSettlementContext.mockReset().mockResolvedValue(undefined);
     mockedService.SpendReservations.complete.mockReset().mockResolvedValue(undefined);
     mockedService.TokenOperations.findByKey.mockReset().mockImplementation(async () => process.env.TEST_AWARD_RECOVERY === 'true'
       ? {
@@ -448,6 +457,11 @@ describe('api integration contracts', () => {
     ]);
     expect(body.components.schemas.SpendRequest.properties.idempotencyKey.minLength).toBe(1);
     expect(body.components.schemas.SpendRequest.properties.operationKey.minLength).toBe(1);
+    expect(body.components.schemas.WalletModeRequest.required).toEqual(['mode']);
+    expect(body.components.schemas.WalletModeRequest.description).toContain('optional idempotencyKey');
+    expect(body.components.schemas.MoveFundsRequest.required).toEqual(['targetAddress']);
+    expect(body.components.schemas.MoveFundsRequest.description).toContain('stable idempotencyKey');
+    expect(body.paths['/wallet/{uid}/move-funds'].post.description).toContain('one stable idempotencyKey');
     expect(body.components.schemas.CdrRequest.oneOf).toEqual([
       { $ref: '#/components/schemas/NeverflatCdrRequest' },
       { $ref: '#/components/schemas/OcpiCdrRequest' },
@@ -663,6 +677,456 @@ describe('api integration contracts', () => {
 
     expect(manualRes.status).toBe(403);
     expect(manualBody.message).toContain('/wallet/me');
+  });
+
+  it('requires a stable identity before starting a managed-wallet transfer', async () => {
+    const res = await apiFetch('/wallet/contract-wallet-move/move-funds', {
+      method: 'POST',
+      body: JSON.stringify({ targetAddress: treasuryWallet.address }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(400);
+    expect(body).toMatchObject({
+      status: 'error',
+      code: 'IDEMPOTENCY_KEY_REQUIRED',
+      errorCode: 'IDEMPOTENCY_KEY_REQUIRED',
+      retryable: false,
+      requiresReview: false,
+    });
+    expect(mockIntegrationModule!.moveFundsFromManagedWallet).not.toHaveBeenCalled();
+  });
+
+  it('passes a body idempotency key to the custodial mode allowance revoke', async () => {
+    const { Users } = await import('./database/service');
+    const uid = 'contract-wallet-mode';
+    (Users.activateWallet as jest.Mock).mockResolvedValueOnce({
+      id: 'user-wallet-mode',
+      uid,
+      wallet_address: ethers.getAddress(linkedWallet.address),
+      wallet_name: null,
+    });
+
+    const res = await apiFetch(`/wallet/${uid}/mode`, {
+      method: 'POST',
+      body: JSON.stringify({
+        mode: 'custodial',
+        walletAddress: linkedWallet.address,
+        allowSplit: true,
+        idempotencyKey: 'wallet-mode-retry-1',
+      }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body).toMatchObject({ status: 'success', uid, walletMode: 'custodial' });
+    expect(Users.activateWallet).toHaveBeenCalledWith(uid, ethers.getAddress(linkedWallet.address));
+    expect(mockIntegrationModule!.revokeAllowanceOnManagedWallet).toHaveBeenCalledWith(
+      uid,
+      expect.anything(),
+      process.env.TREASURY_ADDRESS,
+      'wallet-mode-retry-1',
+    );
+  });
+
+  it('preserves a mode operation identity when the core reports a saved hash', async () => {
+    const { Users } = await import('./database/service');
+    const operationKey = 'wallet-mode-receipt-pending';
+    const savedHash = `0x${'f'.repeat(64)}`;
+    const modeError = Object.assign(new Error('mode transaction receipt is temporarily unavailable'), {
+      operationKey,
+      code: 'RECEIPT_READ_UNAVAILABLE',
+      errorCode: 'RECEIPT_READ_UNAVAILABLE',
+      pending: true,
+      requiresReview: false,
+      retryable: true,
+      movementOutcome: 'unknown',
+      diagnostic: {
+        stage: 'receipt',
+        rpcMethod: 'provider.waitForTransaction',
+        errorCode: 'RECEIPT_READ_UNAVAILABLE',
+        retryable: true,
+        savedHash,
+      },
+    });
+    (Users.activateWallet as jest.Mock).mockRejectedValueOnce(modeError);
+
+    const res = await apiFetch('/wallet/contract-wallet-mode-receipt/mode', {
+      method: 'POST',
+      body: JSON.stringify({
+        mode: 'managed',
+        allowSplit: true,
+        idempotencyKey: operationKey,
+      }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(202);
+    expect(body).toMatchObject({
+      status: 'pending',
+      operationKey,
+      txHash: savedHash,
+      errorCode: 'RECEIPT_READ_UNAVAILABLE',
+      pending: true,
+      retryable: true,
+      requiresReview: false,
+    });
+  });
+
+  it('audits a maintenance revoke funding failure without treating its hash as token movement', async () => {
+    const { AuditLogs, Users } = await import('./database/service');
+    const fundingHash = `0x${'b'.repeat(64)}`;
+    const revokeError = Object.assign(new Error('funding provider response was unavailable'), {
+      code: 'APPROVAL_PREPARATION_REVIEW_REQUIRED',
+      pending: false,
+      requiresReview: true,
+      retryable: false,
+      movementOutcome: 'review',
+      fundingTxHash: fundingHash,
+      diagnostic: {
+        stage: 'prepare',
+        rpcMethod: 'eth_sendTransaction',
+        rpcCode: 19,
+        httpStatus: 500,
+        traceId: 'revoke-funding-trace',
+        errorCode: 'RPC_SUBMISSION_UNAVAILABLE',
+        retryable: false,
+        savedHash: fundingHash,
+      },
+    });
+    mockIntegrationModule!.revokeAllowanceOnManagedWallet.mockRejectedValueOnce(revokeError);
+    (Users.activateWallet as jest.Mock).mockResolvedValueOnce({
+      id: 'user-wallet-revoke-review',
+      uid: 'contract-wallet-revoke-review',
+      wallet_address: ethers.getAddress(linkedWallet.address),
+      wallet_name: null,
+    });
+    (AuditLogs.create as jest.Mock).mockClear();
+
+    const res = await apiFetch('/wallet/contract-wallet-revoke-review/mode', {
+      method: 'POST',
+      body: JSON.stringify({
+        mode: 'custodial',
+        walletAddress: linkedWallet.address,
+        allowSplit: true,
+        idempotencyKey: 'wallet-revoke-review-1',
+      }),
+    });
+    expect(res.status).toBe(200);
+
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const revokeAudit = (AuditLogs.create as jest.Mock).mock.calls
+      .map(([event]) => event as { eventType?: string; status?: string; metadata?: Record<string, unknown> })
+      .find(event => event.eventType === 'wallet.mode_allowance_revoke_failed');
+    expect(revokeAudit).toMatchObject({
+      status: 'requires_review',
+      metadata: {
+        uid: 'contract-wallet-revoke-review',
+        errorCode: 'RPC_SUBMISSION_UNAVAILABLE',
+        stage: 'prepare',
+        txHash: null,
+        fundingTxHash: fundingHash,
+        diagnostic: {
+          rpcMethod: 'eth_sendTransaction',
+          rpcCode: 19,
+          httpStatus: 500,
+          traceId: 'revoke-funding-trace',
+          errorCode: 'RPC_SUBMISSION_UNAVAILABLE',
+          retryable: false,
+        },
+      },
+    });
+    expect(revokeAudit?.metadata?.diagnostic).not.toHaveProperty('savedHash');
+  });
+
+  it('allows mode persistence without an optional allowance-revoke action key', async () => {
+    const { Users } = await import('./database/service');
+    const res = await apiFetch('/wallet/contract-wallet-mode/mode', {
+      method: 'POST',
+      body: JSON.stringify({ mode: 'managed', allowSplit: true }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body).toMatchObject({ status: 'success', uid: 'contract-wallet-mode', walletMode: 'managed' });
+    expect(Users.activateWallet).toHaveBeenCalledWith('contract-wallet-mode', expect.any(String));
+    expect(mockIntegrationModule!.revokeAllowanceOnManagedWallet).not.toHaveBeenCalled();
+  });
+
+  it('passes a header idempotency key to managed-wallet fund movement', async () => {
+    const txHash = `0x${'a'.repeat(64)}`;
+    mockIntegrationModule!.moveFundsFromManagedWallet.mockResolvedValueOnce({ txHash, amount: '1.00' });
+
+    const res = await apiFetch('/wallet/contract-wallet-move/move-funds', {
+      method: 'POST',
+      headers: { 'Idempotency-Key': 'wallet-move-retry-1' },
+      body: JSON.stringify({ targetAddress: treasuryWallet.address }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body).toMatchObject({ status: 'success', txHash, amount: '1.00' });
+    expect(mockIntegrationModule!.moveFundsFromManagedWallet).toHaveBeenCalledWith(
+      'contract-wallet-move',
+      treasuryWallet.address,
+      expect.anything(),
+      process.env.TOKEN_CONTRACT_ADDRESS,
+      'wallet-move-retry-1',
+    );
+  });
+
+  it('rejects conflicting body and header wallet operation identities', async () => {
+    const res = await apiFetch('/wallet/contract-wallet-move/move-funds', {
+      method: 'POST',
+      headers: { 'Idempotency-Key': 'wallet-move-header' },
+      body: JSON.stringify({
+        targetAddress: treasuryWallet.address,
+        idempotencyKey: 'wallet-move-body',
+      }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(409);
+    expect(body).toMatchObject({
+      status: 'error',
+      code: 'TOKEN_OPERATION_INTENT_MISMATCH',
+      errorCode: 'TOKEN_OPERATION_INTENT_MISMATCH',
+      retryable: false,
+      requiresReview: false,
+    });
+    expect(mockIntegrationModule!.moveFundsFromManagedWallet).not.toHaveBeenCalled();
+  });
+
+  it('maps a same-key changed-target conflict before a replacement movement', async () => {
+    const operationKey = 'wallet-move-target-conflict';
+    const firstTarget = treasuryWallet.address;
+    const changedTarget = linkedWallet.address;
+    const intentConflict = Object.assign(new Error('TOKEN_OPERATION_INTENT_MISMATCH: saved target differs'), {
+      code: 'TOKEN_OPERATION_INTENT_MISMATCH',
+      operationKey,
+      retryable: false,
+      requiresReview: false,
+      movementOutcome: 'no_movement',
+    });
+    mockIntegrationModule!.moveFundsFromManagedWallet
+      .mockResolvedValueOnce({ txHash: `0x${'c'.repeat(64)}`, amount: '1.00' })
+      .mockRejectedValueOnce(intentConflict);
+
+    const first = await apiFetch('/wallet/contract-wallet-move/move-funds', {
+      method: 'POST',
+      body: JSON.stringify({ targetAddress: firstTarget, idempotencyKey: operationKey }),
+    });
+    expect(first.status).toBe(200);
+
+    const second = await apiFetch('/wallet/contract-wallet-move/move-funds', {
+      method: 'POST',
+      body: JSON.stringify({ targetAddress: changedTarget, idempotencyKey: operationKey }),
+    });
+    const secondBody = await second.json();
+
+    expect(second.status).toBe(409);
+    expect(secondBody).toMatchObject({
+      status: 'error',
+      code: 'TOKEN_OPERATION_INTENT_MISMATCH',
+      errorCode: 'TOKEN_OPERATION_INTENT_MISMATCH',
+      operationKey,
+      retryable: false,
+      requiresReview: false,
+    });
+    expect(mockIntegrationModule!.moveFundsFromManagedWallet).toHaveBeenNthCalledWith(
+      2,
+      'contract-wallet-move',
+      changedTarget,
+      expect.anything(),
+      process.env.TOKEN_CONTRACT_ADDRESS,
+      operationKey,
+    );
+  });
+
+  it('surfaces a zero managed-wallet allowance as an actionable move failure', async () => {
+    mockIntegrationModule!.moveFundsFromManagedWallet.mockRejectedValueOnce(
+      new Error('execution reverted: ERC20 transferFrom failed because allowance is zero'),
+    );
+
+    const res = await apiFetch('/wallet/contract-wallet-move/move-funds', {
+      method: 'POST',
+      headers: { 'Idempotency-Key': 'wallet-move-zero-allowance' },
+      body: JSON.stringify({ targetAddress: treasuryWallet.address }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(409);
+    expect(body).toMatchObject({
+      status: 'error',
+      code: 'MANAGED_WALLET_ALLOWANCE_UNAVAILABLE',
+      errorCode: 'MANAGED_WALLET_ALLOWANCE_UNAVAILABLE',
+      stage: 'broadcast',
+      txHash: null,
+      fundingTxHash: null,
+      retryable: false,
+      requiresReview: false,
+    });
+    expect(body.error).toContain('allowance is zero or unavailable');
+    expect(body.error).not.toContain('transferFrom failed');
+  });
+
+  it('maps the core-shaped allowance preflight failure to an actionable permission message', async () => {
+    const operationKey = 'wallet-move-core-allowance';
+    mockIntegrationModule!.moveFundsFromManagedWallet.mockRejectedValueOnce(Object.assign(
+      new Error('The managed wallet treasury permission is insufficient for this transfer. Enable the approved treasury permission for managed mode, then retry the same move key; no movement was attempted'),
+      {
+        code: 'MANAGED_WALLET_ALLOWANCE_UNAVAILABLE',
+        errorCode: 'MANAGED_WALLET_ALLOWANCE_UNAVAILABLE',
+        operationKey,
+        pending: false,
+        requiresReview: false,
+        retryable: false,
+        preflightFailure: true,
+        movementOutcome: 'no_movement',
+        diagnostic: {
+          stage: 'preflight',
+          rpcMethod: 'eth_call',
+          errorCode: 'MANAGED_WALLET_ALLOWANCE_UNAVAILABLE',
+          retryable: false,
+          category: 'preflight',
+        },
+      },
+    ));
+
+    const res = await apiFetch('/wallet/contract-wallet-move/move-funds', {
+      method: 'POST',
+      headers: { 'Idempotency-Key': operationKey },
+      body: JSON.stringify({ targetAddress: treasuryWallet.address }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(409);
+    expect(body).toMatchObject({
+      status: 'error',
+      operationKey,
+      code: 'MANAGED_WALLET_ALLOWANCE_UNAVAILABLE',
+      errorCode: 'MANAGED_WALLET_ALLOWANCE_UNAVAILABLE',
+      stage: 'preflight',
+      movementOutcome: 'no_movement',
+      pending: false,
+      retryable: false,
+      requiresReview: false,
+    });
+    expect(body.error).toContain('allowance is zero or unavailable');
+    expect(body.error).toContain('managed mode');
+    expect(body.error).not.toContain('treasury permission is insufficient');
+  });
+
+  it('reports an unsent managed-wallet move preflight outage as a same-key retry', async () => {
+    mockIntegrationModule!.moveFundsFromManagedWallet.mockRejectedValueOnce(Object.assign(
+      new Error('RPC_READ_UNAVAILABLE'),
+      {
+        pending: false,
+        retryable: true,
+        diagnostic: {
+          stage: 'preflight',
+          rpcMethod: 'eth_estimateGas',
+          rpcCode: 19,
+          httpStatus: 500,
+          traceId: 'move-preflight-trace',
+          rpcEndpoint: 'fallback-1',
+          rpcFailover: [
+            { label: 'primary', outcome: 'failed', httpStatus: 500 },
+            { label: 'fallback-1', outcome: 'success' },
+            { label: 'https://rpc.example.test?secret=hidden', outcome: 'success' },
+          ],
+          errorCode: 'RPC_READ_UNAVAILABLE',
+          retryable: true,
+        },
+      },
+    ));
+
+    const res = await apiFetch('/wallet/contract-wallet-move/move-funds', {
+      method: 'POST',
+      headers: { 'Idempotency-Key': 'wallet-move-preflight-retry' },
+      body: JSON.stringify({ targetAddress: treasuryWallet.address }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(503);
+    expect(body).toMatchObject({
+      status: 'pending',
+      errorCode: 'RPC_READ_UNAVAILABLE',
+      stage: 'preflight',
+      movementOutcome: 'no_movement',
+      pending: true,
+      retryable: true,
+      requiresReview: false,
+      txHash: null,
+    });
+    expect(body.diagnostic).toMatchObject({
+      stage: 'preflight',
+      rpcMethod: 'eth_estimateGas',
+      rpcCode: 19,
+      httpStatus: 500,
+      traceId: 'move-preflight-trace',
+      rpcEndpoint: 'fallback-1',
+      rpcFailover: [
+        { label: 'primary', outcome: 'failed', httpStatus: 500 },
+        { label: 'fallback-1', outcome: 'success' },
+      ],
+      errorCode: 'RPC_READ_UNAVAILABLE',
+      retryable: true,
+    });
+  });
+
+  it('returns HTTP 202 for a core-shaped move whose saved token hash awaits receipt confirmation', async () => {
+    const operationKey = 'wallet-move-receipt-pending';
+    const moveHash = `0x${'e'.repeat(64)}`;
+    mockIntegrationModule!.moveFundsFromManagedWallet.mockRejectedValueOnce(Object.assign(
+      new Error('receipt read is temporarily unavailable'),
+      {
+        operationKey,
+        pending: true,
+        requiresReview: false,
+        retryable: true,
+        movementOutcome: 'unknown',
+        diagnostic: {
+          stage: 'receipt',
+          rpcMethod: 'provider.waitForTransaction',
+          rpcCode: 26,
+          httpStatus: 400,
+          traceId: 'move-receipt-pending-trace',
+          errorCode: 'RECEIPT_READ_UNAVAILABLE',
+          retryable: true,
+          savedHash: moveHash,
+        },
+      },
+    ));
+
+    const res = await apiFetch('/wallet/contract-wallet-move/move-funds', {
+      method: 'POST',
+      headers: { 'Idempotency-Key': operationKey },
+      body: JSON.stringify({ targetAddress: treasuryWallet.address }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(202);
+    expect(body).toMatchObject({
+      status: 'pending',
+      operationKey,
+      txHash: moveHash,
+      fundingTxHash: null,
+      errorCode: 'RECEIPT_READ_UNAVAILABLE',
+      stage: 'receipt',
+      movementOutcome: 'unknown',
+      pending: true,
+      retryable: true,
+      requiresReview: false,
+      diagnostic: {
+        stage: 'receipt',
+        rpcMethod: 'provider.waitForTransaction',
+        rpcCode: 26,
+        httpStatus: 400,
+        traceId: 'move-receipt-pending-trace',
+        savedHash: moveHash,
+      },
+    });
   });
 
   it('verifies the signed unlink route and delegates cleanup atomically', async () => {
@@ -1209,6 +1673,93 @@ describe('api integration contracts', () => {
       2,
       txHash,
     );
+  });
+
+  it('completes recovery from the full settlement context without a second spend', async () => {
+    const { SpendReservations, TokenOperations } = await import('./database/service');
+    const txHash = `0x${'a'.repeat(64)}`;
+    const operationKey = 'spend:reservation-full-context';
+    const operation = {
+      operation_key: operationKey,
+      operation_type: 'spend' as const,
+      request_fingerprint: spendIntentFingerprint({
+        uid: 'contract-1',
+        walletAddress: linkedWallet.address,
+        amount: 1.99,
+        sessionId: 'precision-session',
+        providerId: 'precision-provider',
+        reservationId: 'reservation-precision',
+      }),
+      uid: 'contract-1',
+      wallet_address: linkedWallet.address,
+      amount: '1.99',
+      session_id: 'precision-session',
+      provider_id: 'precision-provider',
+      reservation_id: 'reservation-precision',
+      status: 'submitted' as const,
+      movement_outcome: 'unknown' as const,
+      tx_hash: txHash,
+      intent_context: {
+        assetContext: {
+          tokenContractAddress: process.env.TOKEN_CONTRACT_ADDRESS,
+          chainId: '80002',
+          treasuryAddress: treasuryWallet.address,
+          signerAddress: treasuryWallet.address,
+        },
+      },
+    };
+    const reservation = {
+      id: 'reservation-precision',
+      uid: 'contract-1',
+      wallet_address: linkedWallet.address,
+      session_id: 'precision-session',
+      provider_id: 'precision-provider',
+      reserved_amount: '2.00',
+      settled_amount: null,
+      delivered_kwh: '1.999',
+      settlement_context: {
+        deliveredKwh: '1.9999',
+        normalizedThreeDecimal: '1.999',
+        sourcePrecision: 4,
+      },
+      status: 'settling' as const,
+      tx_hash: txHash,
+    };
+    (TokenOperations.findByKey as jest.Mock).mockImplementation(async () => operation);
+    (SpendReservations.findByIdForUid as jest.Mock).mockResolvedValueOnce(reservation);
+    (SpendReservations.complete as jest.Mock).mockResolvedValueOnce({
+      ...reservation,
+      status: 'settled',
+      settled_amount: '1.99',
+      released_amount: '0.01',
+      tx_hash: txHash,
+    });
+    installTransferProof(txHash, '1.99', linkedWallet.address, treasuryWallet.address);
+    const token = await adminToken();
+
+    const res = await apiFetch('/admin/operations/recover', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ operationKey }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body).toMatchObject({
+      status: 'ok',
+      recoveryStatus: 'completed',
+      projectionStatus: 'projected',
+      noReplacementTransfer: true,
+      transactionHash: txHash,
+    });
+    expect(SpendReservations.complete).toHaveBeenCalledWith(
+      reservation.id,
+      1.9999,
+      1.99,
+      txHash,
+    );
+    expect(mockIntegrationModule!.moveFundsFromManagedWallet).not.toHaveBeenCalled();
+    expect(mockIntegrationModule!.approveUserForSpendingViaFunding).not.toHaveBeenCalled();
   });
 
   it('does not treat legacy ADMIN_USERNAME as the registered admin email', async () => {
@@ -2213,7 +2764,7 @@ describe('api integration contracts', () => {
     });
     const body = await res.json();
 
-    expect(res.status).toBe(202);
+    expect(res.status).toBe(503);
     expect(body).toMatchObject({
       status: 'pending',
       operationKey,
@@ -2224,6 +2775,622 @@ describe('api integration contracts', () => {
       movementOutcome: 'no_movement',
     });
     expect(mockIntegrationModule!.approveUserForSpendingViaFunding).not.toHaveBeenCalled();
+  });
+
+  it('preserves a core-shaped unsent funding diagnostic without mislabeling its hash as the spend', async () => {
+    const operationKey = 'spend:contract-1:funding-read-retry';
+    const fundingHash = `0x${'f'.repeat(64)}`;
+    const mockedService = jest.requireMock('./database/service') as {
+      TokenOperations: { findByKey: jest.Mock };
+    };
+    mockedService.TokenOperations.findByKey.mockResolvedValue({
+      operation_key: operationKey,
+      operation_type: 'spend',
+      status: 'failed',
+      movement_outcome: 'no_movement',
+      uid: 'contract-1',
+      amount: '1.91',
+      wallet_address: linkedWallet.address,
+      session_id: 'funding-read-retry-session',
+      provider_id: 'funding-read-retry-provider',
+    });
+    mockIndexModule!.processSpend.mockResolvedValueOnce({
+      success: false,
+      amount: 1.91,
+      userAddress: linkedWallet.address,
+      operationKey,
+      operationStatus: 'failed',
+      pending: false,
+      preflightFailure: true,
+      preflightApprovalEligible: true,
+      requiresReview: false,
+      movementOutcome: 'no_movement',
+      retryable: false,
+      error: 'Spend preflight failed: insufficient allowance',
+    });
+    mockIntegrationModule!.approveUserForSpendingViaFunding.mockRejectedValueOnce(Object.assign(
+      new Error('Funding preparation failed before broadcast; no movement was attempted: RPC_READ_UNAVAILABLE'),
+      {
+        code: 'APPROVAL_PREPARATION_REVIEW_REQUIRED',
+        operationKey: 'approval:funding-read-retry',
+        pending: false,
+        requiresReview: false,
+        retryable: true,
+        preflightFailure: true,
+        movementOutcome: 'no_movement',
+        fundingTxHash: fundingHash,
+        diagnostic: {
+          stage: 'prepare',
+          rpcMethod: 'eth_sendTransaction',
+          rpcCode: 19,
+          httpStatus: 500,
+          traceId: 'funding-preparation-trace',
+          errorCode: 'RPC_READ_UNAVAILABLE',
+          retryable: true,
+          savedHash: fundingHash,
+        },
+      },
+    ));
+
+    const res = await apiFetch('/spend', {
+      method: 'POST',
+      body: JSON.stringify({ uid: 'contract-1', operationKey }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(503);
+    expect(body).toMatchObject({
+      status: 'error',
+      operationKey,
+      txHash: null,
+      fundingTxHash: fundingHash,
+      errorCode: 'RPC_READ_UNAVAILABLE',
+      stage: 'prepare',
+      movementOutcome: 'no_movement',
+      pending: false,
+      retryable: true,
+      requiresReview: false,
+      diagnostic: {
+        stage: 'prepare',
+        rpcMethod: 'eth_sendTransaction',
+        rpcCode: 19,
+        httpStatus: 500,
+        traceId: 'funding-preparation-trace',
+        errorCode: 'RPC_READ_UNAVAILABLE',
+        retryable: true,
+      },
+    });
+    expect(body.diagnostic.savedHash).toBeUndefined();
+    expect(JSON.stringify(body)).not.toContain('Funding preparation failed before broadcast');
+  });
+
+  it('returns structured safe diagnostics for an RPC spend failure', async () => {
+    const operationKey = 'spend:contract-1:rpc-diagnostic';
+    const hashlessOperation = {
+      operation_key: operationKey,
+      operation_type: 'spend',
+      status: 'failed',
+      movement_outcome: 'no_movement',
+      uid: 'contract-1',
+      amount: '1.91',
+      wallet_address: linkedWallet.address,
+      session_id: 'rpc-diagnostic-session',
+      provider_id: 'rpc-diagnostic-provider',
+    };
+    const mockedService = jest.requireMock('./database/service') as {
+      TokenOperations: { findByKey: jest.Mock };
+    };
+    mockedService.TokenOperations.findByKey.mockResolvedValue(hashlessOperation);
+    mockIndexModule!.processSpend.mockResolvedValueOnce({
+      success: false,
+      amount: 1.91,
+      userAddress: linkedWallet.address,
+      operationKey,
+      operationStatus: 'failed',
+      pending: true,
+      retryable: true,
+      requiresReview: false,
+      preflightFailure: true,
+      movementOutcome: 'no_movement',
+      errorCode: 'RPC_READ_UNAVAILABLE',
+      stage: 'preflight',
+      diagnostic: {
+        stage: 'preflight',
+        rpcMethod: 'eth_call',
+        rpcCode: 19,
+        httpStatus: 500,
+        traceId: 'e8109f4bb0bbf568daa9f3f080df5df6',
+        errorCode: 'RPC_READ_UNAVAILABLE',
+        retryable: true,
+      },
+      error: 'dRPC temporary internal error code 19 https://rpc.example.test/secret',
+    });
+
+    const res = await apiFetch('/spend', {
+      method: 'POST',
+      body: JSON.stringify({ uid: 'contract-1', operationKey }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(503);
+    expect(body).toMatchObject({
+      status: 'pending',
+      operationKey,
+      errorCode: 'RPC_READ_UNAVAILABLE',
+      stage: 'preflight',
+      movementOutcome: 'no_movement',
+      pending: true,
+      retryable: true,
+      requiresReview: false,
+      diagnostic: {
+        stage: 'preflight',
+        rpcMethod: 'eth_call',
+        rpcCode: 19,
+        httpStatus: 500,
+        traceId: 'e8109f4bb0bbf568daa9f3f080df5df6',
+        errorCode: 'RPC_READ_UNAVAILABLE',
+        retryable: true,
+      },
+    });
+    expect(body.error).toContain('temporarily unavailable');
+    expect(JSON.stringify(body)).not.toContain('rpc.example.test');
+    expect(JSON.stringify(body)).not.toContain('secret');
+  });
+
+  it('uses the nested core diagnostic for an unsent award preparation outage', async () => {
+    mockIndexModule!.processAwardFromCDR.mockResolvedValueOnce({
+      success: false,
+      eligible: true,
+      amount: 1.91,
+      uid: 'contract-1',
+      pending: false,
+      preflightFailure: true,
+      movementOutcome: 'no_movement',
+      diagnostic: {
+        stage: 'prepare',
+        rpcMethod: 'eth_call',
+        rpcCode: 19,
+        httpStatus: 500,
+        traceId: 'award-preparation-trace',
+        errorCode: 'RPC_READ_UNAVAILABLE',
+        retryable: true,
+      },
+      error: 'dRPC temporary internal error code 19 https://rpc.example.test/award-secret',
+    });
+
+    const res = await apiFetch('/ingest/cdr', {
+      method: 'POST',
+      headers: { 'X-Ingest-API-Key': 'test-ingest-key' },
+      body: JSON.stringify({
+        SessionID: 'rpc-preparation-diagnostic-session',
+        ProviderID: 'provider-1',
+        EVSEID: 'DE*NVF*RPC01',
+        cdr_token: { contract_id: 'contract-1' },
+        StartTime: '2026-10-13T07:00:00.000Z',
+        EndTime: '2026-10-13T08:00:00.000Z',
+        Energy: '1.913',
+        EnergyDirection: 'CHARGE',
+      }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(503);
+    expect(body).toMatchObject({
+      status: 'error',
+      errorCode: 'RPC_READ_UNAVAILABLE',
+      stage: 'prepare',
+      movementOutcome: 'no_movement',
+      pending: false,
+      retryable: true,
+      requiresReview: false,
+      diagnostic: {
+        stage: 'prepare',
+        errorCode: 'RPC_READ_UNAVAILABLE',
+        retryable: true,
+      },
+    });
+    expect(body.operationKey).toEqual(expect.stringMatching(/^award:/));
+    expect(JSON.stringify(body)).not.toContain('rpc.example.test');
+    expect(JSON.stringify(body)).not.toContain('award-secret');
+  });
+
+  it('keeps a receipt diagnostic precise when the legacy result stage is absent', async () => {
+    const operationKey = 'spend:contract-1:receipt-diagnostic';
+    const txHash = `0x${'e'.repeat(64)}`;
+    const mockedService = jest.requireMock('./database/service') as {
+      TokenOperations: { findByKey: jest.Mock };
+    };
+    mockedService.TokenOperations.findByKey.mockResolvedValueOnce({
+      operation_key: operationKey,
+      operation_type: 'spend',
+      status: 'submitted',
+      movement_outcome: 'unknown',
+      uid: 'contract-1',
+      amount: '1.91',
+      wallet_address: linkedWallet.address,
+      session_id: 'receipt-diagnostic-session',
+      provider_id: 'receipt-diagnostic-provider',
+      tx_hash: txHash,
+    });
+    mockIndexModule!.processSpend.mockResolvedValueOnce({
+      success: false,
+      amount: 1.91,
+      userAddress: linkedWallet.address,
+      operationKey,
+      operationStatus: 'submitted',
+      pending: true,
+      movementOutcome: 'unknown',
+      txHash,
+      diagnostic: {
+        stage: 'receipt',
+        rpcMethod: 'eth_getTransactionReceipt',
+        errorCode: 'TRANSACTION_CONFIRMATION_PENDING',
+        retryable: true,
+      },
+      error: 'confirmation pending for saved transaction hash',
+    });
+
+    const res = await apiFetch('/spend', {
+      method: 'POST',
+      body: JSON.stringify({ uid: 'contract-1', operationKey }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(202);
+    expect(body).toMatchObject({
+      status: 'pending',
+      operationKey,
+      txHash,
+      errorCode: 'TRANSACTION_CONFIRMATION_PENDING',
+      stage: 'receipt',
+      movementOutcome: 'unknown',
+      retryable: true,
+      requiresReview: false,
+      diagnostic: {
+        stage: 'receipt',
+        errorCode: 'TRANSACTION_CONFIRMATION_PENDING',
+        retryable: true,
+      },
+    });
+  });
+
+  it('returns an immutable spend-intent conflict without a replacement transfer', async () => {
+    const operationKey = 'spend:contract-1:intent-conflict';
+    const mockedService = jest.requireMock('./database/service') as {
+      TokenOperations: { findByKey: jest.Mock };
+    };
+    mockedService.TokenOperations.findByKey.mockResolvedValue({
+      operation_key: operationKey,
+      operation_type: 'spend',
+      status: 'failed',
+      movement_outcome: 'unknown',
+      uid: 'contract-1',
+      amount: '1.91',
+      wallet_address: linkedWallet.address,
+      session_id: 'intent-conflict-session',
+      provider_id: 'intent-conflict-provider',
+    });
+    mockIndexModule!.processSpend.mockResolvedValueOnce({
+      success: false,
+      amount: 1.91,
+      userAddress: linkedWallet.address,
+      operationKey,
+      operationStatus: 'failed',
+      requiresReview: true,
+      movementOutcome: 'unknown',
+      error: 'TOKEN_OPERATION_INTENT_MISMATCH: saved asset context differs from this request',
+    });
+
+    const res = await apiFetch('/spend', {
+      method: 'POST',
+      body: JSON.stringify({ uid: 'contract-1', operationKey }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(409);
+    expect(body).toMatchObject({
+      status: 'error',
+      operationKey,
+      errorCode: 'TOKEN_OPERATION_INTENT_MISMATCH',
+      stage: 'asset_context',
+      movementOutcome: 'unknown',
+      pending: false,
+      retryable: false,
+      requiresReview: true,
+    });
+    expect(body.error).toContain('No replacement transfer was submitted');
+  });
+
+  it('returns an immutable settlement-context conflict without retrying a spend', async () => {
+    const operationKey = 'spend:contract-1:settlement-context-conflict';
+    const mockedService = jest.requireMock('./database/service') as {
+      TokenOperations: { findByKey: jest.Mock };
+    };
+    mockedService.TokenOperations.findByKey.mockResolvedValue({
+      operation_key: operationKey,
+      operation_type: 'spend',
+      status: 'failed',
+      movement_outcome: 'no_movement',
+      uid: 'contract-1',
+      amount: '1.91',
+      wallet_address: linkedWallet.address,
+      session_id: 'settlement-context-session',
+      provider_id: 'settlement-context-provider',
+    });
+    mockIndexModule!.processSpend.mockResolvedValueOnce({
+      success: false,
+      amount: 1.91,
+      userAddress: linkedWallet.address,
+      operationKey,
+      operationStatus: 'failed',
+      pending: false,
+      preflightFailure: true,
+      requiresReview: true,
+      movementOutcome: 'no_movement',
+      diagnostic: {
+        stage: 'asset_context',
+        errorCode: 'RESERVATION_CONTEXT_MISMATCH',
+        retryable: false,
+      },
+      error: 'RESERVATION_CONTEXT_MISMATCH: saved settlement context differs',
+    });
+
+    const res = await apiFetch('/spend', {
+      method: 'POST',
+      body: JSON.stringify({ uid: 'contract-1', operationKey }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(409);
+    expect(body).toMatchObject({
+      status: 'error',
+      errorCode: 'RESERVATION_CONTEXT_MISMATCH',
+      stage: 'asset_context',
+      movementOutcome: 'no_movement',
+      pending: false,
+      retryable: false,
+      requiresReview: true,
+      diagnostic: {
+        stage: 'asset_context',
+        errorCode: 'RESERVATION_CONTEXT_MISMATCH',
+        retryable: false,
+      },
+    });
+  });
+
+  it('persists reservation delivery context before submitting a positive settlement', async () => {
+    const reservationId = 'reservation-context-before-spend';
+    const spendHash = `0x${'b'.repeat(64)}`;
+    const mockedService = jest.requireMock('./database/service') as {
+      SpendReservations: {
+        findBySession: jest.Mock;
+        claimForSettlement: jest.Mock;
+        persistSettlementContext: jest.Mock;
+        complete: jest.Mock;
+      };
+    };
+    const reservation = {
+      id: reservationId,
+      uid: 'contract-context',
+      wallet_address: linkedWallet.address,
+      session_id: 'context-session',
+      provider_id: 'context-provider',
+      reserved_amount: '2.00',
+      settled_amount: null,
+      released_amount: null,
+      delivered_kwh: null,
+      status: 'reserved',
+      tx_hash: null,
+      updated_at: new Date('2026-10-13T08:00:00Z'),
+    };
+    mockedService.SpendReservations.findBySession.mockResolvedValueOnce(undefined);
+    mockedService.SpendReservations.claimForSettlement.mockResolvedValueOnce({ ...reservation, status: 'settling' });
+    mockedService.SpendReservations.persistSettlementContext.mockResolvedValueOnce({ ...reservation, delivered_kwh: '1.913' });
+    mockedService.SpendReservations.complete.mockResolvedValueOnce({
+      ...reservation,
+      status: 'settled',
+      settled_amount: '1.91',
+      released_amount: '0.09',
+      delivered_kwh: '1.913',
+      tx_hash: spendHash,
+    });
+    mockIndexModule!.processAwardFromCDR.mockResolvedValueOnce({
+      success: true,
+      eligible: true,
+      amount: 1,
+      uid: reservation.uid,
+      txHash: `0x${'a'.repeat(64)}`,
+      operationStatus: 'projected',
+      stage: 'complete',
+    });
+    mockIndexModule!.processSpend.mockResolvedValueOnce({
+      success: true,
+      amount: 1.91,
+      userAddress: reservation.wallet_address,
+      txHash: spendHash,
+      operationKey: `reservation:${reservationId}`,
+      operationStatus: 'confirmed',
+      movementOutcome: 'confirmed',
+    });
+
+    const res = await apiFetch('/ingest/cdr', {
+      method: 'POST',
+      headers: { 'X-Ingest-API-Key': 'test-ingest-key' },
+      body: JSON.stringify({
+        SessionID: reservation.session_id,
+        ProviderID: reservation.provider_id,
+        EVSEID: 'DE*NVF*CONTEXT01',
+        cdr_token: { contract_id: reservation.uid },
+        StartTime: '2026-10-13T07:00:00.000Z',
+        EndTime: '2026-10-13T08:00:00.000Z',
+        Energy: '1.913',
+        EnergyDirection: 'CHARGE',
+      }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body.reservationSettlement.status).toBe('settled');
+    expect(mockedService.SpendReservations.persistSettlementContext).toHaveBeenCalledWith(reservationId, 1.913);
+    expect(mockIndexModule!.processSpend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reservationId,
+        amount: 1.91,
+        settlementContext: { reservationId, deliveredKwh: 1.913 },
+      }),
+      expect.anything(),
+    );
+    expect(mockedService.SpendReservations.persistSettlementContext.mock.invocationCallOrder[0])
+      .toBeLessThan(mockIndexModule!.processSpend.mock.invocationCallOrder[0]);
+  });
+
+  it('turns a changed repeated CDR delivery context into review before any spend', async () => {
+    const reservationId = 'reservation-context-mismatch';
+    const mockedService = jest.requireMock('./database/service') as {
+      SpendReservations: { findBySession: jest.Mock; claimForSettlement: jest.Mock; persistSettlementContext: jest.Mock };
+    };
+    const reservation = {
+      id: reservationId,
+      uid: 'contract-context-mismatch',
+      wallet_address: linkedWallet.address,
+      session_id: 'context-mismatch-session',
+      provider_id: 'context-mismatch-provider',
+      reserved_amount: '5.00',
+      settled_amount: null,
+      released_amount: null,
+      delivered_kwh: '4.000',
+      status: 'reserved',
+      tx_hash: null,
+    };
+    mockedService.SpendReservations.findBySession.mockResolvedValueOnce(reservation);
+    mockedService.SpendReservations.claimForSettlement.mockResolvedValueOnce({ ...reservation, status: 'settling' });
+    mockedService.SpendReservations.persistSettlementContext.mockRejectedValueOnce(
+      new Error('RESERVATION_SETTLEMENT_CONTEXT_MISMATCH'),
+    );
+    mockIndexModule!.processAwardFromCDR.mockResolvedValueOnce({
+      success: true,
+      eligible: true,
+      amount: 1,
+      uid: 'contract-context-mismatch',
+      txHash: `0x${'c'.repeat(64)}`,
+      operationStatus: 'projected',
+      stage: 'complete',
+    });
+
+    const res = await apiFetch('/ingest/cdr', {
+      method: 'POST',
+      headers: { 'X-Ingest-API-Key': 'test-ingest-key' },
+      body: JSON.stringify({
+        SessionID: 'context-mismatch-session',
+        ProviderID: 'context-mismatch-provider',
+        EVSEID: 'DE*NVF*CONTEXT02',
+        cdr_token: { contract_id: 'contract-context-mismatch' },
+        StartTime: '2026-10-13T07:00:00.000Z',
+        EndTime: '2026-10-13T08:00:00.000Z',
+        Energy: '5',
+        EnergyDirection: 'CHARGE',
+      }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(409);
+    expect(body).toMatchObject({
+      status: 'error',
+      reservationId,
+      errorCode: 'RESERVATION_CONTEXT_MISMATCH',
+      stage: 'recovery',
+      movementOutcome: 'no_movement',
+      retryable: false,
+      requiresReview: true,
+    });
+    expect(mockIndexModule!.processSpend).not.toHaveBeenCalled();
+  });
+
+  it('keeps an award hash separate from a hashless failed reservation spend', async () => {
+    const reservationId = 'reservation-hash-separation';
+    const awardHash = `0x${'d'.repeat(64)}`;
+    const mockedService = jest.requireMock('./database/service') as {
+      SpendReservations: {
+        findBySession: jest.Mock;
+        claimForSettlement: jest.Mock;
+        persistSettlementContext: jest.Mock;
+        complete: jest.Mock;
+      };
+    };
+    const reservation = {
+      id: reservationId,
+      uid: 'contract-hash-separation',
+      wallet_address: linkedWallet.address,
+      session_id: 'hash-separation-session',
+      provider_id: 'hash-separation-provider',
+      reserved_amount: '2.00',
+      settled_amount: null,
+      released_amount: null,
+      delivered_kwh: null,
+      status: 'reserved',
+      tx_hash: null,
+    };
+    mockedService.SpendReservations.findBySession.mockResolvedValueOnce(reservation);
+    mockedService.SpendReservations.claimForSettlement.mockResolvedValueOnce({ ...reservation, status: 'settling' });
+    mockedService.SpendReservations.persistSettlementContext.mockResolvedValueOnce({ ...reservation, delivered_kwh: '1.913' });
+    mockIndexModule!.processAwardFromCDR.mockResolvedValueOnce({
+      success: true,
+      eligible: true,
+      amount: 1,
+      uid: reservation.uid,
+      txHash: awardHash,
+      operationStatus: 'projected',
+      stage: 'complete',
+    });
+    mockIndexModule!.processSpend.mockResolvedValueOnce({
+      success: false,
+      amount: 1.91,
+      userAddress: reservation.wallet_address,
+      operationKey: `reservation:${reservationId}`,
+      operationStatus: 'failed',
+      pending: false,
+      requiresReview: true,
+      movementOutcome: 'unknown',
+      diagnostic: {
+        stage: 'broadcast',
+        errorCode: 'CHAIN_OUTCOME_UNKNOWN',
+        retryable: true,
+      },
+      error: 'CHAIN_OUTCOME_UNKNOWN: reservation spend response was ambiguous',
+    });
+
+    const res = await apiFetch('/ingest/cdr', {
+      method: 'POST',
+      headers: { 'X-Ingest-API-Key': 'test-ingest-key' },
+      body: JSON.stringify({
+        SessionID: reservation.session_id,
+        ProviderID: reservation.provider_id,
+        EVSEID: 'DE*NVF*HASH01',
+        cdr_token: { contract_id: reservation.uid },
+        StartTime: '2026-10-13T07:00:00.000Z',
+        EndTime: '2026-10-13T08:00:00.000Z',
+        Energy: '1.913',
+        EnergyDirection: 'CHARGE',
+      }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(202);
+    expect(body).toMatchObject({
+      status: 'pending',
+      awardTxHash: awardHash,
+      txHash: null,
+      reservationTxHash: null,
+      requiresReview: true,
+      retryable: false,
+      movementOutcome: 'unknown',
+      diagnostic: {
+        stage: 'broadcast',
+        errorCode: 'CHAIN_OUTCOME_UNKNOWN',
+        retryable: false,
+      },
+    });
+    expect(mockedService.SpendReservations.complete).not.toHaveBeenCalled();
   });
 
   it('does not create a settled reservation receipt under a changed asset context', async () => {
@@ -3193,6 +4360,68 @@ describe('api integration contracts', () => {
       totalEvents: 3,
       awards: { completed: 1 },
     });
+  });
+
+  it('includes sanitized requires-review diagnostics in the evidence pack', async () => {
+    const token = await adminToken();
+    const reviewEvent = {
+      id: 'review-rpc-1',
+      event_type: 'spend.failed',
+      actor_type: 'api_client',
+      actor_id: 'contract-review',
+      target_type: 'wallet',
+      target_id: linkedWallet.address,
+      status: 'requires_review',
+      metadata: {
+        error: 'https://rpc.example.test/private?token=raw-secret',
+        errorCode: 'CHAIN_OUTCOME_UNKNOWN',
+        stage: 'broadcast',
+        movementOutcome: 'unknown',
+        diagnostic: {
+          stage: 'broadcast',
+          rpcMethod: 'eth_sendRawTransaction',
+          rpcCode: -32000,
+          httpStatus: 500,
+          traceId: 'trace-review-1',
+          errorCode: 'CHAIN_OUTCOME_UNKNOWN',
+          retryable: false,
+          savedHash: `0x${'d'.repeat(64)}`,
+        },
+      },
+      created_at: new Date().toISOString(),
+    };
+    mockAuditLogs.getRecent
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([reviewEvent])
+      .mockResolvedValueOnce([]);
+
+    const res = await apiFetch('/admin/evidence-pack', {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body.audit.reviewRequired).toHaveLength(1);
+    expect(body.audit.reviewRequired[0]).toMatchObject({
+      id: 'review-rpc-1',
+      status: 'requires_review',
+      presentation: expect.objectContaining({
+        category: 'operational',
+        details: expect.arrayContaining([
+          { label: 'Error code', value: 'CHAIN_OUTCOME_UNKNOWN' },
+          { label: 'Failure stage', value: 'broadcast' },
+          { label: 'RPC method', value: 'eth_sendRawTransaction' },
+          { label: 'RPC code', value: '-32000' },
+          { label: 'HTTP status', value: '500' },
+          { label: 'Provider trace', value: 'trace-review-1' },
+        ]),
+      }),
+    });
+    expect(JSON.stringify(body)).not.toContain('raw-secret');
+    expect(JSON.stringify(body)).not.toContain('rpc.example.test');
+    expect(body.audit.reviewRequired[0]).not.toHaveProperty('metadata');
   });
 
   it('returns a safe evidence-pack error when audit storage is unavailable', async () => {

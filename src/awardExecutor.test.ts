@@ -36,6 +36,26 @@ jest.mock('./database/integration', () => ({
   approveUserForSpendingViaFunding: jest.fn().mockResolvedValue(undefined),
 }));
 jest.mock('./database/service', () => ({
+  TreasuryTransactions: {
+    prepare: jest.fn(async (request: any) => {
+      const nonce = await request.getPendingNonce();
+      const prepared = await request.prepare(nonce);
+      return {
+        alreadyPrepared: false,
+        rawTransaction: prepared.rawTransaction,
+        lease: {
+          operation_key: request.operationKey,
+          chain_id: String(request.chainId),
+          signer_address: '0x9999999999999999999999999999999999999999',
+          nonce,
+          tx_hash: `0x${'a'.repeat(64)}`,
+          tx_context: prepared.context,
+        },
+      };
+    }),
+    markSubmitted: jest.fn().mockResolvedValue(undefined),
+    markUnknown: jest.fn().mockResolvedValue(undefined),
+  },
   TokenOperations: {
     findByKey: jest.fn().mockResolvedValue(undefined),
     claim: jest.fn().mockImplementation(async (input: { operationKey: string; amount: string }) => ({
@@ -60,6 +80,7 @@ jest.mock('./database/service', () => ({
     markProjectionError: jest.fn().mockResolvedValue(undefined),
     markUnknown: jest.fn().mockResolvedValue(undefined),
     markFailed: jest.fn().mockResolvedValue(undefined),
+    markPreflightFailed: jest.fn().mockResolvedValue(undefined),
   },
 }));
 
@@ -70,12 +91,27 @@ describe('Award Executor', () => {
       wait: jest.fn().mockResolvedValue({ status: 1 }),
     }),
   };
+  const mockProvider = {
+    getNetwork: jest.fn().mockResolvedValue({ chainId: 80002n }),
+    getTransactionCount: jest.fn().mockResolvedValue(0),
+    getFeeData: jest.fn().mockResolvedValue({ maxFeePerGas: 100n, maxPriorityFeePerGas: 10n, gasPrice: null }),
+    estimateGas: jest.fn().mockResolvedValue(100_000n),
+    broadcastTransaction: mockContract.transfer,
+    waitForTransaction: jest.fn().mockResolvedValue({ status: 1 }),
+  } as unknown as ethers.Provider;
 
   beforeEach(() => {
     jest.clearAllMocks();
     process.env.TREASURY_ADDRESS = '0x9999999999999999999999999999999999999999';
     process.env.CHAIN_ID = '80002';
     process.env.TOKEN_CONTRACT_ADDRESS = '0x605871D30DC278a036F09e2ace771df8a224624B';
+    (mockProvider.getTransactionCount as jest.Mock).mockResolvedValue(0);
+    (mockProvider.getFeeData as jest.Mock).mockResolvedValue({ maxFeePerGas: 100n, maxPriorityFeePerGas: 10n, gasPrice: null });
+    (mockProvider.estimateGas as jest.Mock).mockResolvedValue(100_000n);
+    (mockProvider.broadcastTransaction as jest.Mock).mockResolvedValue({
+      hash: `0x${'a'.repeat(64)}`,
+      wait: jest.fn().mockResolvedValue({ status: 1 }),
+    });
     clearUserRegistry(); // Clear user registry before each test
     // Set up the contract mock for each test
     const contractMock = require('./contract');
@@ -130,7 +166,8 @@ describe('Award Executor', () => {
     // Create mock signer (user address is resolved automatically from UID)
     const mockSigner = {
       getAddress: jest.fn().mockResolvedValue('0x9999999999999999999999999999999999999999'),
-      provider: { getNetwork: jest.fn().mockResolvedValue({ chainId: 80002n }) },
+      provider: mockProvider,
+      signTransaction: jest.fn().mockResolvedValue('0x1234'),
     } as unknown as ethers.Signer;
 
     function installDurableOperationMock() {
@@ -160,8 +197,10 @@ describe('Award Executor', () => {
       });
       serviceMock.TokenOperations.markSubmitted.mockImplementation(async (key: string, txHash: string) => {
         const operation = operations.get(key);
-        operation.tx_hash = txHash;
-        operation.status = 'submitted';
+        if (operation) {
+          operation.tx_hash = txHash;
+          operation.status = 'submitted';
+        }
         return operation;
       });
       serviceMock.TokenOperations.markConfirmed.mockImplementation(async (key: string) => {
@@ -182,8 +221,27 @@ describe('Award Executor', () => {
       });
       serviceMock.TokenOperations.markUnknown.mockImplementation(async (key: string, message: string) => {
         const operation = operations.get(key);
-        operation.status = 'unknown';
-        operation.error_message = message;
+        if (operation) {
+          operation.status = 'unknown';
+          operation.error_message = message;
+        }
+        return operation;
+      });
+      serviceMock.TreasuryTransactions.markSubmitted.mockImplementation(async (key: string, txHash: string) => {
+        const operation = operations.get(key);
+        if (operation) {
+          operation.tx_hash = txHash;
+          operation.status = 'submitted';
+        }
+        return operation;
+      });
+      serviceMock.TreasuryTransactions.markUnknown.mockImplementation(async (key: string, diagnostic: any) => {
+        const operation = operations.get(key);
+        if (operation) {
+          operation.tx_hash = diagnostic.savedHash || operation.tx_hash;
+          operation.status = 'unknown';
+          operation.diagnostic_context = diagnostic;
+        }
         return operation;
       });
       return operations;
@@ -651,18 +709,37 @@ describe('Award Executor', () => {
       expect(mockContract.transfer).toHaveBeenCalledTimes(1);
     });
 
-    it('retains an ambiguous submission claim and never rebroadcasts automatically', async () => {
+    it('reconciles a saved hash after an HTTP 500 broadcast response without rebroadcasting', async () => {
       installDurableOperationMock();
-      mockContract.transfer.mockRejectedValueOnce(new Error('RPC connection dropped after submission'));
+      const evidenceMock = require('./spendEvidence').verifySpendEvidence as jest.Mock;
+      evidenceMock.mockResolvedValueOnce({
+        valid: false,
+        failure: {
+          code: 'PROVIDER_ERROR',
+          message: 'receipt lookup temporarily unavailable',
+          pending: true,
+        },
+      });
+      mockContract.transfer.mockRejectedValueOnce(Object.assign(
+        new Error('server response 500 https://rpc.example.test/?secret=redacted'),
+        { code: 'SERVER_ERROR', error: { code: 19, traceId: 'award-trace-500' } },
+      ));
 
       const first = await processAwardFromCDR(mockRawCDR, mockSigner);
       expect(first.success).toBe(false);
       expect(first.pending).toBe(true);
-      expect(first.requiresReview).toBe(true);
+      expect(first.requiresReview).toBe(false);
+      expect(first.txHash).toBe(`0x${'a'.repeat(64)}`);
+      expect(first.diagnostic).toMatchObject({
+        stage: 'receipt',
+        errorCode: 'RECEIPT_READ_UNAVAILABLE',
+        savedHash: `0x${'a'.repeat(64)}`,
+      });
 
       const replay = await processAwardFromCDR(mockRawCDR, mockSigner);
-      expect(replay.success).toBe(false);
-      expect(replay.requiresReview).toBe(true);
+      expect(replay.success).toBe(true);
+      expect(replay.operationStatus).toBe('projected');
+      expect(replay.txHash).toBe(`0x${'a'.repeat(64)}`);
       expect(mockContract.transfer).toHaveBeenCalledTimes(1);
     });
 

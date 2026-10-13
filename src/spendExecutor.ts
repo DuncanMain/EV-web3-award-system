@@ -1,11 +1,14 @@
 import { ethers } from 'ethers';
-import { SpendRequest, SpendResult, SpendExecutionResult } from './types';
+import { SpendRequest, SpendResult, SpendExecutionResult, TransactionDiagnostic } from './types';
 import { getContract } from './contract';
 import { getTreasuryAddress } from './treasury/treasuryConfig';
 import { recordSpend } from './database/integration';
 import { TokenOperations, TokenOperationRecord, TokenMovementOutcome } from './database/service';
 import { assetContextMismatch, canonicalTokenAmount, getTokenAssetContext, requireCanonicalTransactionHash, spendIntentFingerprint, spendOperationKey } from './database/tokenOperation';
-import { verifySpendEvidence, SpendEvidenceResult } from './spendEvidence';
+import { verifySpendEvidence, SpendEvidenceFailure, SpendEvidenceResult } from './spendEvidence';
+import { SpendReservations } from './database/service';
+import { createTransactionDiagnostic, isPreBroadcastTransactionDiagnostic, prepareAndBroadcastTransaction, TransactionReliabilityError, TransactionReliabilityResult } from './transactionReliability';
+import { withNullableRpcReadRetry, withRpcReadRetry } from './rpcProvider';
 
 /**
  * Note: For spend execution to work, users must have approved the treasury
@@ -20,6 +23,11 @@ export interface SpendOperationRequest extends SpendRequest {
   operationKey?: string;
   idempotencyKey?: string;
   reservationId?: string;
+  /** Final physical CDR context, persisted before any settlement transfer. */
+  settlementContext?: {
+    reservationId: string;
+    deliveredKwh: number;
+  };
 }
 
 export interface ReliableSpendExecutionResult extends SpendExecutionResult {
@@ -35,6 +43,8 @@ export interface ReliableSpendExecutionResult extends SpendExecutionResult {
   duplicate?: boolean;
   /** Durable movement classification; callers must not infer this from status. */
   movementOutcome?: TokenMovementOutcome;
+  /** Retry is safe only when the saved diagnostic proves no broadcast. */
+  retryable?: boolean;
 }
 
 /**
@@ -55,19 +65,30 @@ async function submitSpend(
   treasurySigner: ethers.Signer,
   userAddress: string,
   treasuryAddress: string,
-  amount: number | string
-): Promise<ethers.ContractTransactionResponse> {
+  amount: number | string,
+  operationKey: string,
+  chainId: string | number,
+  tokenContractAddress: string,
+  targetType: 'token_operation' | 'standalone' = 'token_operation',
+): Promise<TransactionReliabilityResult> {
   const canonicalAmount = canonicalTokenAmount(amount);
   if (!canonicalAmount || canonicalAmount.units <= 0n) {
     throw new Error('UNSUPPORTED_TOKEN_PRECISION');
   }
-  const contract = getContract(treasurySigner);
-  const tx = await contract.transferFrom(
-    userAddress,
-    treasuryAddress,
-    ethers.parseUnits(canonicalAmount.decimal, 18)
-  );
-  return tx as ethers.ContractTransactionResponse;
+  const iface = new ethers.Interface(['function transferFrom(address from,address to,uint256 amount)']);
+  return prepareAndBroadcastTransaction({
+    operationKey,
+    targetType,
+    signer: treasurySigner,
+    chainId,
+    to: tokenContractAddress,
+    data: iface.encodeFunctionData('transferFrom', [
+      userAddress,
+      treasuryAddress,
+      ethers.parseUnits(canonicalAmount.decimal, 18),
+    ]),
+    value: 0n,
+  });
 }
 
 /**
@@ -81,9 +102,22 @@ export async function executeSpend(
   treasuryAddress: string,
   amount: number
 ): Promise<string> {
-  const tx = await submitSpend(treasurySigner, userAddress, treasuryAddress, amount);
-  await tx.wait();
-  return tx.hash;
+  const provider = treasurySigner.provider;
+  if (!provider) throw new Error('PROVIDER_REQUIRED');
+  const network = await withRpcReadRetry(() => provider.getNetwork());
+  const tx = await submitSpend(
+    treasurySigner,
+    userAddress,
+    treasuryAddress,
+    amount,
+    `compat:spend:${userAddress.toLowerCase()}:${amount}:${Date.now()}`,
+    String(network.chainId),
+    getContract(treasurySigner).target.toString(),
+    'standalone',
+  );
+  const receipt = await withNullableRpcReadRetry(() => provider.waitForTransaction(tx.txHash));
+  if (!receipt || Number(receipt.status) !== 1) throw new Error('Spend transaction is not confirmed');
+  return tx.txHash;
 }
 
 function pendingSpendResult(
@@ -93,6 +127,7 @@ function pendingSpendResult(
   txHash?: string,
   requiresReview = false,
   movementOutcome?: TokenMovementOutcome,
+  diagnostic?: TransactionDiagnostic,
 ): ReliableSpendExecutionResult {
   return {
     success: false,
@@ -104,6 +139,7 @@ function pendingSpendResult(
     pending: true,
     requiresReview,
     ...(movementOutcome ? { movementOutcome } : {}),
+    ...(diagnostic ? { diagnostic } : {}),
     error,
   };
 }
@@ -217,17 +253,21 @@ function preflightFailureResult(
   error: string,
   approvalEligible: boolean,
   movementOutcome: TokenMovementOutcome = 'no_movement',
+  diagnostic?: TransactionDiagnostic,
 ): ReliableSpendExecutionResult {
+  const retryable = diagnostic ? diagnostic.retryable : approvalEligible ? false : true;
   return {
     success: false,
     amount: request.amount,
     userAddress: request.userAddress,
     operationKey,
     operationStatus: 'failed',
-    pending: !approvalEligible,
+    pending: retryable,
     preflightFailure: true,
     preflightApprovalEligible: approvalEligible,
     movementOutcome,
+    retryable,
+    ...(diagnostic ? { diagnostic } : {}),
     error,
   };
 }
@@ -260,12 +300,16 @@ async function preflightSpend(
   let allowance: bigint;
   let balance: bigint;
   try {
-    [allowance, balance] = await Promise.all([
-      tokenReadonly.allowance(userAddress, assetContext.signerAddress) as Promise<bigint>,
-      tokenReadonly.balanceOf(userAddress) as Promise<bigint>,
-    ]);
+    allowance = await withRpcReadRetry(
+      () => tokenReadonly.allowance(userAddress, assetContext.signerAddress) as Promise<bigint>,
+    );
+    balance = await withRpcReadRetry(
+      () => tokenReadonly.balanceOf(userAddress) as Promise<bigint>,
+    );
   } catch (err) {
-    throw new Error(`SPEND_PREFLIGHT_UNAVAILABLE: ${err instanceof Error ? err.message : String(err)}`);
+    const wrapped = new Error(`SPEND_PREFLIGHT_UNAVAILABLE: ${err instanceof Error ? err.message : String(err)}`);
+    Object.assign(wrapped, { code: err && typeof err === 'object' ? (err as { code?: unknown }).code : undefined, cause: err });
+    throw wrapped;
   }
   if (allowance < amountUnits) {
     throw new KnownSpendPreflightFailure(
@@ -292,7 +336,9 @@ async function preflightSpend(
       await contract.transferFrom.staticCall(userAddress, treasuryAddress, amountUnits);
     } catch (err) {
       if (isUnavailableReadonlyError(err)) {
-        throw new Error(`SPEND_PREFLIGHT_UNAVAILABLE: ${preflightErrorMessage(err)}`);
+        const wrapped = new Error(`SPEND_PREFLIGHT_UNAVAILABLE: ${preflightErrorMessage(err)}`);
+        Object.assign(wrapped, { code: err && typeof err === 'object' ? (err as { code?: unknown }).code : undefined, cause: err });
+        throw wrapped;
       }
       throw new KnownSpendPreflightFailure(
         `token transfer preflight reverted: ${preflightErrorMessage(err)}`,
@@ -303,7 +349,9 @@ async function preflightSpend(
       await contract.transferFrom.estimateGas(userAddress, treasuryAddress, amountUnits);
     } catch (err) {
       if (isUnavailableReadonlyError(err)) {
-        throw new Error(`SPEND_PREFLIGHT_UNAVAILABLE: ${preflightErrorMessage(err)}`);
+        const wrapped = new Error(`SPEND_PREFLIGHT_UNAVAILABLE: ${preflightErrorMessage(err)}`);
+        Object.assign(wrapped, { code: err && typeof err === 'object' ? (err as { code?: unknown }).code : undefined, cause: err });
+        throw wrapped;
       }
       throw new KnownSpendPreflightFailure(
         `token transfer gas estimate reverted: ${preflightErrorMessage(err)}`,
@@ -322,7 +370,9 @@ async function readTokenBalance(
     ['function balanceOf(address owner) view returns (uint256)'],
     provider,
   );
-  const units = await token.balanceOf(walletAddress) as bigint;
+  const units = await withRpcReadRetry(
+    () => token.balanceOf(walletAddress) as Promise<bigint>,
+  );
   return Number(ethers.formatUnits(units, 18));
 }
 
@@ -330,6 +380,23 @@ function evidencePending(failureCode: string): boolean {
   return failureCode === 'RECEIPT_PENDING'
     || failureCode === 'PROVIDER_ERROR'
     || failureCode === 'TRANSACTION_NOT_FOUND';
+}
+
+function evidenceDiagnostic(
+  failureCode: string,
+  txHash?: string,
+  sourceFailure?: SpendEvidenceFailure,
+): TransactionDiagnostic {
+  const pending = evidencePending(failureCode);
+  return {
+    stage: 'receipt',
+    category: pending ? 'confirmation_pending' : 'review_required',
+    ...(sourceFailure?.diagnostic || {}),
+    rpcMethod: sourceFailure?.diagnostic?.rpcMethod || 'spendEvidence.read',
+    errorCode: failureCode === 'PROVIDER_ERROR' ? 'RECEIPT_READ_UNAVAILABLE' : failureCode,
+    retryable: sourceFailure?.diagnostic?.retryable ?? pending,
+    ...(txHash ? { savedHash: txHash } : {}),
+  };
 }
 
 async function projectSpendOperation(
@@ -345,12 +412,14 @@ async function projectSpendOperation(
     session_id?: string | null;
     intent_context?: Record<string, unknown> | null;
     movement_outcome?: TokenMovementOutcome | null;
+    diagnostic_context?: TransactionDiagnostic | null;
   },
   request: SpendOperationRequest,
   verifyEvidence: (() => Promise<SpendEvidenceResult>) | undefined
 ): Promise<ReliableSpendExecutionResult> {
   const originalAmount = Number(operation.amount);
   let movementOutcome: TokenMovementOutcome = operation.movement_outcome || 'unknown';
+  const savedDiagnostic = operation.diagnostic_context || undefined;
   const replayRequest: SpendOperationRequest = {
     ...request,
     uid: operation.uid || request.uid,
@@ -370,6 +439,7 @@ async function projectSpendOperation(
         operation.tx_hash || undefined,
         true,
         movementOutcome,
+        savedDiagnostic,
       );
     }
     return {
@@ -381,6 +451,7 @@ async function projectSpendOperation(
       operationStatus: 'failed',
       requiresReview: false,
       movementOutcome,
+      diagnostic: savedDiagnostic,
       error: 'Spend operation is marked failed; no replacement transfer was submitted.',
     };
   }
@@ -407,6 +478,7 @@ async function projectSpendOperation(
       undefined,
       true,
       movementOutcome,
+      savedDiagnostic,
     );
   }
 
@@ -419,12 +491,24 @@ async function projectSpendOperation(
         operation.tx_hash,
         false,
         movementOutcome,
+        savedDiagnostic,
       );
     }
     let evidence: SpendEvidenceResult;
     try {
       evidence = await verifyEvidence();
     } catch (err) {
+      const diagnostic = evidenceDiagnostic('PROVIDER_ERROR', operation.tx_hash);
+      try {
+        await TokenOperations.markUnknown(
+          operation.operation_key,
+          'Spend transaction confirmation is pending',
+          diagnostic,
+        );
+      } catch {
+        // Keep the saved operation hash if the diagnostic update is
+        // temporarily unavailable.
+      }
       return pendingSpendResult(
         replayRequest,
         operation.status,
@@ -432,10 +516,22 @@ async function projectSpendOperation(
         operation.tx_hash,
         false,
         movementOutcome,
+        diagnostic,
       );
     }
     if (!evidence.valid) {
       if (evidencePending(evidence.failure.code)) {
+        const diagnostic = evidenceDiagnostic(evidence.failure.code, operation.tx_hash, evidence.failure);
+        try {
+          await TokenOperations.markUnknown(
+            operation.operation_key,
+            `Spend transaction confirmation is pending: ${evidence.failure.message}`,
+            diagnostic,
+          );
+        } catch {
+          // Keep the saved operation hash if the diagnostic update is
+          // temporarily unavailable.
+        }
         return pendingSpendResult(
           replayRequest,
           operation.status,
@@ -443,8 +539,10 @@ async function projectSpendOperation(
           operation.tx_hash,
           evidence.failure.code === 'TRANSACTION_NOT_FOUND',
           movementOutcome,
+          diagnostic,
         );
       }
+      const diagnostic = evidenceDiagnostic(evidence.failure.code, operation.tx_hash, evidence.failure);
       const evidenceMovementOutcome: TokenMovementOutcome = evidence.failure.code === 'TRANSACTION_FAILED'
         ? 'no_movement'
         : 'review';
@@ -453,6 +551,7 @@ async function projectSpendOperation(
           operation.operation_key,
           `Spend evidence rejected: ${evidence.failure.message}`,
           evidenceMovementOutcome,
+          diagnostic,
         );
         movementOutcome = evidenceMovementOutcome === 'review'
           ? 'review'
@@ -465,6 +564,7 @@ async function projectSpendOperation(
           operation.tx_hash,
           true,
           evidenceMovementOutcome,
+          diagnostic,
         );
       }
       if (movementOutcome === 'review') {
@@ -475,6 +575,7 @@ async function projectSpendOperation(
           operation.tx_hash,
           true,
           movementOutcome,
+          diagnostic,
         );
       }
       return {
@@ -486,6 +587,7 @@ async function projectSpendOperation(
         operationStatus: 'failed',
         requiresReview: false,
         movementOutcome,
+        diagnostic,
         error: `Spend transfer was not projected because chain evidence was rejected (${evidence.failure.code}): ${evidence.failure.message}`,
       };
     }
@@ -757,10 +859,24 @@ export async function recoverSpendOperation(
       txHash,
       false,
       operation.movement_outcome || 'unknown',
+      evidenceDiagnostic('PROVIDER_ERROR', txHash),
     );
   }
   if (!evidence.valid) {
     const requiresReview = !['RECEIPT_PENDING', 'PROVIDER_ERROR'].includes(evidence.failure.code);
+    const diagnostic = evidenceDiagnostic(evidence.failure.code, txHash, evidence.failure);
+    if (!requiresReview) {
+      try {
+        await TokenOperations.markUnknown(
+          operation.operation_key,
+          `Spend recovery evidence is pending: ${evidence.failure.message}`,
+          diagnostic,
+        );
+      } catch {
+        // Preserve the read-only recovery result if the diagnostic update is
+        // temporarily unavailable.
+      }
+    }
     return pendingSpendResult(
       request,
       operation.status,
@@ -768,6 +884,7 @@ export async function recoverSpendOperation(
       txHash,
       requiresReview,
       requiresReview ? 'review' : operation.movement_outcome || 'unknown',
+      diagnostic,
     );
   }
 
@@ -891,6 +1008,70 @@ export async function processSpend(
     reservationId: request.reservationId,
     idempotencyKey,
   });
+
+  // Persist and validate the immutable physical CDR before claiming or
+  // reconciling the token operation.  A same-amount replay with a different
+  // high-precision reading must be rejected before an existing operation can
+  // be projected, otherwise the replay could silently use a changed CDR.
+  if (request.settlementContext) {
+    const settlementContextDiagnostic = (errorCode: string, error: unknown): TransactionDiagnostic => createTransactionDiagnostic(
+      'preflight',
+      errorCode,
+      error,
+      { retryable: false, category: 'review_required' },
+    );
+    const settlementFailure = (message: string, diagnostic: TransactionDiagnostic): ReliableSpendExecutionResult => ({
+      success: false,
+      amount: request.amount,
+      userAddress: request.userAddress,
+      operationKey,
+      operationStatus: 'failed',
+      pending: false,
+      requiresReview: true,
+      preflightFailure: true,
+      preflightApprovalEligible: false,
+      movementOutcome: 'no_movement',
+      retryable: false,
+      diagnostic,
+      error: message,
+    });
+    if (!request.reservationId || request.reservationId !== request.settlementContext.reservationId) {
+      return settlementFailure(
+        'SETTLEMENT_CONTEXT_RESERVATION_MISMATCH',
+        settlementContextDiagnostic('SETTLEMENT_CONTEXT_RESERVATION_MISMATCH', 'reservation id does not match settlement context'),
+      );
+    }
+    try {
+      await SpendReservations.persistSettlementContext(
+        request.settlementContext.reservationId,
+        request.settlementContext.deliveredKwh,
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      let existing: TokenOperationRecord | undefined;
+      try { existing = await TokenOperations.findByKey(operationKey); } catch { /* fail closed below */ }
+      if (existing) {
+        return {
+          success: false,
+          amount: Number(existing.amount),
+          userAddress: existing.wallet_address,
+          operationKey,
+          txHash: existing.tx_hash || undefined,
+          operationStatus: existing.status,
+          pending: true,
+          requiresReview: true,
+          movementOutcome: existing.movement_outcome || 'unknown',
+          retryable: false,
+          diagnostic: settlementContextDiagnostic('SETTLEMENT_CONTEXT_MISMATCH', err),
+          error: `Spend settlement context does not match the original request: ${message}`,
+        };
+      }
+      return settlementFailure(
+        `Spend settlement context was not persisted; no movement was attempted: ${message}`,
+        settlementContextDiagnostic('SETTLEMENT_CONTEXT_MISMATCH', err),
+      );
+    }
+  }
 
   let treasuryAddress: string;
   let assetContext: Awaited<ReturnType<typeof getTokenAssetContext>>;
@@ -1033,6 +1214,17 @@ export async function processSpend(
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       const approvalEligible = err instanceof KnownSpendPreflightFailure;
+      const diagnostic = !approvalEligible && /SPEND_PREFLIGHT_UNAVAILABLE|provider is required/i.test(message)
+        ? createTransactionDiagnostic('preflight', 'RPC_READ_UNAVAILABLE', err, {
+          rpcMethod: 'spend.preflight.read',
+          // This branch is reached only when the read/estimate could not
+          // establish a deterministic token rejection. No send occurred, so
+          // retrying the same operation key is safe even for wrappers whose
+          // outer ethers code is not itself marked transient.
+          retryable: true,
+          category: 'rpc_unavailable',
+        })
+        : undefined;
       let movementOutcome: TokenMovementOutcome = 'unknown';
       try {
         // This block runs before submitSpend is entered. Even an RPC/read
@@ -1040,7 +1232,7 @@ export async function processSpend(
         // this operation. Retain a durable no-movement marker so the same
         // request key can safely retry after the provider or allowance state
         // is repaired.
-        const failedOperation = await TokenOperations.markPreflightFailed(operationKey, message);
+        const failedOperation = await TokenOperations.markPreflightFailed(operationKey, message, diagnostic);
         movementOutcome = failedOperation?.movement_outcome || 'unknown';
       } catch {
         // Retain the claim and fail closed if even the no-movement status
@@ -1052,16 +1244,73 @@ export async function processSpend(
         `Spend preflight failed: ${message}`,
         approvalEligible,
         movementOutcome,
+        diagnostic,
       );
     }
 
-    let tx: ethers.ContractTransactionResponse;
+    let tx: TransactionReliabilityResult;
     try {
-      tx = await submitSpend(treasurySigner, request.userAddress, treasuryAddress, canonicalAmount.value);
+      tx = await submitSpend(
+        treasurySigner,
+        request.userAddress,
+        treasuryAddress,
+        canonicalAmount.value,
+        operationKey,
+        assetContext.chainId,
+        assetContext.tokenContractAddress,
+      );
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const diagnostic = err instanceof TransactionReliabilityError ? err.diagnostic : undefined;
+      const message = diagnostic?.errorCode || 'TRANSACTION_SUBMISSION_FAILED';
+      if (diagnostic && isPreBroadcastTransactionDiagnostic(diagnostic)) {
+        try { await TokenOperations.markPreflightFailed(operationKey, message, diagnostic); } catch { /* fail closed */ }
+        return preflightFailureResult(
+          requestWithOperationKey,
+          operationKey,
+          `Spend transaction preparation failed and no movement was attempted: ${message}`,
+          false,
+          'no_movement',
+          diagnostic,
+        );
+      }
+      // A provider can accept the raw transaction and lose the response.
+      // Reconcile the exact saved hash once with bounded read-only evidence
+      // before returning an unresolved result. This path never prepares or
+      // broadcasts a replacement transaction.
+      if (diagnostic?.savedHash && diagnostic.stage === 'broadcast' && treasurySigner.provider) {
+        try {
+          const evidence = await verifySpendEvidence({
+            provider: treasurySigner.provider as ethers.Provider,
+            tokenContractAddress: assetContext.tokenContractAddress,
+            chainId: assetContext.chainId,
+            sourceWallet: request.userAddress,
+            treasuryRecipient: assetContext.treasuryAddress || treasuryAddress,
+            amountUnits: ethers.parseUnits(canonicalAmount.decimal, 18),
+            txHash: diagnostic.savedHash,
+          });
+          return projectSpendOperation(
+            {
+              operation_key: operationKey,
+              status: 'unknown',
+              tx_hash: diagnostic.savedHash,
+              amount: canonicalAmount.decimal,
+              uid,
+              wallet_address: request.userAddress,
+              session_id: request.sessionId || null,
+              intent_context: { assetContext },
+              movement_outcome: 'unknown',
+              diagnostic_context: diagnostic,
+            },
+            requestWithOperationKey,
+            async () => evidence,
+          );
+        } catch {
+          // Keep the original saved-hash diagnostic if the reconciliation
+          // read itself is unavailable.
+        }
+      }
       try {
-        await TokenOperations.markUnknown(operationKey, `Submission outcome is unknown: ${message}`);
+        await TokenOperations.markUnknown(operationKey, message, diagnostic);
       } catch {
         // Retain the durable claim and fail closed if the status update fails.
       }
@@ -1069,14 +1318,15 @@ export async function processSpend(
         requestWithOperationKey,
         'unknown',
         `Spend submission outcome is unknown and requires operator review: ${message}`,
-        undefined,
+        diagnostic?.savedHash,
         true,
         'unknown',
+        diagnostic,
       );
     }
 
     try {
-      await TokenOperations.markSubmitted(operationKey, tx.hash);
+      await TokenOperations.markSubmitted(operationKey, tx.txHash);
     } catch (err) {
       try {
         await TokenOperations.markUnknown(operationKey, `Transaction hash could not be persisted: ${err instanceof Error ? err.message : String(err)}`);
@@ -1088,9 +1338,10 @@ export async function processSpend(
         requestWithOperationKey,
         'unknown',
         'Spend was submitted but its transaction hash could not be durably saved; operator review is required.',
-        tx.hash,
+        tx.txHash,
         true,
         'unknown',
+        undefined,
       );
     }
 
@@ -1098,7 +1349,7 @@ export async function processSpend(
       {
         operation_key: operationKey,
         status: 'submitted',
-        tx_hash: tx.hash,
+        tx_hash: tx.txHash,
         amount: canonicalAmount.decimal,
         uid,
         wallet_address: request.userAddress,
@@ -1113,7 +1364,7 @@ export async function processSpend(
         sourceWallet: request.userAddress,
         treasuryRecipient: assetContext.treasuryAddress || treasuryAddress,
         amountUnits: ethers.parseUnits(canonicalAmount.decimal, 18),
-        txHash: tx.hash,
+        txHash: tx.txHash,
       }),
     );
   } catch (err) {

@@ -202,6 +202,12 @@ async function runMigrations() {
     await migrateActiveWalletSelection(db);
     console.log('[Migration] 022: Active wallet selection is present');
 
+    // Migration 023: persist complete prepared treasury transactions and
+    // coordinate nonces across awards, spends, and gas funding.
+    const { up: migrateTransactionReliability } = await import('./migrations/023_add_transaction_reliability');
+    await migrateTransactionReliability(db);
+    console.log('[Migration] 023: Transaction reliability state is present');
+
     console.log('[Migration] All migrations completed successfully');
   } catch (err) {
     console.error('[Migration] Error:', err);

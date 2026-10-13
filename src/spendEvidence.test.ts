@@ -153,6 +153,123 @@ describe('verifySpendEvidence', () => {
     expect(evidenceProvider.getTransactionReceipt).not.toHaveBeenCalled();
   });
 
+  it('returns bounded receipt RPC diagnostics after an exhausted unknown-block read', async () => {
+    const evidenceProvider = providerFor(
+      transaction(tokenInterface.encodeFunctionData('transfer', [TREASURY, AMOUNT])),
+      receipt([transferLog()]),
+    );
+    const getReceipt = evidenceProvider.getTransactionReceipt as jest.Mock;
+    getReceipt.mockRejectedValue(
+      Object.assign(new Error('server response 400 https://polygon-amoy.drpc.org/?secret=hidden'), {
+        code: 'SERVER_ERROR',
+        status: 400,
+        error: { code: 26, traceId: 'receipt-trace-26' },
+      }),
+    );
+
+    const result = await verifySpendEvidence(request({
+      provider: evidenceProvider,
+      readRetry: { delayMs: 0 },
+    }));
+
+    expect(result).toMatchObject({
+      valid: false,
+      failure: {
+        code: 'PROVIDER_ERROR',
+        diagnostic: {
+          rpcMethod: 'eth_getTransactionReceipt',
+          providerCode: 'SERVER_ERROR',
+          rpcCode: 26,
+          httpStatus: 400,
+          traceId: 'receipt-trace-26',
+          retryable: true,
+        },
+      },
+    });
+    expect(result.valid ? '' : result.failure.message).not.toContain('drpc.org');
+    expect(getReceipt).toHaveBeenCalledTimes(3);
+  });
+
+  it('extracts the production ethers dRPC responseBody shape without exposing the body', async () => {
+    const evidenceProvider = providerFor(
+      transaction(tokenInterface.encodeFunctionData('transfer', [TREASURY, AMOUNT])),
+      receipt([transferLog()]),
+    );
+    const responseBody = JSON.stringify({
+      id: 108,
+      jsonrpc: '2.0',
+      error: {
+        code: 19,
+        message: 'Temporary internal error. Please retry, trace-id: e8109f4bb0bbf568daa9f3f080df5df6',
+      },
+    });
+    (evidenceProvider.getTransaction as jest.Mock).mockRejectedValue({
+      code: 'SERVER_ERROR',
+      info: {
+        responseStatus: '500 Internal Server Error',
+        responseBody,
+      },
+    });
+
+    const result = await verifySpendEvidence(request({
+      provider: evidenceProvider,
+      readRetry: { delayMs: 0 },
+    }));
+
+    expect(result).toMatchObject({
+      valid: false,
+      failure: {
+        code: 'PROVIDER_ERROR',
+        diagnostic: {
+          rpcMethod: 'eth_getTransactionByHash',
+          providerCode: 'SERVER_ERROR',
+          rpcCode: 19,
+          httpStatus: 500,
+          traceId: 'e8109f4bb0bbf568daa9f3f080df5df6',
+          retryable: true,
+        },
+      },
+    });
+    expect(result.valid ? '' : result.failure.message).not.toContain(responseBody);
+  });
+
+  it('extracts production unknown-block receipt diagnostics with the receipt method', async () => {
+    const evidenceProvider = providerFor(
+      transaction(tokenInterface.encodeFunctionData('transfer', [TREASURY, AMOUNT])),
+      receipt([transferLog()]),
+    );
+    (evidenceProvider.getTransactionReceipt as jest.Mock).mockRejectedValue({
+      code: 'SERVER_ERROR',
+      info: {
+        responseStatus: '400 Bad Request',
+        responseBody: JSON.stringify({
+          id: 284,
+          jsonrpc: '2.0',
+          error: { code: 26, message: 'Unknown block, trace-id: receipt-prod-trace' },
+        }),
+      },
+    });
+
+    const result = await verifySpendEvidence(request({
+      provider: evidenceProvider,
+      readRetry: { delayMs: 0 },
+    }));
+
+    expect(result).toMatchObject({
+      valid: false,
+      failure: {
+        diagnostic: {
+          rpcMethod: 'eth_getTransactionReceipt',
+          providerCode: 'SERVER_ERROR',
+          rpcCode: 26,
+          httpStatus: 400,
+          traceId: 'receipt-prod-trace',
+          retryable: true,
+        },
+      },
+    });
+  });
+
   it('does not retry a deterministic transaction or receipt mismatch', async () => {
     const evidenceProvider = providerFor(
       transaction(

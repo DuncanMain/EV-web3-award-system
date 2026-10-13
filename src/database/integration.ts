@@ -1,5 +1,6 @@
 import { NormalisedSession, AwardMetadata, AwardType } from '../types';
-import { ApprovalPreparations, Users, Awards, Balances, Spends } from './service';
+import type { TransactionDiagnostic } from '../types';
+import { ApprovalPreparations, TreasuryTransactions, Users, Awards, Balances, Spends } from './service';
 import { getDatabase } from './connection';
 import { resolveUidToAddress, generateDeterministicWallet } from '../user/userService';
 import { ethers } from 'ethers';
@@ -9,7 +10,16 @@ import {
   requireCanonicalTransactionHash,
   requireUnambiguousTransactionMatch,
 } from './tokenOperation';
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
+import {
+  createTransactionDiagnostic,
+  isPreBroadcastTransactionDiagnostic,
+  prepareAndBroadcastTransaction,
+  TransactionReliabilityError,
+} from '../transactionReliability';
+import { isTransientRpcReadError, withNullableRpcReadRetry, withRpcReadRetry } from '../rpcProvider';
+import { verifySpendEvidence } from '../spendEvidence';
+import type { SpendEvidenceFailure } from '../spendEvidence';
 
 function normalizeTxHash(txHash: string): string {
   return txHash.trim().toLowerCase();
@@ -24,6 +34,266 @@ function sameTokenAmount(left: unknown, right: unknown): boolean {
 const approvalInterface = new ethers.Interface([
   'function approve(address spender, uint256 amount) public returns (bool)',
 ]);
+const managedMoveInterface = new ethers.Interface([
+  'function transferFrom(address from,address to,uint256 amount)',
+]);
+
+function standaloneActionSuffix(actionKey?: string): string {
+  const source = actionKey?.trim() || randomUUID();
+  if (source.length > 240) throw new Error('STANDALONE_ACTION_KEY_TOO_LONG');
+  return createHash('sha256').update(source).digest('hex');
+}
+
+async function reconcileOriginalNativeTransfer(
+  provider: ethers.Provider,
+  tx: {
+    txHash: string;
+    context: { signerAddress: string; to: string; value: string };
+  },
+  label: string,
+): Promise<void> {
+  let transaction: ethers.TransactionResponse | null;
+  let receipt: ethers.TransactionReceipt | null;
+  try {
+    transaction = await withNullableRpcReadRetry(() => provider.getTransaction(tx.txHash));
+    receipt = await withNullableRpcReadRetry(() => provider.getTransactionReceipt(tx.txHash));
+  } catch (error) {
+    throw new Error(`${label} original transaction evidence is unavailable; operator review is required: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!transaction || !receipt) {
+    throw new Error(`${label} original transaction is still pending; operator review is required`);
+  }
+  if (transaction.hash.toLowerCase() !== tx.txHash.toLowerCase()
+    || transaction.from.toLowerCase() !== tx.context.signerAddress.toLowerCase()
+    || transaction.to?.toLowerCase() !== tx.context.to.toLowerCase()
+    || transaction.value !== BigInt(tx.context.value)) {
+    throw new Error(`${label} original transaction intent does not match its saved signing context; operator review is required`);
+  }
+  if (Number(receipt.status) !== 1) {
+    throw new Error(`${label} original transaction failed on-chain; operator review is required`);
+  }
+}
+
+type ManagedMoveOutcome = 'unknown' | 'no_movement' | 'review';
+
+/**
+ * Preserve the original standalone move identity when confirmation or
+ * duplicate evidence fails. The saved hash is never replaced and this path
+ * deliberately has no broadcast call.
+ */
+async function throwManagedMoveFailure(
+  operationKey: string,
+  tx: { txHash: string; context: { nonce: number | string } },
+  diagnostic: TransactionDiagnostic,
+  message: string,
+  movementOutcome: ManagedMoveOutcome,
+): Promise<never> {
+  let durableStateWriteFailed = false;
+  try {
+    if (movementOutcome === 'no_movement') {
+      await TreasuryTransactions.markFailed(operationKey, diagnostic, message);
+    } else {
+      await TreasuryTransactions.markUnknown(operationKey, diagnostic, message);
+    }
+  } catch {
+    durableStateWriteFailed = true;
+  }
+  const failure = Object.assign(new TransactionReliabilityError(diagnostic), {
+    code: diagnostic.errorCode,
+    message,
+    operationKey,
+    txHash: tx.txHash,
+    nonce: Number(tx.context.nonce),
+    pending: diagnostic.retryable,
+    requiresReview: movementOutcome === 'review',
+    movementOutcome,
+    durableStateWriteFailed,
+  });
+  throw failure;
+}
+
+/**
+ * Surface a managed-wallet preflight failure with the same structured fields
+ * used after a durable lease exists. No treasury lease is created before this
+ * helper runs, so the result proves that no token movement was attempted.
+ */
+function throwManagedMovePreflightFailure(
+  operationKey: string,
+  diagnostic: TransactionDiagnostic,
+  message: string,
+): never {
+  const failure = Object.assign(new TransactionReliabilityError(diagnostic), {
+    code: diagnostic.errorCode,
+    errorCode: diagnostic.errorCode,
+    stage: diagnostic.stage,
+    operationKey,
+    txHash: diagnostic.savedHash || null,
+    ...(diagnostic.nonce === undefined ? {} : { nonce: diagnostic.nonce }),
+    pending: diagnostic.retryable,
+    requiresReview: false,
+    retryable: diagnostic.retryable,
+    preflightFailure: true,
+    movementOutcome: 'no_movement' as const,
+    message,
+  });
+  throw failure;
+}
+
+function throwManagedMovePreparationFailure(
+  operationKey: string,
+  error: unknown,
+): never {
+  const diagnostic = error instanceof TransactionReliabilityError
+    ? error.diagnostic
+    : createTransactionDiagnostic('prepare', 'TRANSACTION_PREPARATION_FAILED', error, {
+      retryable: false,
+      category: 'preflight',
+    });
+  const requiresReview = diagnostic.category === 'review_required' || !isPreBroadcastTransactionDiagnostic(diagnostic);
+  const movementOutcome: ManagedMoveOutcome = requiresReview
+    ? (diagnostic.savedHash ? 'unknown' : 'review')
+    : 'no_movement';
+  const failure = Object.assign(
+    error instanceof Error ? error : new Error(diagnostic.errorCode),
+    {
+      code: diagnostic.errorCode,
+      errorCode: diagnostic.errorCode,
+      diagnostic,
+      operationKey,
+      txHash: diagnostic.savedHash || null,
+      ...(diagnostic.nonce === undefined ? {} : { nonce: diagnostic.nonce }),
+      pending: diagnostic.savedHash ? true : diagnostic.retryable,
+      requiresReview,
+      retryable: diagnostic.retryable,
+      preflightFailure: isPreBroadcastTransactionDiagnostic(diagnostic),
+      movementOutcome,
+    },
+  );
+  throw failure;
+}
+
+function throwManagedFundingFailure(
+  operationKey: string,
+  error: unknown,
+  fallback: {
+    stage: TransactionDiagnostic['stage'];
+    rpcMethod: string;
+    savedHash?: string;
+  },
+): never {
+  const sourceDiagnostic = error instanceof TransactionReliabilityError ? error.diagnostic : undefined;
+  const diagnostic = sourceDiagnostic || createTransactionDiagnostic(
+    fallback.stage,
+    fallback.stage === 'receipt' ? 'RECEIPT_READ_UNAVAILABLE' : 'RPC_READ_UNAVAILABLE',
+    error,
+    {
+      rpcMethod: fallback.rpcMethod,
+      retryable: isTransientRpcReadError(error),
+      category: isTransientRpcReadError(error) ? 'confirmation_pending' : 'review_required',
+      ...(fallback.savedHash ? { savedHash: fallback.savedHash } : {}),
+    },
+  );
+  const fundingTxHash = diagnostic.savedHash || fallback.savedHash;
+  const publicDiagnostic: TransactionDiagnostic = {
+    ...diagnostic,
+    ...(fundingTxHash ? {} : { savedHash: undefined }),
+  };
+  delete publicDiagnostic.savedHash;
+  const preBroadcast = isPreBroadcastTransactionDiagnostic(diagnostic);
+  const requiresReview = diagnostic.category === 'review_required' || !preBroadcast;
+  const failure = Object.assign(
+    error instanceof Error ? error : new Error(diagnostic.errorCode),
+    {
+      code: diagnostic.errorCode,
+      errorCode: diagnostic.errorCode,
+      diagnostic: publicDiagnostic,
+      operationKey,
+      txHash: null,
+      fundingTxHash,
+      ...(diagnostic.nonce === undefined ? {} : { nonce: diagnostic.nonce }),
+      pending: fundingTxHash ? true : diagnostic.retryable,
+      requiresReview,
+      retryable: diagnostic.retryable,
+      preflightFailure: preBroadcast,
+      movementOutcome: (requiresReview ? 'review' : preBroadcast ? 'no_movement' : 'unknown') as ManagedMoveOutcome,
+    },
+  );
+  throw failure;
+}
+
+function managedMoveEvidenceDiagnostic(
+  tx: { txHash: string; context: { nonce: number | string } },
+  failure: SpendEvidenceFailure,
+): TransactionDiagnostic {
+  return {
+    stage: 'receipt',
+    category: failure.pending ? 'confirmation_pending' : 'review_required',
+    ...(failure.diagnostic || {}),
+    rpcMethod: failure.diagnostic?.rpcMethod || 'spendEvidence.read',
+    errorCode: failure.code,
+    retryable: failure.diagnostic?.retryable ?? failure.pending,
+    savedHash: tx.txHash,
+    nonce: Number(tx.context.nonce),
+  };
+}
+
+function managedMoveReceiptDiagnostic(
+  tx: { txHash: string; context: { nonce: number | string } },
+  error?: unknown,
+  receipt?: ethers.TransactionReceipt | null,
+): { diagnostic: TransactionDiagnostic; movementOutcome: ManagedMoveOutcome; message: string } {
+  if (error) {
+    const retryable = isTransientRpcReadError(error);
+    return {
+      diagnostic: createTransactionDiagnostic('receipt', 'RECEIPT_READ_UNAVAILABLE', error, {
+        rpcMethod: 'provider.waitForTransaction',
+        retryable,
+        category: retryable ? 'confirmation_pending' : 'review_required',
+        savedHash: tx.txHash,
+        nonce: Number(tx.context.nonce),
+      }),
+      movementOutcome: retryable ? 'unknown' : 'review',
+      message: `Managed-wallet transfer receipt lookup failed for original transaction ${tx.txHash}`,
+    };
+  }
+  if (!receipt) {
+    return {
+      diagnostic: createTransactionDiagnostic('receipt', 'RECEIPT_PENDING', undefined, {
+        rpcMethod: 'provider.waitForTransaction',
+        retryable: true,
+        category: 'confirmation_pending',
+        savedHash: tx.txHash,
+        nonce: Number(tx.context.nonce),
+      }),
+      movementOutcome: 'unknown',
+      message: `Managed-wallet transfer receipt is still pending for original transaction ${tx.txHash}`,
+    };
+  }
+  if (Number(receipt.status) === 0) {
+    return {
+      diagnostic: createTransactionDiagnostic('receipt', 'TRANSACTION_FAILED', undefined, {
+        rpcMethod: 'provider.waitForTransaction',
+        retryable: false,
+        category: 'review_required',
+        savedHash: tx.txHash,
+        nonce: Number(tx.context.nonce),
+      }),
+      movementOutcome: 'no_movement',
+      message: `Managed-wallet transfer mined with a failed receipt for original transaction ${tx.txHash}; no replacement was submitted`,
+    };
+  }
+  return {
+    diagnostic: createTransactionDiagnostic('receipt', 'MALFORMED_RECEIPT', undefined, {
+      rpcMethod: 'provider.waitForTransaction',
+      retryable: false,
+      category: 'review_required',
+      savedHash: tx.txHash,
+      nonce: Number(tx.context.nonce),
+    }),
+    movementOutcome: 'review',
+    message: `Managed-wallet transfer returned an invalid receipt status for original transaction ${tx.txHash}`,
+  };
+}
 
 /**
  * Estimate the native currency needed by the managed wallet's approval call.
@@ -38,10 +308,10 @@ export async function estimateManagedApprovalGasTarget(
   treasuryAddress: string,
 ): Promise<bigint> {
   const data = approvalInterface.encodeFunctionData('approve', [treasuryAddress, ethers.MaxUint256]);
-  const [gasLimit, feeData] = await Promise.all([
-    provider.estimateGas({ from: walletAddress, to: tokenContractAddress, data }),
-    provider.getFeeData(),
-  ]);
+  const gasLimit = await withRpcReadRetry(
+    () => provider.estimateGas({ from: walletAddress, to: tokenContractAddress, data }),
+  );
+  const feeData = await withRpcReadRetry(() => provider.getFeeData());
   const feePerGas = feeData.maxFeePerGas ?? feeData.gasPrice;
   if (!feePerGas || feePerGas <= 0n || gasLimit <= 0n) {
     throw new Error('APPROVAL_GAS_ESTIMATE_UNAVAILABLE: chain did not return a usable gas estimate and fee quote');
@@ -78,10 +348,10 @@ async function proveUnknownFundingOnlyPreparation(
     // Keep these reads sequential. Some free Polygon RPC plans reject a
     // JSON-RPC batch containing more than three requests; Promise.all can
     // make ethers combine these independent reads into one oversized batch.
-    const fundingReceipt = await provider.getTransactionReceipt(fundingHash);
-    const fundingTransaction = await provider.getTransaction(fundingHash);
-    const latestNonce = await provider.getTransactionCount(walletAddress, 'latest');
-    const pendingNonce = await provider.getTransactionCount(walletAddress, 'pending');
+    const fundingReceipt = await withNullableRpcReadRetry(() => provider.getTransactionReceipt(fundingHash));
+    const fundingTransaction = await withNullableRpcReadRetry(() => provider.getTransaction(fundingHash));
+    const latestNonce = await withRpcReadRetry(() => provider.getTransactionCount(walletAddress, 'latest'));
+    const pendingNonce = await withRpcReadRetry(() => provider.getTransactionCount(walletAddress, 'pending'));
     const expectedWallet = walletAddress.toLowerCase();
     const expectedTreasury = treasurySignerAddress.toLowerCase();
     const receiptMatches = !!fundingReceipt
@@ -116,8 +386,12 @@ type ApprovalRecoveryDetails = {
   stage: 'funding' | 'approval' | 'preparation';
   operationKey: string;
   txHash?: string;
+  /** Native treasury funding hash, kept separate from approval/SPARKZ hashes. */
+  fundingTxHash?: string;
+  diagnostic?: TransactionDiagnostic;
   durableStateWriteFailed?: boolean;
   cause?: string;
+  movementOutcome?: 'unknown' | 'no_movement' | 'confirmed' | 'review';
 };
 
 /**
@@ -125,19 +399,31 @@ type ApprovalRecoveryDetails = {
  * review state on the first failing request.  The API can then preserve the
  * operation key/hash and avoid treating the error as a safe preflight retry.
  */
-function approvalRecoveryError(message: string, details: ApprovalRecoveryDetails): Error & ApprovalRecoveryDetails & {
+function approvalRecoveryError(
+  message: string,
+  details: ApprovalRecoveryDetails,
+  options: {
+    pending?: boolean;
+    requiresReview?: boolean;
+    retryable?: boolean;
+    preflightFailure?: boolean;
+  } = {},
+): Error & ApprovalRecoveryDetails & {
   code: 'APPROVAL_PREPARATION_REVIEW_REQUIRED';
-  pending: true;
-  requiresReview: true;
-  retryable: false;
-  preflightFailure: false;
+  pending: boolean;
+  requiresReview: boolean;
+  retryable: boolean;
+  preflightFailure: boolean;
+  diagnostic?: TransactionDiagnostic;
+  fundingTxHash?: string;
 } {
+  const retryable = options.retryable ?? false;
   return Object.assign(new Error(message), {
     code: 'APPROVAL_PREPARATION_REVIEW_REQUIRED' as const,
-    pending: true as const,
-    requiresReview: true as const,
-    retryable: false as const,
-    preflightFailure: false as const,
+    pending: options.pending ?? true,
+    requiresReview: options.requiresReview ?? true,
+    retryable,
+    preflightFailure: options.preflightFailure ?? false,
     ...details,
   });
 }
@@ -181,7 +467,9 @@ export async function approveUserForSpendingViaFunding(
     const requiredWei = requiredCanonical
       ? ethers.parseUnits(requiredCanonical.decimal, 18)
       : 1n;
-    const currentAllowance: bigint = await tokenReadonly.allowance(userWallet.address, treasuryAddress);
+    const currentAllowance: bigint = await withRpcReadRetry(
+      () => tokenReadonly.allowance(userWallet.address, treasuryAddress) as Promise<bigint>,
+    );
     if (currentAllowance >= requiredWei) {
       console.log(`ℹ️  Existing token allowance covers user ${uid}; skipping approval transaction`);
       return;
@@ -213,7 +501,9 @@ export async function approveUserForSpendingViaFunding(
           {
             stage: 'preparation',
             operationKey: preparationKey,
-            txHash: preparation.approval_tx_hash || preparation.funding_tx_hash || undefined,
+            ...(preparation.approval_tx_hash
+              ? { txHash: preparation.approval_tx_hash }
+              : { fundingTxHash: preparation.funding_tx_hash || undefined }),
             cause: proof.reason,
           },
         );
@@ -227,7 +517,7 @@ export async function approveUserForSpendingViaFunding(
             {
               stage: 'preparation',
               operationKey: preparationKey,
-              txHash: preparation.funding_tx_hash || undefined,
+              fundingTxHash: preparation.funding_tx_hash || undefined,
             },
           );
         }
@@ -236,23 +526,30 @@ export async function approveUserForSpendingViaFunding(
         preparation = recovered;
       }
     }
-    if (!preparationClaim.acquired && preparation.status !== 'funded') {
+    const resumableFundingAttempt = preparation.status === 'funding'
+      && Boolean(preparation.funding_attempt_key);
+    if (!preparationClaim.acquired && preparation.status !== 'funded' && !resumableFundingAttempt) {
       throw approvalRecoveryError(
         `Approval preparation is retained in ${preparation.status} state for ${preparationKey}${preparation.error_message ? ` (${preparation.error_message})` : ''}`,
         {
           stage: 'preparation',
           operationKey: preparationKey,
-          txHash: preparation.approval_tx_hash || preparation.funding_tx_hash || undefined,
+          ...(preparation.approval_tx_hash
+            ? { txHash: preparation.approval_tx_hash }
+            : { fundingTxHash: preparation.funding_tx_hash || undefined }),
         },
       );
     }
+
+    let fundingAttemptKey = preparation.funding_attempt_key || undefined;
+    let fundingAttemptValue = preparation.funding_attempt_value || undefined;
 
     // A previously confirmed funding transfer may still be below the current
     // measured target. Transition it back to `funding` before a top-up so the
     // next process cannot send another transfer while this attempt is
     // ambiguous.
     if (preparation.status === 'funded') {
-      const nativeBalance = await provider.getBalance(userWallet.address);
+      const nativeBalance = await withRpcReadRetry(() => provider.getBalance(userWallet.address));
       const gasTarget = await estimateManagedApprovalGasTarget(
         provider,
         userWallet.address,
@@ -260,18 +557,29 @@ export async function approveUserForSpendingViaFunding(
         treasuryAddress,
       );
       if (nativeBalance < gasTarget) {
-        const fundingClaim = await ApprovalPreparations.claimFundingTopUp(preparationKey);
+        fundingAttemptValue = (gasTarget - nativeBalance).toString();
+        // A confirmed preparation may later need another top-up for the
+        // same amount. Give each newly claimed top-up its own durable lease
+        // identity; retries use the key persisted by claimFundingTopUp.
+        fundingAttemptKey = `${preparationKey}:topup:${randomUUID()}`;
+        const fundingClaim = await ApprovalPreparations.claimFundingTopUp(
+          preparationKey,
+          fundingAttemptKey,
+          fundingAttemptValue,
+        );
         if (!fundingClaim.acquired) {
           throw approvalRecoveryError(
             `Managed-wallet approval gas is below the measured target, but another process owns the durable top-up attempt (${fundingClaim.record.status})`,
             {
               stage: 'funding',
               operationKey: preparationKey,
-              txHash: fundingClaim.record.funding_tx_hash || preparation.funding_tx_hash || undefined,
+              fundingTxHash: fundingClaim.record.funding_tx_hash || preparation.funding_tx_hash || undefined,
             },
           );
         }
         preparation = fundingClaim.record;
+        fundingAttemptKey = preparation.funding_attempt_key || fundingAttemptKey;
+        fundingAttemptValue = preparation.funding_attempt_value || fundingAttemptValue;
       }
     }
 
@@ -280,30 +588,122 @@ export async function approveUserForSpendingViaFunding(
     // funding transfer. The amount itself is measured from the approval gas
     // estimate and current fee quote instead of assuming a fixed .005.
     if (preparation.status === 'funding') {
-      const nativeBalance = await provider.getBalance(userWallet.address);
-      const gasTarget = await estimateManagedApprovalGasTarget(
-        provider,
-        userWallet.address,
-        contractAddress,
-        treasuryAddress,
-      );
-      if (nativeBalance < gasTarget) {
-        const gasAmount = gasTarget - nativeBalance;
-        let fundTx: ethers.TransactionResponse | undefined;
+      let gasAmount: bigint | undefined;
+      if (fundingAttemptValue) {
         try {
-          fundTx = await treasurySigner.sendTransaction({
+          gasAmount = BigInt(fundingAttemptValue);
+        } catch {
+          throw approvalRecoveryError(
+            'Managed-wallet approval funding attempt has an invalid durable amount; operator review is required',
+            {
+              stage: 'funding',
+              operationKey: preparationKey,
+              cause: 'invalid funding_attempt_value',
+            },
+          );
+        }
+      } else {
+        const nativeBalance = await withRpcReadRetry(() => provider.getBalance(userWallet.address));
+        const gasTarget = await estimateManagedApprovalGasTarget(
+          provider,
+          userWallet.address,
+          contractAddress,
+          treasuryAddress,
+        );
+        if (nativeBalance < gasTarget) gasAmount = gasTarget - nativeBalance;
+      }
+      if (fundingAttemptValue && (!gasAmount || gasAmount <= 0n)) {
+        throw approvalRecoveryError(
+          'Managed-wallet approval funding attempt has a non-positive durable amount; operator review is required',
+          {
+            stage: 'funding',
+            operationKey: preparationKey,
+            cause: 'invalid funding_attempt_value',
+          },
+        );
+      }
+      if (gasAmount && gasAmount > 0n) {
+        let fundingResult: Awaited<ReturnType<typeof prepareAndBroadcastTransaction>> | undefined;
+        let fundingWasAlreadyPrepared = false;
+        const fundingOperationKey = fundingAttemptKey || `${preparationKey}:funding:${gasAmount.toString()}`;
+        try {
+          fundingResult = await prepareAndBroadcastTransaction({
+            operationKey: fundingOperationKey,
+            targetOperationKey: preparationKey,
+            targetType: 'approval_funding',
+            signer: treasurySigner,
+            chainId: preparation.chain_id,
             to: userWallet.address,
             value: gasAmount,
           });
-          await ApprovalPreparations.markFundingSubmitted(preparationKey, fundTx.hash);
+          if (fundingResult.alreadyPrepared) {
+            // A process may have restarted after the original lease was
+            // submitted but before this approval row was advanced. Reconcile
+            // that exact saved hash read-only before any approval side effect;
+            // never create a replacement funding transfer for the same key.
+            await reconcileOriginalNativeTransfer(
+              provider,
+              fundingResult,
+              'Managed-wallet approval gas funding',
+            );
+            fundingWasAlreadyPrepared = true;
+          }
+          await ApprovalPreparations.markFundingSubmitted(
+            preparationKey,
+            fundingResult.txHash,
+            {
+              nonce: fundingResult.context.nonce,
+              context: fundingResult.context,
+              attemptKey: fundingOperationKey,
+            },
+          );
         } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
+          const diagnostic = err instanceof TransactionReliabilityError ? err.diagnostic : undefined;
+          const message = diagnostic?.errorCode || (err instanceof Error ? err.message : String(err));
+          if (diagnostic && isPreBroadcastTransactionDiagnostic(diagnostic)) {
+            let durableStateWriteFailed = false;
+            try {
+              await ApprovalPreparations.markFundingPreflightFailed(
+                preparationKey,
+                message,
+                diagnostic,
+              );
+            } catch {
+              durableStateWriteFailed = true;
+            }
+            throw approvalRecoveryError(
+              `Funding preparation failed before broadcast; no movement was attempted: ${message}`,
+              {
+                stage: 'funding',
+                operationKey: preparationKey,
+                durableStateWriteFailed,
+                cause: message,
+                movementOutcome: 'no_movement',
+                diagnostic,
+              },
+              {
+                pending: diagnostic.retryable,
+                requiresReview: false,
+                retryable: diagnostic.retryable,
+                preflightFailure: true,
+              },
+            );
+          }
           let durableStateWriteFailed = false;
+          const savedFundingHash = diagnostic?.savedHash
+            || fundingResult?.txHash
+            || preparation.funding_tx_hash
+            || undefined;
           try {
             await ApprovalPreparations.markUnknown(
               preparationKey,
-              `funding submission outcome is unknown: ${message}`,
-              { fundingTxHash: fundTx?.hash, clearFundingHash: !fundTx?.hash },
+              `funding submission requires review: ${message}`,
+              {
+                fundingTxHash: savedFundingHash,
+                fundingAttemptKey: fundingOperationKey,
+                clearFundingHash: !savedFundingHash,
+                diagnostic,
+              },
             );
           } catch {
             durableStateWriteFailed = true;
@@ -313,39 +713,59 @@ export async function approveUserForSpendingViaFunding(
             {
               stage: 'funding',
               operationKey: preparationKey,
-              txHash: fundTx?.hash,
+              fundingTxHash: savedFundingHash,
+              diagnostic,
               durableStateWriteFailed,
               cause: message,
             },
           );
         }
-        try {
-          const fundReceipt = await fundTx.wait();
-          if (!fundReceipt || fundReceipt.status !== 1) {
-            throw new Error(`Gas funding transaction was not confirmed successfully: ${fundTx.hash}`);
-          }
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          let durableStateWriteFailed = false;
+        if (!fundingWasAlreadyPrepared) {
           try {
-            await ApprovalPreparations.markUnknown(
-              preparationKey,
-              `funding confirmation outcome is unknown: ${message}`,
-              { fundingTxHash: fundTx.hash },
+            const fundReceipt = await withNullableRpcReadRetry(() => provider.waitForTransaction(fundingResult!.txHash));
+            if (!fundReceipt || fundReceipt.status !== 1) {
+              throw new Error(`Gas funding transaction was not confirmed successfully: ${fundingResult!.txHash}`);
+            }
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            const diagnostic = createTransactionDiagnostic(
+              'receipt',
+              'RECEIPT_READ_UNAVAILABLE',
+              err,
+              {
+                rpcMethod: 'provider.waitForTransaction',
+                retryable: isTransientRpcReadError(err),
+                category: 'confirmation_pending',
+                savedHash: fundingResult!.txHash,
+                nonce: fundingResult!.context.nonce,
+              },
             );
-          } catch {
-            durableStateWriteFailed = true;
+            let durableStateWriteFailed = false;
+            try {
+              await ApprovalPreparations.markUnknown(
+                preparationKey,
+                `funding confirmation outcome is unknown: ${message}`,
+                {
+                  fundingTxHash: fundingResult!.txHash,
+                  fundingAttemptKey: fundingOperationKey,
+                  diagnostic,
+                },
+              );
+            } catch {
+              durableStateWriteFailed = true;
+            }
+            throw approvalRecoveryError(
+              `Funding confirmation outcome is unknown and requires operator review: ${message}`,
+              {
+                stage: 'funding',
+                operationKey: preparationKey,
+                fundingTxHash: fundingResult!.txHash,
+                diagnostic,
+                durableStateWriteFailed,
+                cause: message,
+              },
+            );
           }
-          throw approvalRecoveryError(
-            `Funding confirmation outcome is unknown and requires operator review: ${message}`,
-            {
-              stage: 'funding',
-              operationKey: preparationKey,
-              txHash: fundTx.hash,
-              durableStateWriteFailed,
-              cause: message,
-            },
-          );
         }
       }
       try {
@@ -357,7 +777,7 @@ export async function approveUserForSpendingViaFunding(
           {
             stage: 'funding',
             operationKey: preparationKey,
-            txHash: preparation.funding_tx_hash || undefined,
+            fundingTxHash: preparation.funding_tx_hash || undefined,
             cause: message,
           },
         );
@@ -375,7 +795,9 @@ export async function approveUserForSpendingViaFunding(
         {
           stage: 'approval',
           operationKey: preparationKey,
-          txHash: retained.approval_tx_hash || retained.funding_tx_hash || undefined,
+          ...(retained.approval_tx_hash
+            ? { txHash: retained.approval_tx_hash }
+            : { fundingTxHash: retained.funding_tx_hash || undefined }),
         },
       );
     }
@@ -389,9 +811,24 @@ export async function approveUserForSpendingViaFunding(
       await ApprovalPreparations.markApprovalSubmitted(preparationKey, approveTx.hash);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      const diagnostic = createTransactionDiagnostic(
+        'broadcast',
+        'APPROVAL_SUBMISSION_OUTCOME_UNKNOWN',
+        err,
+        {
+          rpcMethod: 'signer.sendTransaction',
+          retryable: false,
+          category: 'review_required',
+          ...(approveTx?.hash ? { savedHash: approveTx.hash } : {}),
+        },
+      );
       let durableStateWriteFailed = false;
       try {
-        await ApprovalPreparations.markUnknown(preparationKey, `approval submission outcome is unknown: ${message}`);
+        await ApprovalPreparations.markUnknown(
+          preparationKey,
+          `approval submission outcome is unknown: ${message}`,
+          { diagnostic },
+        );
       } catch {
         durableStateWriteFailed = true;
       }
@@ -401,21 +838,37 @@ export async function approveUserForSpendingViaFunding(
           stage: 'approval',
           operationKey: preparationKey,
           txHash: approveTx?.hash,
+          diagnostic,
           durableStateWriteFailed,
           cause: message,
         },
       );
     }
     try {
-      const approveReceipt = await approveTx.wait();
+      const approveReceipt = await withNullableRpcReadRetry(() => approveTx!.wait());
       if (!approveReceipt || approveReceipt.status !== 1) {
         throw new Error(`Approval transaction was not confirmed successfully: ${approveTx.hash}`);
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      const diagnostic = createTransactionDiagnostic(
+        'receipt',
+        'RECEIPT_READ_UNAVAILABLE',
+        err,
+        {
+          rpcMethod: 'transaction.wait',
+          retryable: isTransientRpcReadError(err),
+          category: 'confirmation_pending',
+          savedHash: approveTx.hash,
+        },
+      );
       let durableStateWriteFailed = false;
       try {
-        await ApprovalPreparations.markUnknown(preparationKey, `approval confirmation outcome is unknown: ${message}`);
+        await ApprovalPreparations.markUnknown(
+          preparationKey,
+          `approval confirmation outcome is unknown: ${message}`,
+          { diagnostic },
+        );
       } catch {
         durableStateWriteFailed = true;
       }
@@ -425,6 +878,7 @@ export async function approveUserForSpendingViaFunding(
           stage: 'approval',
           operationKey: preparationKey,
           txHash: approveTx.hash,
+          diagnostic,
           durableStateWriteFailed,
           cause: message,
         },
@@ -478,7 +932,8 @@ async function withApprovalPreparationLock<T>(key: string, work: () => Promise<T
 export async function revokeAllowanceOnManagedWallet(
   uid: string,
   treasurySigner: ethers.Signer,
-  treasuryAddress: string
+  treasuryAddress: string,
+  actionKey?: string,
 ): Promise<void> {
   const provider = treasurySigner.provider;
   if (!provider) throw new Error('Provider not available');
@@ -492,7 +947,9 @@ export async function revokeAllowanceOnManagedWallet(
   // Check current allowance — skip on-chain txs if already zero
   const tokenAbi = ['function allowance(address owner, address spender) view returns (uint256)'];
   const tokenReadonly = new ethers.Contract(contractAddress, tokenAbi, provider);
-  const currentAllowance: bigint = await tokenReadonly.allowance(userWallet.address, treasuryAddress);
+  const currentAllowance: bigint = await withRpcReadRetry(
+    () => tokenReadonly.allowance(userWallet.address, treasuryAddress) as Promise<bigint>,
+  );
   if (currentAllowance === 0n) {
     console.log(`ℹ️  Allowance already zero for managed wallet of user ${uid} — skipping revoke`);
     return;
@@ -500,11 +957,37 @@ export async function revokeAllowanceOnManagedWallet(
 
   // Fund gas: send a small amount of MATIC to the derived wallet
   const gasAmount = ethers.parseEther('0.002');
-  const fundTx = await treasurySigner.sendTransaction({
-    to: userWallet.address,
-    value: gasAmount,
-  });
-  await fundTx.wait();
+  const chain = await withRpcReadRetry(() => provider.getNetwork());
+  const fundingOperationKey = `maintenance:revoke:${uid}:funding:${standaloneActionSuffix(actionKey)}`;
+  let funding: Awaited<ReturnType<typeof prepareAndBroadcastTransaction>> | undefined;
+  let fundingFailureStage: TransactionDiagnostic['stage'] = 'prepare';
+  let fundingFailureMethod = 'treasury.prepare';
+  try {
+    funding = await prepareAndBroadcastTransaction({
+      operationKey: fundingOperationKey,
+      targetType: 'standalone',
+      signer: treasurySigner,
+      chainId: String(chain.chainId),
+      to: userWallet.address,
+      value: gasAmount,
+    });
+    if (funding.alreadyPrepared) {
+      fundingFailureStage = 'receipt';
+      fundingFailureMethod = 'provider.transactionEvidence';
+      await reconcileOriginalNativeTransfer(provider, funding, 'Allowance-revoke gas funding');
+    } else {
+      fundingFailureStage = 'receipt';
+      fundingFailureMethod = 'provider.waitForTransaction';
+      const receipt = await withNullableRpcReadRetry(() => provider.waitForTransaction(funding!.txHash));
+      if (!receipt || Number(receipt.status) !== 1) throw new Error('Allowance-revoke gas funding is not confirmed');
+    }
+  } catch (error) {
+    throwManagedFundingFailure(fundingOperationKey, error, {
+      stage: fundingFailureStage,
+      rpcMethod: fundingFailureMethod,
+      ...(funding?.txHash ? { savedHash: funding.txHash } : {}),
+    });
+  }
 
   // Call approve(treasury, 0) from the derived wallet
   const approveTx = await userSigner.sendTransaction({
@@ -512,7 +995,8 @@ export async function revokeAllowanceOnManagedWallet(
     data: new ethers.Interface(['function approve(address spender, uint256 amount) public returns (bool)'])
       .encodeFunctionData('approve', [treasuryAddress, 0n]),
   });
-  await approveTx.wait();
+  const approveReceipt = await withNullableRpcReadRetry(() => approveTx.wait());
+  if (!approveReceipt || Number(approveReceipt.status) !== 1) throw new Error('Allowance revoke transaction is not confirmed');
 
   console.log(`✓ Treasury allowance revoked on managed wallet for user ${uid}`);
 }
@@ -532,7 +1016,8 @@ export async function moveFundsFromManagedWallet(
   uid: string,
   targetAddress: string,
   treasurySigner: ethers.Signer,
-  tokenContractAddress: string
+  tokenContractAddress: string,
+  actionKey?: string,
 ): Promise<{ txHash: string; amount: string }> {
   const provider = treasurySigner.provider;
   if (!provider) throw new Error('Provider not available');
@@ -545,18 +1030,202 @@ export async function moveFundsFromManagedWallet(
     'function transferFrom(address from, address to, uint256 amount) returns (bool)',
   ];
   const token = new ethers.Contract(tokenContractAddress, tokenAbi, treasurySigner);
+  // The action identity is supplied by the caller and is deliberately kept
+  // independent of the current balance, target, and token.  Those values are
+  // immutable intent in the saved signing context, so a retry after a lost
+  // response can reconcile the original hash even when the wallet balance has
+  // since reached zero.  A missing key denotes a new logical action.
+  const operationKey = `maintenance:move:${uid}:${standaloneActionSuffix(actionKey)}`;
+  const existingLease = await TreasuryTransactions.findByOperationKey(operationKey);
+  let balance: bigint;
+  let chainId: string;
+  let destination = tokenContractAddress;
+  let data: string;
+  let value: bigint = 0n;
+  let accessList: ethers.AccessList | undefined;
 
-  const balance: bigint = await token.balanceOf(userWallet.address);
-  if (balance === 0n) {
-    throw new Error('Managed wallet balance is already zero — nothing to move');
+  if (existingLease) {
+    if (existingLease.target_type !== 'standalone' || !existingLease.tx_context) {
+      throw new Error('TREASURY_TRANSACTION_INTENT_MISMATCH');
+    }
+    const savedContext = existingLease.tx_context;
+    if (savedContext.to.toLowerCase() !== tokenContractAddress.toLowerCase()
+      || typeof savedContext.data !== 'string') {
+      throw new Error('TREASURY_TRANSACTION_INTENT_MISMATCH');
+    }
+    let decoded: ethers.Result;
+    try {
+      decoded = managedMoveInterface.decodeFunctionData('transferFrom', savedContext.data);
+    } catch {
+      throw new Error('TREASURY_TRANSACTION_INTENT_MISMATCH');
+    }
+    const savedSource = String(decoded[0]);
+    const savedTarget = String(decoded[1]);
+    if (savedSource.toLowerCase() !== userWallet.address.toLowerCase()
+      || savedTarget.toLowerCase() !== targetAddress.toLowerCase()) {
+      throw new Error('TREASURY_TRANSACTION_INTENT_MISMATCH');
+    }
+    try {
+      balance = BigInt(decoded[2].toString());
+      value = BigInt(savedContext.value || '0');
+    } catch {
+      throw new Error('TREASURY_TRANSACTION_INTENT_MISMATCH');
+    }
+    if (balance <= 0n) throw new Error('TREASURY_TRANSACTION_INTENT_MISMATCH');
+    chainId = String(savedContext.chainId);
+    destination = savedContext.to;
+    data = savedContext.data;
+    accessList = savedContext.accessList as ethers.AccessList | undefined;
+  } else {
+    try {
+      balance = await withRpcReadRetry(
+        () => token.balanceOf(userWallet.address) as Promise<bigint>,
+      );
+    } catch (error) {
+      const retryable = isTransientRpcReadError(error);
+      throwManagedMovePreflightFailure(
+        operationKey,
+        createTransactionDiagnostic('preflight', 'RPC_READ_UNAVAILABLE', error, {
+          rpcMethod: 'eth_call',
+          retryable,
+          category: retryable ? 'rpc_unavailable' : 'preflight',
+        }),
+        `Managed-wallet balance could not be read before transfer preparation; no movement was attempted${retryable ? ', retry the same move key after the token network recovers' : ''}`,
+      );
+    }
+    if (balance === 0n) {
+      throwManagedMovePreflightFailure(
+        operationKey,
+        createTransactionDiagnostic('preflight', 'MANAGED_WALLET_BALANCE_EMPTY', undefined, {
+          rpcMethod: 'eth_call',
+          retryable: false,
+          category: 'preflight',
+        }),
+        'Managed wallet balance is already zero — nothing to move',
+      );
+    }
+    let treasuryAddress: string;
+    try {
+      treasuryAddress = await treasurySigner.getAddress();
+    } catch (error) {
+      const retryable = isTransientRpcReadError(error);
+      throwManagedMovePreflightFailure(
+        operationKey,
+        createTransactionDiagnostic('preflight', 'RPC_READ_UNAVAILABLE', error, {
+          rpcMethod: 'signer.getAddress',
+          retryable,
+          category: retryable ? 'rpc_unavailable' : 'preflight',
+        }),
+        `Managed-wallet treasury permission could not be read before transfer preparation; no movement was attempted${retryable ? ', retry the same move key after the token network recovers' : ''}`,
+      );
+    }
+    const tokenReadonly = new ethers.Contract(
+      tokenContractAddress,
+      ['function allowance(address owner, address spender) view returns (uint256)'],
+      provider,
+    );
+    let allowance: bigint;
+    try {
+      allowance = await withRpcReadRetry(
+        () => tokenReadonly.allowance(userWallet.address, treasuryAddress) as Promise<bigint>,
+      );
+    } catch (error) {
+      const retryable = isTransientRpcReadError(error);
+      throwManagedMovePreflightFailure(
+        operationKey,
+        createTransactionDiagnostic('preflight', 'RPC_READ_UNAVAILABLE', error, {
+          rpcMethod: 'eth_call',
+          retryable,
+          category: retryable ? 'rpc_unavailable' : 'preflight',
+        }),
+        `Managed-wallet treasury permission could not be read before transfer preparation; no movement was attempted${retryable ? ', retry the same move key after the token network recovers' : ''}`,
+      );
+    }
+    if (allowance < balance) {
+      throwManagedMovePreflightFailure(
+        operationKey,
+        createTransactionDiagnostic('preflight', 'MANAGED_WALLET_ALLOWANCE_UNAVAILABLE', undefined, {
+          rpcMethod: 'eth_call',
+          retryable: false,
+          category: 'preflight',
+        }),
+        'The managed wallet treasury permission is insufficient for this transfer. Enable the approved treasury permission for managed mode, then retry the same move key; no movement was attempted',
+      );
+    }
+    let chain: ethers.Networkish;
+    try {
+      chain = await withRpcReadRetry(() => provider.getNetwork());
+    } catch (error) {
+      const retryable = isTransientRpcReadError(error);
+      throwManagedMovePreflightFailure(
+        operationKey,
+        createTransactionDiagnostic('preflight', 'CHAIN_CONTEXT_UNAVAILABLE', error, {
+          rpcMethod: 'eth_chainId',
+          retryable,
+          category: retryable ? 'rpc_unavailable' : 'preflight',
+        }),
+        `Managed-wallet chain context could not be read before transfer preparation; no movement was attempted${retryable ? ', retry the same move key after the token network recovers' : ''}`,
+      );
+    }
+    chainId = String(chain.chainId);
+    data = managedMoveInterface.encodeFunctionData('transferFrom', [userWallet.address, targetAddress, balance]);
   }
 
-  const tx = await token.transferFrom(userWallet.address, targetAddress, balance);
-  await tx.wait();
+  let tx: Awaited<ReturnType<typeof prepareAndBroadcastTransaction>>;
+  try {
+    tx = await prepareAndBroadcastTransaction({
+      operationKey,
+      targetType: 'standalone',
+      signer: treasurySigner,
+      chainId,
+      to: destination,
+      data,
+      value,
+      ...(accessList === undefined ? {} : { accessList }),
+    });
+  } catch (error) {
+    throwManagedMovePreparationFailure(operationKey, error);
+  }
+  if (tx.alreadyPrepared) {
+    const evidence = await verifySpendEvidence({
+      provider,
+      tokenContractAddress,
+      chainId: BigInt(chainId),
+      sourceWallet: userWallet.address,
+      treasuryRecipient: targetAddress,
+      amountUnits: balance,
+      txHash: tx.txHash,
+    });
+    if (!evidence.valid) {
+      const diagnostic = managedMoveEvidenceDiagnostic(tx, evidence.failure);
+      const movementOutcome: ManagedMoveOutcome = evidence.failure.code === 'TRANSACTION_FAILED'
+        ? 'no_movement'
+        : (evidence.failure.pending || diagnostic.retryable ? 'unknown' : 'review');
+      await throwManagedMoveFailure(
+        operationKey,
+        tx,
+        diagnostic,
+        `Managed-wallet transfer duplicate could not be reconciled safely for original transaction ${tx.txHash}: ${evidence.failure.code}`,
+        movementOutcome,
+      );
+    }
+  } else {
+    let receipt: ethers.TransactionReceipt | null = null;
+    try {
+      receipt = await withNullableRpcReadRetry(() => provider.waitForTransaction(tx.txHash));
+    } catch (error) {
+      const failure = managedMoveReceiptDiagnostic(tx, error);
+      await throwManagedMoveFailure(operationKey, tx, failure.diagnostic, failure.message, failure.movementOutcome);
+    }
+    if (!receipt || Number(receipt.status) !== 1) {
+      const failure = managedMoveReceiptDiagnostic(tx, undefined, receipt);
+      await throwManagedMoveFailure(operationKey, tx, failure.diagnostic, failure.message, failure.movementOutcome);
+    }
+  }
 
   const amount = ethers.formatEther(balance);
-  console.log(`✓ Moved ${amount} SPARKZ from managed wallet of user ${uid} to ${targetAddress} (tx: ${tx.hash})`);
-  return { txHash: tx.hash as string, amount };
+  console.log(`✓ Moved ${amount} SPARKZ from managed wallet of user ${uid} to ${targetAddress} (tx: ${tx.txHash})`);
+  return { txHash: tx.txHash, amount };
 }
 
 /**
