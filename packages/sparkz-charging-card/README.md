@@ -177,6 +177,20 @@ NEVERFLAT perform delayed settlement after the CDR without asking for a second
 signature. A partial settlement can leave a residual allowance which should be
 revoked or replaced after settlement.
 
+The card keeps approval evidence in memory for the lifetime of the mounted
+component. If `/spend/me` returns a pending/review result or its response is
+lost after the approval, a retry with the same contract, API endpoint, session,
+provider, wallet, and amount reuses the saved `authorizationTxHash` instead of
+opening another wallet prompt. An approval submission or receipt with unknown
+outcome is reported as `CUSTODIAL_APPROVAL_OUTCOME_UNKNOWN` and blocks another
+signature until the original hash is reconciled. A remount or page reload does
+not reconstruct this browser memory: the host integration should persist the
+operation identity and authorization hash in its durable outbox and reconcile
+the original request before retrying or creating a new card instance. When a
+hash is available but receipt reading fails, treat it as known-hash review and
+use a read-only receipt or backend reconciliation for that hash; do not ask the
+wallet to create a replacement approval.
+
 ### CDR received/session closed
 
 When BEIA considers the session complete, pass `UNPLUGGED` again and remove

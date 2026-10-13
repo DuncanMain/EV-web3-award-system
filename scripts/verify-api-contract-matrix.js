@@ -196,6 +196,7 @@ const EXPECTED_ERROR_CONTRACTS = [
   { match: /^invalid-linked-wallet(?:-array-body)?$/, message: /wallet address/i },
   { match: /^invalid-linked-profile-address$|^invalid-unlink-address$/, message: /wallet address/i },
   { match: /^invalid-move-funds-target$/, message: /targetAddress/i },
+  { match: /^invalid-move-funds-keyless$/, code: 'IDEMPOTENCY_KEY_REQUIRED', message: /idempotencyKey|Idempotency-Key/i },
   { match: /^invalid-custodial-intent$|^invalid-custodial-failure$/, message: /uid|walletAddress|amount/i },
   { match: /^invalid-custodial-record(?:-array-body)?$/, message: /uid|walletAddress|txHash|amount/i },
   { match: /^invalid-json-raw-body$/, code: 'INVALID_JSON', message: /valid JSON/i },
@@ -376,6 +377,7 @@ async function financialSnapshot() {
     'spend_receipts',
     'spend_reservations',
     'spends',
+    'treasury_transaction_leases',
     'token_operations',
     'users',
   ];
@@ -525,6 +527,10 @@ async function runInvalidAuthenticatedCases() {
     ['invalid-linked-profile-address', 'PATCH', `/wallet/${encodeURIComponent(MATRIX_UID)}/linked-wallets/not-an-address/profile`, { headers: headerSet('api'), body: { walletName: 'invalid' } }, 400],
     ['invalid-unlink-address', 'DELETE', `/wallet/${encodeURIComponent(MATRIX_UID)}/linked-wallets/not-an-address`, { headers: headerSet('api'), body: {} }, 400],
     ['invalid-move-funds-target', 'POST', `/wallet/${encodeURIComponent(MATRIX_UID)}/move-funds`, { headers: headerSet('api'), body: { targetAddress: 'invalid' } }, 400],
+    ['invalid-move-funds-keyless', 'POST', `/wallet/${encodeURIComponent(MATRIX_UID)}/move-funds`, {
+      headers: headerSet('api'),
+      body: { targetAddress: '0x1111111111111111111111111111111111111111' },
+    }, 400],
     ['invalid-custodial-intent', 'POST', '/spend/custodial-intent', { headers: headerSet('api'), body: {} }, 400],
     ['invalid-custodial-failure', 'POST', '/spend/custodial-failure', { headers: headerSet('api'), body: {} }, 400],
     ['invalid-custodial-record', 'POST', '/spend/custodial-record', { headers: headerSet('api'), body: {} }, 400],
@@ -738,7 +744,11 @@ async function runValidReservationAndSpendCases() {
 }
 
 async function runValidCustodialAndLinkedCases() {
-  externalSigner = new ethers.Wallet(HARDHAT_ACCOUNT_ONE_PRIVATE_KEY, deployed.provider);
+  // Hardhat automines and the matrix sends multiple transactions from this
+  // synthetic external wallet.  NonceManager preserves the wallet's local
+  // sequence across the approval and custodial-record setup calls instead of
+  // relying on a provider nonce read that can lag immediately after mining.
+  externalSigner = new ethers.NonceManager(new ethers.Wallet(HARDHAT_ACCOUNT_ONE_PRIVATE_KEY, deployed.provider));
   const externalAddress = await externalSigner.getAddress();
   const linkSignature = await externalSigner.signMessage(signedWalletLinkMessage(MATRIX_CUSTODIAL_UID, externalAddress, 'link'));
   await requiredCase('linked-wallet-valid', 'POST', `/wallet/${encodeURIComponent(MATRIX_CUSTODIAL_UID)}/linked-wallets`, {
@@ -894,22 +904,106 @@ async function runMoveFundsAndAdminCases() {
   const target = externalSigner ? await externalSigner.getAddress() : '0x0000000000000000000000000000000000000001';
   const sourceBefore = await deployed.token.balanceOf(primaryWalletAddress);
   const targetBefore = await deployed.token.balanceOf(target);
-  let moveAmountUnits = 0n;
-  await requiredCase('move-funds-valid', 'POST', `/wallet/${encodeURIComponent(MATRIX_UID)}/move-funds`, {
+  const moveRoute = `/wallet/${encodeURIComponent(MATRIX_UID)}/move-funds`;
+  const moveBody = { targetAddress: target, idempotencyKey: 'matrix-move-funds-valid' };
+  let moveAmountUnits = null;
+  let moveTxHash;
+  const moveResponse = await requiredCase('move-funds-valid', 'POST', `/wallet/${encodeURIComponent(MATRIX_UID)}/move-funds`, {
     headers: headerSet('api'),
-    body: { targetAddress: target },
-  }, 200, response => {
-    assert.equal(response.body.status, 'success');
+    body: moveBody,
+  }, [200, 202], response => {
     assert.ok(response.body.txHash);
-    assert.ok(Number(response.body.amount) > 0);
-    moveAmountUnits = ethers.parseUnits(String(response.body.amount), 18);
+    moveTxHash = response.body.txHash;
+    if (response.status === 200) {
+      assert.equal(response.body.status, 'success');
+      assert.ok(Number(response.body.amount) > 0);
+      moveAmountUnits = ethers.parseUnits(String(response.body.amount), 18);
+    } else {
+      assert.equal(response.body.status, 'pending');
+      assert.equal(response.body.pending, true);
+      assert.equal(response.body.requiresReview, false);
+    }
+  });
+
+  // A 202 is only an acknowledgement that the original signed operation is
+  // still being confirmed. Poll the same idempotency key for a bounded number
+  // of attempts and require the locally automined transfer to reach 200 before
+  // treating the positive amount and chain deltas as a successful proof.
+  let confirmationResponse = moveResponse;
+  if (moveResponse.status === 202) {
+    const maxConfirmationPolls = 4;
+    for (let attempt = 1; attempt <= maxConfirmationPolls; attempt += 1) {
+      await new Promise(resolve => setTimeout(resolve, 100 * attempt));
+      const retryResponse = await requiredCase(`move-funds-confirmation-retry-${attempt}`, 'POST', moveRoute, {
+        headers: headerSet('api'),
+        body: moveBody,
+      }, [200, 202], response => {
+        assert.equal(response.body.txHash, moveTxHash, 'same-key confirmation retry preserved the original transaction hash');
+        if (response.status === 200) {
+          assert.equal(response.body.status, 'success');
+          assert.ok(Number(response.body.amount) > 0);
+          moveAmountUnits = ethers.parseUnits(String(response.body.amount), 18);
+        } else {
+          assert.equal(response.body.status, 'pending');
+          assert.equal(response.body.pending, true);
+          assert.equal(response.body.requiresReview, false);
+        }
+      });
+      confirmationResponse = retryResponse;
+      if (retryResponse.status === 200) break;
+    }
+  }
+  assert.equal(confirmationResponse.status, 200, 'same-key move-funds confirmation must reach 200 on local automining');
+  assert.ok(moveAmountUnits > 0n, 'confirmed move-funds response must contain a positive amount');
+
+  // A retry must return the saved operation result without a second transfer.
+  // A changed target under the same identity must be a conflict, also before
+  // any replacement movement is attempted.
+  const replayResponse = await requiredCase('move-funds-replay-valid', 'POST', moveRoute, {
+    headers: headerSet('api'),
+    body: moveBody,
+  }, 200, response => {
+    assert.equal(response.body.txHash, moveTxHash);
+    assert.equal(response.body.status, 'success');
+    assert.equal(ethers.parseUnits(String(response.body.amount), 18), moveAmountUnits);
   });
   const sourceAfter = await deployed.token.balanceOf(primaryWalletAddress);
   const targetAfter = await deployed.token.balanceOf(target);
-  assert.ok(sourceAfter < sourceBefore, 'move-funds reduced the managed wallet balance');
-  assert.ok(targetAfter > targetBefore, 'move-funds increased the target wallet balance');
-  assert.equal(sourceBefore - sourceAfter, moveAmountUnits, 'move-funds source delta matches response amount');
-  assert.equal(targetAfter - targetBefore, moveAmountUnits, 'move-funds target delta matches response amount');
+  const sourceDelta = sourceBefore - sourceAfter;
+  const targetDelta = targetAfter - targetBefore;
+  assert.equal(sourceDelta, targetDelta, 'move-funds source and target deltas stay balanced');
+  assert.equal(sourceDelta, moveAmountUnits, 'move-funds source delta matches response amount');
+  assert.equal(targetDelta, moveAmountUnits, 'move-funds target delta matches response amount');
+
+  const replayAgain = await requiredCase('move-funds-replay-idempotent', 'POST', moveRoute, {
+    headers: headerSet('api'),
+    body: moveBody,
+  }, 200, response => {
+    assert.equal(response.body.txHash, moveTxHash);
+    assert.equal(response.body.status, 'success');
+    assert.equal(ethers.parseUnits(String(response.body.amount), 18), moveAmountUnits);
+  });
+  const sourceAfterReplay = await deployed.token.balanceOf(primaryWalletAddress);
+  const targetAfterReplay = await deployed.token.balanceOf(target);
+  assert.equal(sourceAfterReplay, sourceAfter, 'same-key replay did not debit the managed wallet again');
+  assert.equal(targetAfterReplay, targetAfter, 'same-key replay did not credit the target again');
+  assert.ok(replayResponse.body.txHash && replayAgain.body.txHash === replayResponse.body.txHash, 'same-key retries preserve the original transaction hash');
+
+  const beforeConflict = await financialSnapshot();
+  await requiredCase('move-funds-key-conflict', 'POST', moveRoute, {
+    headers: headerSet('api'),
+    body: {
+      targetAddress: '0x0000000000000000000000000000000000000002',
+      idempotencyKey: 'matrix-move-funds-valid',
+    },
+  }, 409, response => {
+    assert.equal(response.body.code, 'TOKEN_OPERATION_INTENT_MISMATCH');
+    assert.equal(response.body.errorCode, 'TOKEN_OPERATION_INTENT_MISMATCH');
+    assert.equal(response.body.retryable, false);
+    assert.equal(response.body.requiresReview, false);
+  });
+  const afterConflict = await financialSnapshot();
+  assertNoSideEffect(beforeConflict, afterConflict, 'move-funds changed-target conflict');
 }
 
 async function runInitialAdminReconciliationCase() {

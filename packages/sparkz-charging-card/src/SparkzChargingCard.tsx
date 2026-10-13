@@ -22,8 +22,15 @@ import {
 import sparkzLogo from './sparkz-logo.svg';
 
 type SpendResponse = {
-  status: 'success';
-  reservation: SparkzReservation;
+  status?: string;
+  reservation?: SparkzReservation;
+  pending?: boolean;
+  retryable?: boolean;
+  requiresReview?: boolean;
+  operationKey?: string | null;
+  txHash?: string | null;
+  message?: string;
+  error?: string;
 };
 
 type ReservationApprovalIntent = {
@@ -46,6 +53,20 @@ type SpendOperationContext = {
   sessionScopeKey: string;
   sessionId: string;
   providerId: string;
+};
+
+type CustodialApprovalIdentity = {
+  contractId: string;
+  apiBaseUrl: string;
+  sessionScopeKey: string;
+  sessionId: string;
+  providerId: string;
+  walletAddress: string;
+  amount: number;
+  status: 'preparing' | 'submitted' | 'confirmed' | 'unknown';
+  authorizationTxHash?: string;
+  error?: string;
+  approvalPromise?: Promise<string>;
 };
 
 type WalletModeRequestIdentity = {
@@ -92,6 +113,66 @@ function getErrorMessage(err: unknown): string {
     if (response.code !== undefined && response.code !== null) return String(response.code);
   }
   return err instanceof Error ? err.message : String(err);
+}
+
+function boundedErrorMessage(err: unknown): string {
+  return getErrorMessage(err).slice(0, 240);
+}
+
+function matchesCustodialApprovalIdentity(
+  identity: CustodialApprovalIdentity,
+  operation: SpendOperationContext,
+  walletAddress: string,
+  amount: number,
+): boolean {
+  return identity.contractId === operation.contractId
+    && identity.apiBaseUrl === operation.apiBaseUrl
+    && identity.sessionScopeKey === operation.sessionScopeKey
+    && identity.sessionId === operation.sessionId
+    && identity.providerId === operation.providerId
+    && identity.walletAddress.toLowerCase() === walletAddress.toLowerCase()
+    && identity.amount === amount;
+}
+
+function custodialApprovalIntentKey(
+  operation: SpendOperationContext,
+  walletAddress: string,
+  amount: number,
+): string {
+  return JSON.stringify([
+    operation.contractId,
+    operation.apiBaseUrl,
+    operation.sessionScopeKey,
+    operation.sessionId,
+    operation.providerId,
+    walletAddress.toLowerCase(),
+    amount,
+  ]);
+}
+
+function custodialApprovalUnknownError(identity: CustodialApprovalIdentity): Error {
+  return Object.assign(
+    new Error(identity.error || 'The custodial approval transaction outcome is unknown; reconcile it before retrying.'),
+    {
+      code: 'CUSTODIAL_APPROVAL_OUTCOME_UNKNOWN',
+      pending: true,
+      retryable: false,
+      requiresReview: true,
+      authorizationTxHash: identity.authorizationTxHash || null,
+    },
+  );
+}
+
+function isKnownWalletRejection(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const candidate = err as { code?: unknown; name?: unknown };
+  const code = String(candidate.code ?? '').toUpperCase();
+  const name = String(candidate.name ?? '').toUpperCase();
+  return code === '4001'
+    || code === 'ACTION_REJECTED'
+    || code === 'USER_REJECTED'
+    || name === 'ACTIONREJECTEDERROR'
+    || name === 'USERREJECTEDREQUESTERROR';
 }
 
 function contractHeaders(contractId: string): HeadersInit {
@@ -210,6 +291,7 @@ export default function SparkzChargingCard({
   });
   const activeOperationTokenRef = useRef(0);
   const activeWalletOperationTokenRef = useRef(0);
+  const custodialApprovalEntriesRef = useRef(new Map<string, CustodialApprovalIdentity>());
   const walletModeRequestIdentityRef = useRef<WalletModeRequestIdentity | null>(null);
   const mountedRef = useRef(true);
   const [dismissed, setDismissed] = useState(false);
@@ -605,30 +687,142 @@ export default function SparkzChargingCard({
       const assertCurrent = () => {
         if (!isSpendRequestCurrent(operation)) throw new StaleSpendOperationError();
       };
+      const assertApprovalContextCurrent = () => {
+        if (!mountedRef.current
+          || !isOwnerGenerationCurrent(operation.ownerGeneration, operation.contractId, operation.apiBaseUrl)) {
+          throw new StaleSpendOperationError();
+        }
+        const current = currentSessionContextRef.current;
+        if (!current.hasSessionContext
+          || current.scopeKey !== operation.sessionScopeKey
+          || current.sessionId !== operation.sessionId
+          || current.providerId !== operation.providerId
+          || !isSessionGenerationCurrent(operation.sessionGeneration, operation.sessionScopeKey)) {
+          throw new StaleSpendOperationError();
+        }
+      };
       assertCurrent();
       let authorizationTxHash: string | undefined;
       let reservationWalletAddress: string | undefined;
+      let custodialApprovalKey: string | undefined;
       if (visibleWallet?.walletMode === 'custodial') {
         const ethereum = (window as Window & { ethereum?: BrowserEthereumProvider }).ethereum;
         if (!ethereum) throw new Error('Open the linked wallet to authorize this reservation.');
         reservationWalletAddress = visibleWallet.walletAddress;
-        assertCurrent();
-        const intentRes = await fetch(apiUrl(normalizedApiBaseUrl, '/spend/reservation-approval-intent'), {
-          method: 'POST',
-          headers: contractHeaders(contractId),
-          body: JSON.stringify({ walletAddress: reservationWalletAddress, amount, sessionId, providerId }),
-        });
-        const intent = await readJson<ReservationApprovalIntent>(intentRes);
-        assertCurrent();
-        authorizationTxHash = await ethereum.request({
-          method: 'eth_sendTransaction', params: [intent.transaction],
-        }) as string;
-        assertCurrent();
-        if (!authorizationTxHash) throw new Error('The wallet did not return an approval transaction hash.');
-        const browserProvider = new ethers.BrowserProvider(ethereum);
-        const approvalReceipt = await browserProvider.waitForTransaction(authorizationTxHash);
-        assertCurrent();
-        if (!approvalReceipt || approvalReceipt.status !== 1) throw new Error('The wallet authorization transaction failed.');
+        custodialApprovalKey = custodialApprovalIntentKey(operation, reservationWalletAddress, amount);
+        const entries = custodialApprovalEntriesRef.current;
+        const savedApproval = entries.get(custodialApprovalKey);
+        if (savedApproval && !matchesCustodialApprovalIdentity(savedApproval, operation, reservationWalletAddress, amount)) {
+          entries.delete(custodialApprovalKey);
+        }
+        const existingApproval = entries.get(custodialApprovalKey);
+        if (existingApproval) {
+          if (existingApproval.status === 'unknown') throw custodialApprovalUnknownError(existingApproval);
+          if (existingApproval.status === 'confirmed') {
+            authorizationTxHash = existingApproval.authorizationTxHash;
+            if (!authorizationTxHash) {
+              throw custodialApprovalUnknownError({
+                ...existingApproval,
+                status: 'unknown',
+                error: 'The saved custodial approval is missing its transaction hash; review it before retrying.',
+              });
+            }
+          } else if (existingApproval.approvalPromise) {
+            authorizationTxHash = await existingApproval.approvalPromise;
+          } else if (existingApproval.authorizationTxHash) {
+            throw custodialApprovalUnknownError({
+              ...existingApproval,
+              status: 'unknown',
+              error: 'The custodial approval attempt has no active confirmation; review its saved transaction hash before retrying.',
+            });
+          } else {
+            throw custodialApprovalUnknownError({
+              ...existingApproval,
+              status: 'unknown',
+              error: 'A custodial approval attempt is already in progress; review it before retrying.',
+            });
+          }
+        } else {
+          // Claim this immutable intent before fetching the transaction or
+          // invoking the wallet. A second submit can then await the same
+          // approval promise instead of opening another wallet prompt.
+          const approvalEntry: CustodialApprovalIdentity = {
+            contractId,
+            apiBaseUrl: normalizedApiBaseUrl,
+            sessionScopeKey: currentSessionScopeKey,
+            sessionId,
+            providerId,
+            walletAddress: reservationWalletAddress,
+            amount,
+            status: 'preparing',
+          };
+          entries.set(custodialApprovalKey, approvalEntry);
+          const approvalPromise = (async () => {
+            try {
+              assertApprovalContextCurrent();
+              const intentRes = await fetch(apiUrl(normalizedApiBaseUrl, '/spend/reservation-approval-intent'), {
+                method: 'POST',
+                headers: contractHeaders(contractId),
+                body: JSON.stringify({ walletAddress: reservationWalletAddress, amount, sessionId, providerId }),
+              });
+              const intent = await readJson<ReservationApprovalIntent>(intentRes);
+              if (!intent?.transaction) throw new Error('The server did not return a valid custodial approval transaction.');
+              assertApprovalContextCurrent();
+
+              let submittedHash: unknown;
+              try {
+                submittedHash = await ethereum.request({
+                  method: 'eth_sendTransaction', params: [intent.transaction],
+                });
+              } catch (approvalError) {
+                if (isKnownWalletRejection(approvalError)) {
+                  if (entries.get(custodialApprovalKey) === approvalEntry) entries.delete(custodialApprovalKey);
+                  throw approvalError;
+                }
+                approvalEntry.status = 'unknown';
+                approvalEntry.error = `The custodial approval submission outcome is unknown: ${boundedErrorMessage(approvalError)}`;
+                throw custodialApprovalUnknownError(approvalEntry);
+              }
+              // Persist the returned hash before checking UI generations. The
+              // wallet may have accepted the write while the card changed owner.
+              if (typeof submittedHash !== 'string' || !submittedHash.trim()) {
+                approvalEntry.status = 'unknown';
+                approvalEntry.error = 'The wallet did not return an approval transaction hash; its submission outcome is unknown.';
+                throw custodialApprovalUnknownError(approvalEntry);
+              }
+              approvalEntry.authorizationTxHash = submittedHash;
+              approvalEntry.status = 'submitted';
+
+              let approvalReceipt;
+              try {
+                const browserProvider = new ethers.BrowserProvider(ethereum);
+                approvalReceipt = await browserProvider.waitForTransaction(submittedHash);
+              } catch (receiptError) {
+                approvalEntry.status = 'unknown';
+                approvalEntry.error = `The custodial approval receipt could not be confirmed: ${boundedErrorMessage(receiptError)}`;
+                throw custodialApprovalUnknownError(approvalEntry);
+              }
+              if (!approvalReceipt) {
+                approvalEntry.status = 'unknown';
+                approvalEntry.error = 'The custodial approval receipt was not available; its submission outcome is unknown.';
+                throw custodialApprovalUnknownError(approvalEntry);
+              }
+              if (approvalReceipt.status !== 1) {
+                if (entries.get(custodialApprovalKey) === approvalEntry) entries.delete(custodialApprovalKey);
+                throw new Error('The wallet authorization transaction failed before the reservation request.');
+              }
+              approvalEntry.status = 'confirmed';
+              return submittedHash;
+            } catch (approvalError) {
+              if (approvalEntry.status === 'preparing' && entries.get(custodialApprovalKey) === approvalEntry) {
+                entries.delete(custodialApprovalKey);
+              }
+              throw approvalError;
+            }
+          })();
+          approvalEntry.approvalPromise = approvalPromise;
+          authorizationTxHash = await approvalPromise;
+        }
       }
       assertCurrent();
       spendRequestStarted = true;
@@ -645,10 +839,26 @@ export default function SparkzChargingCard({
         }),
       });
       const data = await readJson<SpendResponse>(res);
+      if (res.status === 202 || data.status !== 'success' || !data.reservation) {
+        const pendingMessage = data.message || data.error
+          || (res.status === 202
+            ? 'The spend request is still pending; retry the same session request.'
+            : 'The spend response did not include a reservation.');
+        throw Object.assign(new Error(pendingMessage), data);
+      }
+      const createdReservation = data.reservation;
+      if (custodialApprovalKey && reservationWalletAddress && authorizationTxHash) {
+        const savedApproval = custodialApprovalEntriesRef.current.get(custodialApprovalKey);
+        if (savedApproval
+          && savedApproval.authorizationTxHash === authorizationTxHash
+          && matchesCustodialApprovalIdentity(savedApproval, operation, reservationWalletAddress, amount)) {
+          custodialApprovalEntriesRef.current.delete(custodialApprovalKey);
+        }
+      }
       if (!isReservationRetentionCurrent(operation)) throw new StaleSpendOperationError();
-      setReservation(data.reservation);
+      setReservation(createdReservation);
       setReservationTracking({
-        reservationId: data.reservation.id,
+        reservationId: createdReservation.id,
         contractId,
         apiBaseUrl: normalizedApiBaseUrl,
         sessionId,
@@ -656,7 +866,7 @@ export default function SparkzChargingCard({
       });
       setSettlement(null);
       notifiedSettlementId.current = null;
-      invokeHostCallback(() => onReservationSuccess?.(data.reservation), (callbackError) => {
+      invokeHostCallback(() => onReservationSuccess?.(createdReservation), (callbackError) => {
         if (isReservationRetentionCurrent(operation)) {
           setError(`Reservation created, but the host callback failed: ${getErrorMessage(callbackError)}`);
         }

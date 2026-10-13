@@ -397,6 +397,7 @@ describe('Award Executor', () => {
       expect(result.eligible).toBe(false);
       expect(result.amount).toBe(0);
       expect(result.stage).toBe('complete');
+      expect(mockContract.transfer).not.toHaveBeenCalled();
     });
 
     it('should fail on invalid CDR', async () => {

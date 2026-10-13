@@ -65,9 +65,13 @@ function code(body) {
 }
 function leakReason(value) {
   const text = typeof value === 'string' ? value : JSON.stringify(value || '');
+  const isOpenApiDocument = isObj(value)
+    && typeof value.openapi === 'string'
+    && isObj(value.paths);
   const diagnosticText = typeof value === 'object' && value !== null
     ? [value.message, value.error].filter(item => typeof item === 'string').join(' ')
     : text;
+  const technicalText = isOpenApiDocument ? diagnosticText : text;
   if ([ADMIN_PASSWORD, API_KEY, INGEST_KEY, 'postgres://', 'node_modules\\'].some(item => item && text.includes(item))) return 'credential or internal path literal';
   // Match SQL-shaped diagnostics inside an error string without letting the
   // broad `.+` span unrelated words in a successful OpenAPI document.
@@ -76,13 +80,38 @@ function leakReason(value) {
     || /\bupdate\s+[\w".-]+\s+set\b/i.test(text)
     || /\bdelete\s+from\s+[\w".-]+\b/i.test(text)) return 'SQL diagnostic';
   if (/\b(?:relation|column) "[^"]+" does not exist\b/i.test(text)) return 'database catalog diagnostic';
-  if (/\b(?:stack trace|stacktrace|json-rpc|rpc error|jsonrpc|internal server error)\b/i.test(text)) return 'RPC or stack diagnostic';
-  if (/\bat\s+[A-Za-z0-9_.<>/$-]+\s+\(/i.test(text)) return 'stack frame';
+  // OpenAPI descriptions may legitimately mention JSON-RPC. For that
+  // recognized document shape, inspect only error-bearing fields; ordinary
+  // API responses remain covered by the whole serialized response so nested
+  // provider diagnostics cannot evade this check.
+  if (/\b(?:stack trace|stacktrace|json-rpc|rpc error|jsonrpc|internal server error)\b/i.test(technicalText)) return 'RPC or stack diagnostic';
+  if (/\bat\s+[A-Za-z0-9_.<>/$-]+\s+\(/i.test(technicalText)) return 'stack frame';
   if (/https?:\/\//i.test(diagnosticText)) return 'diagnostic URL';
   return null;
 }
 function leak(value) {
   return Boolean(leakReason(value));
+}
+
+function assertLeakCheckerContracts() {
+  const openApiDocumentation = {
+    openapi: '3.0.3',
+    paths: { '/health': { get: { description: 'Uses JSON-RPC terminology in public documentation.' } } },
+  };
+  if (leakReason(openApiDocumentation) !== null) {
+    throw new Error('leak checker rejected legitimate JSON-RPC text in a recognized OpenAPI document');
+  }
+  const nestedRpcError = { status: 'error', diagnostic: { message: 'JSON-RPC provider failure' } };
+  if (leakReason(nestedRpcError) !== 'RPC or stack diagnostic') {
+    throw new Error('leak checker missed a nested RPC diagnostic in an ordinary API response');
+  }
+  const documentedCredential = {
+    openapi: '3.0.3',
+    paths: { '/health': { get: { description: `example key ${ADMIN_PASSWORD}` } } },
+  };
+  if (leakReason(documentedCredential) !== 'credential or internal path literal') {
+    throw new Error('leak checker missed a credential embedded in OpenAPI documentation');
+  }
 }
 function safeBody(body) {
   if (body === null || body === undefined) return { type: 'empty' };
@@ -598,6 +627,7 @@ function writeEvidence(errorMessage) {
 async function main() {
   let fatal = null;
   try {
+    assertLeakCheckerContracts();
     await setup();
     await matrix();
   } catch (error) {

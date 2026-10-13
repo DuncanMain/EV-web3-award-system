@@ -28,11 +28,11 @@ function response(body, status = 200) {
   };
 }
 
-function wallet(uid) {
+function wallet(uid, walletMode = 'managed') {
   return {
     status: 'success',
     uid,
-    walletMode: 'managed',
+    walletMode,
     walletAddress: `0x${uid.slice(-8).padStart(8, '0')}`,
     managedWalletAddress: `0x${uid.slice(-8).padStart(8, '0')}`,
     isRegistered: true,
@@ -99,6 +99,24 @@ function settlement(overrides = {}) {
     receiptStatus: 'settled',
     updatedAt: '2026-09-24T00:00:00.000Z',
     ...overrides,
+  };
+}
+
+function approvalReceipt(hash, walletAddress) {
+  return {
+    transactionHash: hash,
+    transactionIndex: '0x0',
+    blockHash: `0x${'b'.repeat(64)}`,
+    blockNumber: '0x10',
+    from: walletAddress,
+    to: '0x0000000000000000000000000000000000000002',
+    cumulativeGasUsed: '0x1',
+    gasUsed: '0x1',
+    effectiveGasPrice: '0x1',
+    logsBloom: `0x${'0'.repeat(512)}`,
+    logs: [],
+    status: '0x1',
+    type: '0x2',
   };
 }
 
@@ -530,4 +548,742 @@ test('blocks a new spend while a saved reservation is still pending', async () =
   const waitingButton = renderer.root.findAllByType('button').find(button => text(button.props.children) === 'Waiting for reservation');
   assert.ok(waitingButton, 'pending reservation explains why the action is unavailable');
   assert.equal(waitingButton.props.disabled, true);
+});
+
+test('preserves pending 202 review fields and retries the same reservation request', async () => {
+  const spendErrors = [];
+  const reservations = [];
+  const spendRequests = [];
+  let spendCall = 0;
+  globalThis.fetch = async (url, init = {}) => {
+    const path = String(url);
+    if (path.endsWith('/wallet/me')) return response(wallet('emaid-1'));
+    if (path.endsWith('/spend/session')) return response(session('emaid-1', 'session-1', 'provider-1'));
+    if (path.endsWith('/spend/me')) {
+      spendRequests.push(JSON.parse(init.body || '{}'));
+      spendCall += 1;
+      if (spendCall === 1) {
+        return response({
+          status: 'pending',
+          pending: true,
+          retryable: false,
+          requiresReview: true,
+          operationKey: 'reservation:pending-202',
+          message: 'The reservation is awaiting chain confirmation.',
+        }, 202);
+      }
+      return response({
+        status: 'success',
+        reservation: { id: 'reservation-retried', status: 'reserved', amount: '1.00', kWhEntitlement: '1.00', availableBalance: 9 },
+      });
+    }
+    if (path.endsWith('/spend/reservations/reservation-retried')) return response(settlement({ reservationId: 'reservation-retried', status: 'settling', receiptStatus: 'pending', txHash: null, spendReceipt: null }));
+    throw new Error(`Unexpected request ${path}`);
+  };
+
+  const renderer = await renderCard({
+    apiBaseUrl: 'http://local.test/api',
+    contractId: 'emaid-1',
+    sessionId: 'session-1',
+    providerId: 'provider-1',
+    sessionStatus: 'PLUGGED_IN',
+    hideAfterSpend: false,
+    onReservationSuccess: value => reservations.push(value.id),
+    onSpendError: error => spendErrors.push(error),
+  });
+  let form = renderer.root.findByType('form');
+  await act(async () => {
+    await form.props.onSubmit({ preventDefault() {} });
+  });
+
+  assert.equal(spendErrors.length, 1);
+  assert.equal(spendErrors[0].pending, true);
+  assert.equal(spendErrors[0].requiresReview, true);
+  assert.equal(spendErrors[0].retryable, false);
+  assert.equal(spendErrors[0].operationKey, 'reservation:pending-202');
+  assert.match(text(renderer.toJSON()), /awaiting chain confirmation/);
+
+  form = renderer.root.findByType('form');
+  await act(async () => {
+    await form.props.onSubmit({ preventDefault() {} });
+  });
+
+  assert.deepEqual(reservations, ['reservation-retried']);
+  assert.equal(spendRequests.length, 2);
+  assert.deepEqual(spendRequests[1], spendRequests[0], 'retry keeps the original session/provider/amount identity');
+});
+
+test('retries a lost mode response with the same optional key and changes key at an owner boundary', async () => {
+  const modeRequests = [];
+  let owner = 'emaid-1';
+  let modeCall = 0;
+  globalThis.fetch = async (url, init = {}) => {
+    const path = String(url);
+    if (path.endsWith('/wallet/me')) {
+      return response(wallet(owner, owner === 'emaid-1' && modeCall > 1 ? 'managed' : 'custodial'));
+    }
+    if (path.endsWith('/wallet/emaid-1/mode') || path.endsWith('/wallet/emaid-2/mode')) {
+      modeRequests.push(JSON.parse(init.body || '{}'));
+      modeCall += 1;
+      if (modeCall === 1) throw new Error('mode response lost');
+      return response({ status: 'success', walletMode: 'managed' });
+    }
+    throw new Error(`Unexpected request ${path}`);
+  };
+
+  const renderer = await renderCard({
+    apiBaseUrl: 'http://local.test/api',
+    contractId: 'emaid-1',
+    sessionStatus: 'UNPLUGGED',
+  });
+  await flush();
+  const accountButton = renderer.root.findAllByType('button').find(button => text(button.props.children) === 'Account');
+  assert.ok(accountButton);
+  await act(async () => {
+    accountButton.props.onClick();
+    await flush();
+  });
+  let modeButton = renderer.root.findAllByType('button').find(button => text(button.props.children) === 'Use managed wallet');
+  assert.ok(modeButton);
+  await act(async () => {
+    modeButton.props.onClick();
+    await flush();
+  });
+
+  modeButton = renderer.root.findAllByType('button').find(button => text(button.props.children) === 'Use managed wallet');
+  assert.ok(modeButton, 'the failed mode response leaves the retry action available');
+  await act(async () => {
+    modeButton.props.onClick();
+    await flush();
+  });
+
+  assert.equal(modeRequests.length, 2);
+  assert.equal(modeRequests[0].mode, 'managed');
+  assert.equal(modeRequests[0].allowSplit, true);
+  assert.equal(typeof modeRequests[0].idempotencyKey, 'string');
+  assert.ok(modeRequests[0].idempotencyKey.length > 0);
+  assert.equal(modeRequests[1].idempotencyKey, modeRequests[0].idempotencyKey, 'response-loss retry reuses the same optional key');
+
+  owner = 'emaid-2';
+  await updateCard(renderer, {
+    apiBaseUrl: 'http://local.test/api',
+    contractId: owner,
+    sessionStatus: 'UNPLUGGED',
+  });
+  modeButton = renderer.root.findAllByType('button').find(button => text(button.props.children) === 'Use managed wallet');
+  assert.ok(modeButton, 'the new owner gets its own mode action');
+  await act(async () => {
+    modeButton.props.onClick();
+    await flush();
+  });
+
+  assert.equal(modeRequests.length, 3);
+  assert.notEqual(modeRequests[2].idempotencyKey, modeRequests[0].idempotencyKey, 'owner change starts a new mode identity');
+});
+
+test('reuses a confirmed custodial approval after a pending reservation response', async () => {
+  const approvalHash = `0x${'a'.repeat(64)}`;
+  const walletAddress = '0x0000000000000000000000000000000000000001';
+  const approvalIntents = [];
+  const spendRequests = [];
+  const spendErrors = [];
+  const reservations = [];
+  let approvalSendCalls = 0;
+  let spendCall = 0;
+
+  globalThis.window = {
+    ethereum: {
+      request: async ({ method, params = [] }) => {
+        if (method === 'eth_sendTransaction') {
+          approvalSendCalls += 1;
+          return approvalHash;
+        }
+        if (method === 'eth_chainId') return '0x13882';
+        if (method === 'eth_blockNumber') return '0x10';
+        if (method === 'eth_getTransactionReceipt') return approvalReceipt(params[0], walletAddress);
+        throw new Error(`Unexpected wallet RPC ${method}`);
+      },
+    },
+  };
+  globalThis.fetch = async (url, init = {}) => {
+    const path = String(url);
+    if (path.endsWith('/wallet/me')) {
+      return response({ ...wallet('emaid-1', 'custodial'), walletAddress, managedWalletAddress: walletAddress });
+    }
+    if (path.endsWith('/spend/session')) return response(session('emaid-1', 'session-1', 'provider-1'));
+    if (path.endsWith('/spend/reservation-approval-intent')) {
+      approvalIntents.push(JSON.parse(init.body || '{}'));
+      return response({
+        status: 'requires_signature',
+        walletAddress,
+        requiredAllowance: '1.00',
+        transaction: {
+          from: walletAddress,
+          to: '0x0000000000000000000000000000000000000002',
+          value: '0x0',
+          data: '0x',
+        },
+      });
+    }
+    if (path.endsWith('/spend/me')) {
+      spendRequests.push(JSON.parse(init.body || '{}'));
+      spendCall += 1;
+      if (spendCall === 1) {
+        return response({
+          status: 'pending',
+          pending: true,
+          retryable: false,
+          requiresReview: true,
+          operationKey: 'reservation:custodial-pending',
+          message: 'The reservation is awaiting chain confirmation.',
+        }, 202);
+      }
+      return response({
+        status: 'success',
+        reservation: { id: 'custodial-retried', status: 'reserved', amount: '1.00', kWhEntitlement: '1.00', availableBalance: 9 },
+      });
+    }
+    if (path.endsWith('/spend/reservations/custodial-retried')) {
+      return response(settlement({ reservationId: 'custodial-retried', status: 'settling', receiptStatus: 'pending', txHash: null, spendReceipt: null }));
+    }
+    throw new Error(`Unexpected request ${path}`);
+  };
+
+  const renderer = await renderCard({
+    apiBaseUrl: 'http://local.test/api',
+    contractId: 'emaid-1',
+    sessionId: 'session-1',
+    providerId: 'provider-1',
+    sessionStatus: 'PLUGGED_IN',
+    hideAfterSpend: false,
+    onReservationSuccess: value => reservations.push(value.id),
+    onSpendError: error => spendErrors.push(error),
+  });
+  let form = renderer.root.findByType('form');
+  await act(async () => {
+    await form.props.onSubmit({ preventDefault() {} });
+  });
+
+  assert.equal(approvalSendCalls, 1, 'the first reservation signs one approval');
+  assert.equal(approvalIntents.length, 1);
+  assert.equal(spendErrors.length, 1);
+  assert.equal(spendErrors[0].pending, true);
+  assert.equal(spendErrors[0].requiresReview, true);
+
+  form = renderer.root.findByType('form');
+  await act(async () => {
+    await form.props.onSubmit({ preventDefault() {} });
+  });
+
+  assert.deepEqual(reservations, ['custodial-retried']);
+  assert.equal(approvalSendCalls, 1, 'same-intent retry reuses the confirmed approval hash');
+  assert.equal(approvalIntents.length, 1, 'same-intent retry does not request another approval intent');
+  assert.equal(spendRequests.length, 2);
+  assert.equal(spendRequests[0].authorizationTxHash, approvalHash);
+  assert.deepEqual(spendRequests[1], spendRequests[0], 'same-intent retry preserves the original approval evidence');
+});
+
+test('claims one custodial approval before a deferred wallet response and preserves its hash across a stale owner', async () => {
+  const approvalHash = `0x${'c'.repeat(64)}`;
+  const walletAddress = '0x0000000000000000000000000000000000000001';
+  const pendingWalletResponse = deferred();
+  const approvalIntents = [];
+  const reservations = [];
+  let approvalSendCalls = 0;
+  let spendCalls = 0;
+  let current = {
+    apiBaseUrl: 'http://local.test/api',
+    contractId: 'emaid-1',
+    sessionId: 'session-1',
+    providerId: 'provider-1',
+    walletAddress,
+  };
+
+  globalThis.window = {
+    ethereum: {
+      request: async ({ method, params = [] }) => {
+        if (method === 'eth_sendTransaction') {
+          approvalSendCalls += 1;
+          return pendingWalletResponse.promise;
+        }
+        if (method === 'eth_chainId') return '0x13882';
+        if (method === 'eth_blockNumber') return '0x10';
+        if (method === 'eth_getTransactionReceipt') return approvalReceipt(params[0], walletAddress);
+        throw new Error(`Unexpected wallet RPC ${method}`);
+      },
+    },
+  };
+  globalThis.fetch = async (url, init = {}) => {
+    const path = String(url);
+    if (path.endsWith('/wallet/me')) {
+      return response({ ...wallet(current.contractId, 'custodial'), walletAddress: current.walletAddress, managedWalletAddress: current.walletAddress });
+    }
+    if (path.endsWith('/spend/session')) return response(session(current.contractId, current.sessionId, current.providerId));
+    if (path.endsWith('/spend/reservation-approval-intent')) {
+      approvalIntents.push(JSON.parse(init.body || '{}'));
+      return response({
+        status: 'requires_signature',
+        walletAddress: current.walletAddress,
+        requiredAllowance: '1.00',
+        transaction: {
+          from: current.walletAddress,
+          to: '0x0000000000000000000000000000000000000002',
+          value: '0x0',
+          data: '0x',
+        },
+      });
+    }
+    if (path.endsWith('/spend/me')) {
+      spendCalls += 1;
+      return response({
+        status: 'success',
+        reservation: { id: 'stale-boundary-reservation', status: 'reserved', amount: '1.00', kWhEntitlement: '1.00', availableBalance: 9 },
+      });
+    }
+    if (path.endsWith('/spend/reservations/stale-boundary-reservation')) return response(settlement({ reservationId: 'stale-boundary-reservation', status: 'settling', txHash: null, spendReceipt: null, receiptStatus: 'pending' }));
+    throw new Error(`Unexpected request ${path}`);
+  };
+
+  const renderer = await renderCard({
+    ...current,
+    sessionStatus: 'PLUGGED_IN',
+    hideAfterSpend: false,
+    onReservationSuccess: value => reservations.push(value.id),
+  });
+  const form = renderer.root.findByType('form');
+  let firstSubmit;
+  await act(async () => {
+    firstSubmit = form.props.onSubmit({ preventDefault() {} });
+    await flush();
+  });
+  assert.equal(approvalSendCalls, 1, 'the first submission reaches the wallet once');
+  assert.equal(approvalIntents.length, 1);
+
+  let concurrentSubmit;
+  await act(async () => {
+    concurrentSubmit = renderer.root.findByType('form').props.onSubmit({ preventDefault() {} });
+    await Promise.resolve();
+  });
+  assert.equal(approvalSendCalls, 1, 'a concurrent same-intent submit awaits the claimed approval');
+  assert.equal(approvalIntents.length, 1, 'a concurrent same-intent submit does not fetch a second approval intent');
+
+  await updateCard(renderer, {
+    apiBaseUrl: 'http://local.test/api',
+    contractId: 'emaid-2',
+    sessionId: undefined,
+    providerId: undefined,
+    sessionStatus: 'UNPLUGGED',
+  });
+  await act(async () => {
+    pendingWalletResponse.resolve(approvalHash);
+    await Promise.all([firstSubmit, concurrentSubmit]);
+  });
+  assert.equal(approvalSendCalls, 1, 'the accepted hash survives the stale owner transition');
+  assert.equal(spendCalls, 0, 'stale submissions do not create a reservation under the new owner');
+
+  current = {
+    apiBaseUrl: 'http://local.test/api',
+    contractId: 'emaid-1',
+    sessionId: 'session-1',
+    providerId: 'provider-1',
+    walletAddress,
+  };
+  await updateCard(renderer, {
+    ...current,
+    sessionStatus: 'PLUGGED_IN',
+    hideAfterSpend: false,
+    onReservationSuccess: value => reservations.push(value.id),
+  });
+  await act(async () => {
+    await renderer.root.findByType('form').props.onSubmit({ preventDefault() {} });
+  });
+  assert.equal(approvalSendCalls, 1, 'returning to the original intent reuses the saved hash');
+  assert.equal(approvalIntents.length, 1);
+  assert.equal(spendCalls, 1);
+  assert.deepEqual(reservations, ['stale-boundary-reservation']);
+});
+
+test('fails closed after an unknown custodial approval response instead of signing again', async () => {
+  const walletAddress = '0x0000000000000000000000000000000000000001';
+  const approvalIntents = [];
+  const spendRequests = [];
+  const spendErrors = [];
+  let approvalSendCalls = 0;
+
+  globalThis.window = {
+    ethereum: {
+      request: async ({ method }) => {
+        if (method === 'eth_sendTransaction') {
+          approvalSendCalls += 1;
+          throw new Error('wallet response lost after approval submission');
+        }
+        return '0x13882';
+      },
+    },
+  };
+  globalThis.fetch = async (url, init = {}) => {
+    const path = String(url);
+    if (path.endsWith('/wallet/me')) {
+      return response({ ...wallet('emaid-1', 'custodial'), walletAddress, managedWalletAddress: walletAddress });
+    }
+    if (path.endsWith('/spend/session')) return response(session('emaid-1', 'session-1', 'provider-1'));
+    if (path.endsWith('/spend/reservation-approval-intent')) {
+      approvalIntents.push(JSON.parse(init.body || '{}'));
+      return response({
+        status: 'requires_signature',
+        walletAddress,
+        requiredAllowance: '1.00',
+        transaction: {
+          from: walletAddress,
+          to: '0x0000000000000000000000000000000000000002',
+          value: '0x0',
+          data: '0x',
+        },
+      });
+    }
+    if (path.endsWith('/spend/me')) {
+      spendRequests.push(JSON.parse(init.body || '{}'));
+      return response({ status: 'success', reservation: { id: 'unexpected', status: 'reserved', amount: '1.00', kWhEntitlement: '1.00', availableBalance: 9 } });
+    }
+    throw new Error(`Unexpected request ${path}`);
+  };
+
+  const renderer = await renderCard({
+    apiBaseUrl: 'http://local.test/api',
+    contractId: 'emaid-1',
+    sessionId: 'session-1',
+    providerId: 'provider-1',
+    sessionStatus: 'PLUGGED_IN',
+    hideAfterSpend: false,
+    onSpendError: error => spendErrors.push(error),
+  });
+  let form = renderer.root.findByType('form');
+  await act(async () => {
+    await form.props.onSubmit({ preventDefault() {} });
+  });
+  form = renderer.root.findByType('form');
+  await act(async () => {
+    await form.props.onSubmit({ preventDefault() {} });
+  });
+
+  assert.equal(approvalIntents.length, 1, 'the unknown approval is not replaced with a second intent');
+  assert.equal(approvalSendCalls, 1, 'the wallet is never asked to sign the ambiguous approval twice');
+  assert.equal(spendRequests.length, 0, 'the spend is not submitted without confirmed approval evidence');
+  assert.equal(spendErrors.length, 2);
+  assert.equal(spendErrors[0].code, 'CUSTODIAL_APPROVAL_OUTCOME_UNKNOWN');
+  assert.equal(spendErrors[0].requiresReview, true);
+  assert.equal(spendErrors[1].code, 'CUSTODIAL_APPROVAL_OUTCOME_UNKNOWN');
+});
+
+test('keeps an explicit wallet rejection retryable without treating it as an unknown approval', async () => {
+  const approvalHash = `0x${'d'.repeat(64)}`;
+  const walletAddress = '0x0000000000000000000000000000000000000001';
+  const approvalIntents = [];
+  const spendRequests = [];
+  const spendErrors = [];
+  let approvalSendCalls = 0;
+  globalThis.window = {
+    ethereum: {
+      request: async ({ method, params = [] }) => {
+        if (method === 'eth_sendTransaction') {
+          approvalSendCalls += 1;
+          if (approvalSendCalls === 1) {
+            throw Object.assign(new Error('User rejected the request.'), { code: 4001, name: 'UserRejectedRequestError' });
+          }
+          return approvalHash;
+        }
+        if (method === 'eth_chainId') return '0x13882';
+        if (method === 'eth_blockNumber') return '0x10';
+        if (method === 'eth_getTransactionReceipt') return approvalReceipt(params[0], walletAddress);
+        throw new Error(`Unexpected wallet RPC ${method}`);
+      },
+    },
+  };
+  globalThis.fetch = async (url, init = {}) => {
+    const path = String(url);
+    if (path.endsWith('/wallet/me')) return response({ ...wallet('emaid-1', 'custodial'), walletAddress, managedWalletAddress: walletAddress });
+    if (path.endsWith('/spend/session')) return response(session('emaid-1', 'session-1', 'provider-1'));
+    if (path.endsWith('/spend/reservation-approval-intent')) {
+      approvalIntents.push(JSON.parse(init.body || '{}'));
+      return response({
+        status: 'requires_signature',
+        walletAddress,
+        requiredAllowance: '1.00',
+        transaction: { from: walletAddress, to: '0x0000000000000000000000000000000000000002', value: '0x0', data: '0x' },
+      });
+    }
+    if (path.endsWith('/spend/me')) {
+      spendRequests.push(JSON.parse(init.body || '{}'));
+      return response({ status: 'success', reservation: { id: 'rejected-then-retried', status: 'reserved', amount: '1.00', kWhEntitlement: '1.00', availableBalance: 9 } });
+    }
+    if (path.endsWith('/spend/reservations/rejected-then-retried')) return response(settlement({ reservationId: 'rejected-then-retried', status: 'settling', txHash: null, spendReceipt: null, receiptStatus: 'pending' }));
+    throw new Error(`Unexpected request ${path}`);
+  };
+
+  const renderer = await renderCard({
+    apiBaseUrl: 'http://local.test/api',
+    contractId: 'emaid-1',
+    sessionId: 'session-1',
+    providerId: 'provider-1',
+    sessionStatus: 'PLUGGED_IN',
+    hideAfterSpend: false,
+    onSpendError: error => spendErrors.push(error),
+  });
+  await act(async () => {
+    await renderer.root.findByType('form').props.onSubmit({ preventDefault() {} });
+  });
+  await act(async () => {
+    await renderer.root.findByType('form').props.onSubmit({ preventDefault() {} });
+  });
+
+  assert.equal(approvalSendCalls, 2);
+  assert.equal(approvalIntents.length, 2);
+  assert.equal(spendErrors.length, 1);
+  assert.equal(spendErrors[0].code, 4001);
+  assert.equal(spendRequests.length, 1);
+  assert.equal(spendRequests[0].authorizationTxHash, approvalHash);
+});
+
+test('does not reuse custodial approval evidence across owner, endpoint, session, provider, wallet, or amount changes', async () => {
+  const firstHash = `0x${'1'.repeat(64)}`;
+  const secondHash = `0x${'2'.repeat(64)}`;
+  const firstWallet = '0x0000000000000000000000000000000000000001';
+  const secondWallet = '0x0000000000000000000000000000000000000002';
+  const approvalIntents = [];
+  const spendRequests = [];
+  let approvalSendCalls = 0;
+  let owner = { apiBaseUrl: 'http://local.test/api', contractId: 'emaid-1', sessionId: 'session-1', providerId: 'provider-1', walletAddress: firstWallet };
+  let spendCall = 0;
+
+  globalThis.window = {
+    ethereum: {
+      request: async ({ method, params = [] }) => {
+        if (method === 'eth_sendTransaction') {
+          approvalSendCalls += 1;
+          return approvalSendCalls === 1 ? firstHash : secondHash;
+        }
+        if (method === 'eth_chainId') return '0x13882';
+        if (method === 'eth_blockNumber') return '0x10';
+        if (method === 'eth_getTransactionReceipt') {
+          const hash = params[0] === firstHash ? firstHash : secondHash;
+          return approvalReceipt(hash, hash === firstHash ? firstWallet : secondWallet);
+        }
+        throw new Error(`Unexpected wallet RPC ${method}`);
+      },
+    },
+  };
+  globalThis.fetch = async (url, init = {}) => {
+    const path = String(url);
+    if (path.endsWith('/wallet/me')) {
+      return response({ ...wallet(owner.contractId, 'custodial'), walletAddress: owner.walletAddress, managedWalletAddress: owner.walletAddress });
+    }
+    if (path.endsWith('/spend/session')) return response(session(owner.contractId, owner.sessionId, owner.providerId));
+    if (path.endsWith('/spend/reservation-approval-intent')) {
+      approvalIntents.push(JSON.parse(init.body || '{}'));
+      return response({
+        status: 'requires_signature',
+        walletAddress: owner.walletAddress,
+        requiredAllowance: '2.00',
+        transaction: {
+          from: owner.walletAddress,
+          to: '0x0000000000000000000000000000000000000003',
+          value: '0x0',
+          data: '0x',
+        },
+      });
+    }
+    if (path.endsWith('/spend/me')) {
+      spendRequests.push(JSON.parse(init.body || '{}'));
+      spendCall += 1;
+      if (spendCall === 1) return response({ status: 'pending', pending: true, message: 'pending' }, 202);
+      return response({
+        status: 'success',
+        reservation: { id: 'boundary-reservation', status: 'reserved', amount: '2.00', kWhEntitlement: '2.00', availableBalance: 8 },
+      });
+    }
+    if (path.endsWith('/spend/reservations/boundary-reservation')) return response(settlement({ reservationId: 'boundary-reservation', status: 'settling', txHash: null, spendReceipt: null, receiptStatus: 'pending' }));
+    throw new Error(`Unexpected request ${path}`);
+  };
+
+  const initialProps = {
+    ...owner,
+    sessionStatus: 'PLUGGED_IN',
+    hideAfterSpend: false,
+  };
+  const renderer = await renderCard(initialProps);
+  let form = renderer.root.findByType('form');
+  await act(async () => {
+    await form.props.onSubmit({ preventDefault() {} });
+  });
+  assert.equal(approvalSendCalls, 1);
+
+  owner = { apiBaseUrl: 'http://other.test/api', contractId: 'emaid-2', sessionId: 'session-2', providerId: 'provider-2', walletAddress: secondWallet };
+  await updateCard(renderer, { ...owner, sessionStatus: 'PLUGGED_IN', hideAfterSpend: false });
+  const amountInput = renderer.root.findByType('input');
+  await act(async () => {
+    amountInput.props.onChange({ target: { value: '2' } });
+    await flush();
+  });
+  form = renderer.root.findByType('form');
+  await act(async () => {
+    await form.props.onSubmit({ preventDefault() {} });
+  });
+
+  assert.equal(approvalSendCalls, 2, 'changed intent signs a new approval');
+  assert.equal(approvalIntents.length, 2);
+  assert.equal(approvalIntents[0].walletAddress, firstWallet);
+  assert.equal(approvalIntents[1].walletAddress, secondWallet);
+  assert.equal(approvalIntents[0].amount, 1);
+  assert.equal(approvalIntents[1].amount, 2);
+  assert.equal(spendRequests.length, 2);
+  assert.equal(spendRequests[0].authorizationTxHash, firstHash);
+  assert.equal(spendRequests[1].authorizationTxHash, secondHash);
+});
+
+test('requests a new custodial approval when only the amount changes', async () => {
+  const firstHash = `0x${'3'.repeat(64)}`;
+  const secondHash = `0x${'4'.repeat(64)}`;
+  const walletAddress = '0x0000000000000000000000000000000000000001';
+  const approvalIntents = [];
+  const spendRequests = [];
+  let approvalSendCalls = 0;
+  let spendCall = 0;
+  globalThis.window = {
+    ethereum: {
+      request: async ({ method, params = [] }) => {
+        if (method === 'eth_sendTransaction') {
+          approvalSendCalls += 1;
+          return approvalSendCalls === 1 ? firstHash : secondHash;
+        }
+        if (method === 'eth_chainId') return '0x13882';
+        if (method === 'eth_blockNumber') return '0x10';
+        if (method === 'eth_getTransactionReceipt') return approvalReceipt(params[0], walletAddress);
+        throw new Error(`Unexpected wallet RPC ${method}`);
+      },
+    },
+  };
+  globalThis.fetch = async (url, init = {}) => {
+    const path = String(url);
+    if (path.endsWith('/wallet/me')) return response({ ...wallet('emaid-1', 'custodial'), walletAddress, managedWalletAddress: walletAddress });
+    if (path.endsWith('/spend/session')) return response(session('emaid-1', 'session-1', 'provider-1'));
+    if (path.endsWith('/spend/reservation-approval-intent')) {
+      approvalIntents.push(JSON.parse(init.body || '{}'));
+      return response({
+        status: 'requires_signature',
+        walletAddress,
+        requiredAllowance: '2.00',
+        transaction: { from: walletAddress, to: '0x0000000000000000000000000000000000000002', value: '0x0', data: '0x' },
+      });
+    }
+    if (path.endsWith('/spend/me')) {
+      spendRequests.push(JSON.parse(init.body || '{}'));
+      spendCall += 1;
+      return spendCall === 1
+        ? response({ status: 'pending', pending: true, message: 'pending amount' }, 202)
+        : response({ status: 'success', reservation: { id: 'amount-boundary', status: 'reserved', amount: '2.00', kWhEntitlement: '2.00', availableBalance: 8 } });
+    }
+    if (path.endsWith('/spend/reservations/amount-boundary')) return response(settlement({ reservationId: 'amount-boundary', status: 'settling', txHash: null, spendReceipt: null, receiptStatus: 'pending' }));
+    throw new Error(`Unexpected request ${path}`);
+  };
+
+  const renderer = await renderCard({
+    apiBaseUrl: 'http://local.test/api',
+    contractId: 'emaid-1',
+    sessionId: 'session-1',
+    providerId: 'provider-1',
+    sessionStatus: 'PLUGGED_IN',
+    hideAfterSpend: false,
+  });
+  await act(async () => {
+    await renderer.root.findByType('form').props.onSubmit({ preventDefault() {} });
+  });
+  const amountInput = renderer.root.findByType('input');
+  await act(async () => {
+    amountInput.props.onChange({ target: { value: '2' } });
+  });
+  await act(async () => {
+    await renderer.root.findByType('form').props.onSubmit({ preventDefault() {} });
+  });
+
+  assert.equal(approvalSendCalls, 2);
+  assert.equal(approvalIntents.length, 2);
+  assert.equal(approvalIntents[0].amount, 1);
+  assert.equal(approvalIntents[1].amount, 2);
+  assert.equal(spendRequests[0].authorizationTxHash, firstHash);
+  assert.equal(spendRequests[1].authorizationTxHash, secondHash);
+});
+
+test('requests a new custodial approval when only the session and provider change', async () => {
+  const firstHash = `0x${'5'.repeat(64)}`;
+  const secondHash = `0x${'6'.repeat(64)}`;
+  const walletAddress = '0x0000000000000000000000000000000000000001';
+  const approvalIntents = [];
+  const spendRequests = [];
+  let approvalSendCalls = 0;
+  let spendCall = 0;
+  let activeSession = { sessionId: 'session-1', providerId: 'provider-1' };
+  globalThis.window = {
+    ethereum: {
+      request: async ({ method, params = [] }) => {
+        if (method === 'eth_sendTransaction') {
+          approvalSendCalls += 1;
+          return approvalSendCalls === 1 ? firstHash : secondHash;
+        }
+        if (method === 'eth_chainId') return '0x13882';
+        if (method === 'eth_blockNumber') return '0x10';
+        if (method === 'eth_getTransactionReceipt') return approvalReceipt(params[0], walletAddress);
+        throw new Error(`Unexpected wallet RPC ${method}`);
+      },
+    },
+  };
+  globalThis.fetch = async (url, init = {}) => {
+    const path = String(url);
+    if (path.endsWith('/wallet/me')) return response({ ...wallet('emaid-1', 'custodial'), walletAddress, managedWalletAddress: walletAddress });
+    if (path.endsWith('/spend/session')) return response(session('emaid-1', activeSession.sessionId, activeSession.providerId));
+    if (path.endsWith('/spend/reservation-approval-intent')) {
+      approvalIntents.push(JSON.parse(init.body || '{}'));
+      return response({
+        status: 'requires_signature',
+        walletAddress,
+        requiredAllowance: '1.00',
+        transaction: { from: walletAddress, to: '0x0000000000000000000000000000000000000002', value: '0x0', data: '0x' },
+      });
+    }
+    if (path.endsWith('/spend/me')) {
+      spendRequests.push(JSON.parse(init.body || '{}'));
+      spendCall += 1;
+      return spendCall === 1
+        ? response({ status: 'pending', pending: true, message: 'pending session' }, 202)
+        : response({ status: 'success', reservation: { id: 'session-boundary', status: 'reserved', amount: '1.00', kWhEntitlement: '1.00', availableBalance: 9 } });
+    }
+    if (path.endsWith('/spend/reservations/session-boundary')) return response(settlement({ reservationId: 'session-boundary', status: 'settling', txHash: null, spendReceipt: null, receiptStatus: 'pending' }));
+    throw new Error(`Unexpected request ${path}`);
+  };
+
+  const baseProps = {
+    apiBaseUrl: 'http://local.test/api',
+    contractId: 'emaid-1',
+    sessionId: 'session-1',
+    providerId: 'provider-1',
+    sessionStatus: 'PLUGGED_IN',
+    hideAfterSpend: false,
+  };
+  const renderer = await renderCard(baseProps);
+  await act(async () => {
+    await renderer.root.findByType('form').props.onSubmit({ preventDefault() {} });
+  });
+  activeSession = { sessionId: 'session-2', providerId: 'provider-2' };
+  await updateCard(renderer, { ...baseProps, ...activeSession });
+  await act(async () => {
+    await renderer.root.findByType('form').props.onSubmit({ preventDefault() {} });
+  });
+
+  assert.equal(approvalSendCalls, 2);
+  assert.equal(approvalIntents.length, 2);
+  assert.equal(spendRequests[0].sessionId, 'session-1');
+  assert.equal(spendRequests[0].providerId, 'provider-1');
+  assert.equal(spendRequests[1].sessionId, 'session-2');
+  assert.equal(spendRequests[1].providerId, 'provider-2');
+  assert.equal(spendRequests[0].authorizationTxHash, firstHash);
+  assert.equal(spendRequests[1].authorizationTxHash, secondHash);
 });
