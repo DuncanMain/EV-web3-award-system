@@ -55,11 +55,21 @@ acceptance, provider health, partner delivery, or financial-chain evidence.
 ## Data and runtime boundary
 
 The Dockerfile entrypoint runs the checked-in migration chain before the API
-listens, including active-wallet migration 022 and transaction-reliability
+listens, including active-wallet migration 022, the additive
+`024_add_admin_alert_settings` migration, after transaction-reliability
 migration 023. The target backup is taken before the new app is launched; it is
 not a license to restore over the target or edit financial rows. Preserve the
 existing eMAID, wallet, balance, award, spend, receipt, reservation, operation,
 signer, chain, and token identities.
+
+Alert recipient and channel settings are stored in `admin_alert_settings`.
+`SENDGRID_API_KEY` and `ADMIN_ALERT_EMAIL_FROM` remain environment-only
+deployment secrets; the admin API exposes provider configuration state without
+returning either secret. A SendGrid HTTP 202 means provider acceptance and is
+not inbox-delivery proof. Existing generic webhook delivery remains available
+through the channel setting and `ADMIN_ALERT_WEBHOOK_URL`. A legacy webhook
+remains the default when present; selecting `both` reports incomplete
+configuration until both providers are available.
 
 The RPC fallback documented in API.md is same-chain and bounded. Raw-send
 failover may retry only identical already-signed bytes and retains the original

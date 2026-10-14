@@ -9,9 +9,11 @@ export type {
 } from './types';
 export {
   apiUrl,
+  classifyWalletQueryError,
   isTerminalReservationSettlement,
   matchesReservationContext,
   normalizeApiBaseUrl,
   sessionScopeKey,
 } from './chargingCardContract';
+export type { SparkzWalletQueryErrorClassification } from './chargingCardContract';
 import './styles.css';

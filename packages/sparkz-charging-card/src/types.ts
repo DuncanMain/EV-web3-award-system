@@ -39,7 +39,8 @@ export type SparkzWalletResponse = {
   managedWalletAddress: string;
   walletMode: SparkzWalletMode;
   isRegistered: boolean;
-  balance: string;
+  balance: string | null;
+  balanceStatus?: 'available' | 'unavailable' | string;
   totalAwarded: string;
   totalSpent: string;
   treasuryAddress?: string | null;

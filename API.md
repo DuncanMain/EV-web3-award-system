@@ -152,6 +152,8 @@ the contract inventory used by the local matrix.
 | GET | `/admin/audit` | Admin bearer | Safe allowlisted operational audit events. |
 | GET | `/admin/pilot-metrics` | Admin bearer | Audit-derived pilot metrics. |
 | GET | `/admin/readiness` | Admin bearer | Readiness checks and warnings. |
+| GET | `/admin/alerts/settings` | Admin bearer | Read the owner-controlled alert recipient, channel, and safe provider status. |
+| PATCH | `/admin/alerts/settings` | Admin bearer | Update `recipientEmail` and/or `channel`; provider credentials remain server-side. |
 | POST | `/admin/alerts/test` | Admin bearer | Exercise configured alert delivery and record result. |
 | GET | `/admin/evidence-pack` | Admin bearer | Export a point-in-time evidence snapshot. |
 | POST | `/admin/reconciliation/run` | Admin bearer | Run DB-versus-chain reconciliation. |
@@ -419,14 +421,24 @@ wallet payload: legacy `uid` alias, wallet/managed addresses, wallet mode,
 linked wallets, contract IDs, balances and balance status/source, totals, recent
 history, token/treasury addresses, and a safe message. A chain balance that is
 temporarily unavailable is reported as unavailable; it is not silently shown as
-zero. It performs no token movement, but a first lookup may provision or
-refresh the durable wallet/user record.
+zero. The read performs no token movement, signing, approval, or durable wallet
+mutation; it may refresh the in-memory address registry.
+
+The optional `walletAddress` query is validated for scalar shape and Ethereum
+syntax before any wallet, user, or chain read. Omit it to read the active wallet.
+A malformed or non-scalar value returns `400` with code
+`INVALID_WALLET_ADDRESS`. A syntactically valid override requires the linked
+wallet/user lookup before the service can return `403` with code
+`WALLET_NOT_LINKED`; balance and history reads occur only after that ownership
+check. A dependency failure still returns the generic `500`
+`WALLET_QUERY_UNAVAILABLE` response. The same validation applies to the enabled
+legacy `GET /wallet/:uid` lookup.
 
 `GET /wallet/:uid` is the legacy/manual lookup and is subject to
 `ENABLE_TEST_UID_LOOKUP`. It uses the path value as an eMAID compatibility
-value, not as an arbitrary user UID. A first lookup may provision or refresh a
-durable wallet/user record but does not move tokens. Disable this branch for a
-locked-down deployment and prefer `/wallet/me`.
+value, not as an arbitrary user UID. It does not create a durable wallet/user
+record or move tokens. Disable this branch for a locked-down deployment and
+prefer `/wallet/me`.
 
 The wallet mutation routes are:
 
@@ -518,15 +530,29 @@ returns `404` when it is absent. Writes are revisioned and durable.
 - `GET /admin/readiness` returns `ready`, `ready_with_warnings`, or
   `not_ready`, counts, and checks. A `ready` response has zero failed and
   warning checks; `ready_with_warnings` has at least one matching warning and
-  no failed checks. Missing `API_KEY` or alert webhook configuration can be
-  warnings while the target is being reviewed. CDR ingestion accepts the
+  no failed checks. Missing `API_KEY` or selected alert-channel provider
+  configuration can be warnings while the target is being reviewed. CDR ingestion accepts the
   configured dedicated `INGEST_API_KEY` when present and otherwise uses the
   existing `API_KEY`/`BEIA_API_KEY` resolver; it fails readiness only when no
   usable API key exists. Admin credentials, token/signer configuration, or
   durable persistence checks remain failures when their paths are enabled.
 - `POST /admin/alerts/test` returns `202` for sent/queued or audited skipped
-  delivery, and `502` when an attempted alert delivery fails. The response
-  reflects the delivery result, not merely configuration presence.
+  delivery, `502` when an attempted alert delivery fails, and `503` when the
+  persisted alert settings cannot be read. The response reflects the delivery
+  result, not merely configuration presence. It also returns
+  `providerAccepted`; a provider acceptance does not prove inbox delivery.
+  No legacy recipient or webhook is used when persisted settings are
+  unavailable.
+- `GET /admin/alerts/settings` returns the owner-controlled `recipientEmail`,
+  selected `channel` (`email`, `webhook`, `both`, or `disabled`), and safe
+  provider status. `delivery.configurationIssue` is
+  `selected_channel_provider_incomplete` when `both` is selected but one
+  provider is unavailable; that state may produce partial delivery and is
+  reported as a readiness warning. `PATCH /admin/alerts/settings` accepts only
+  `recipientEmail` and/or `channel`; provider keys and sender credentials are
+  environment-only. Set the deployment-specific owner destination in the
+  admin panel and use the email channel after the provider sender/key are
+  configured.
 - `GET /admin/evidence-pack` returns a point-in-time readiness, configuration,
   reconciliation, metrics, retry/warning/error, requires-review, and alert
   evidence snapshot. The `audit.reviewRequired` list uses the same sanitized
@@ -569,13 +595,23 @@ transfer, accepts caller amount/eMAID/hash/CDR overrides, or settles a
 reservation without the saved context supported by the operation. Unknown or
 hashless operations, missing/invalid award snapshots, mismatched assets,
 fingerprints, owners, receipts, or unsupported reservation states remain
-blocked with a review-required result.
+blocked with a review-required result. Lifecycle responses include the saved
+`operationKey`, `operationType`, `eMAID`, numeric `amount`,
+`transactionHash`, `projectionStatus`, `receiptStatus`, `movementOutcome`, and
+`noReplacementTransfer` when the saved operation is available. A completed
+response uses `recoveryStatus: "completed"`; pending, blocked, and failed
+responses use `pending`, `blocked`, or `error` respectively and carry the
+stable `code`, retryability, and review flags.
 
 Typical statuses are `200` for completed or already-completed projection, `202`
-for pending evidence/receipt, `409` for a blocked review result, `400` for a
-malformed body/key, and `401` for missing/invalid admin authentication. Every
-request is audited before mutation; an audit persistence failure is reported as
-an audit failure rather than falsely claiming an unaudited success.
+for pending evidence/receipt, `409` for a blocked review result, `404` when the
+operation key is unknown, `422` when saved evidence cannot be recovered safely,
+`400` for a malformed body/key, `401` for missing/invalid admin authentication,
+and `503` when lookup or outcome auditing is unavailable. These lifecycle error
+responses use the structured recovery response shape rather than the generic
+`ErrorResponse`. Every request is audited before mutation; an audit persistence
+failure is reported as an audit failure rather than falsely claiming an
+unaudited success.
 
 ## 7. Errors and safe retries
 

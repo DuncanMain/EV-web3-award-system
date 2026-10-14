@@ -1,7 +1,85 @@
 import http from 'http';
+import fs from 'fs';
+import path from 'path';
 import { ethers } from 'ethers';
 import { createSpendReceiptPayload, signSpendReceipt } from './receipt';
 import { spendIntentFingerprint, spendOperationKey } from './database/tokenOperation';
+
+// These are the operations that must remain present. The parity assertion
+// derives the full expected set from the current source, so additive routes
+// (including mounted admin settings routers) are picked up automatically.
+const REQUIRED_CORE_API_OPERATIONS = [
+  'GET /admin/audit',
+  'GET /admin/evidence-pack',
+  'GET /admin/off-peak',
+  'GET /admin/operations',
+  'GET /admin/pilot-metrics',
+  'GET /admin/readiness',
+  'GET /admin/reconciliation',
+  'GET /admin/rules',
+  'GET /ingest/health',
+  'GET /spend/reservations/{reservationId}',
+  'GET /transactions',
+  'GET /wallet/me',
+  'GET /wallet/{uid}',
+  'PATCH /wallet/{uid}/linked-wallets/{walletAddress}/profile',
+  'PATCH /wallet/{uid}/profile',
+  'POST /admin/alerts/test',
+  'POST /admin/login',
+  'POST /admin/logout',
+  'POST /admin/operations/recover',
+  'POST /admin/reconciliation/run',
+  'POST /ingest/cdr',
+  'POST /ingest/cdr/preview',
+  'POST /spend',
+  'POST /spend/custodial-failure',
+  'POST /spend/custodial-intent',
+  'POST /spend/custodial-record',
+  'POST /spend/me',
+  'POST /spend/reservation-approval-intent',
+  'POST /spend/session',
+  'POST /spend-receipts/verify',
+  'POST /wallet/{uid}/contract-ids',
+  'POST /wallet/{uid}/linked-wallets',
+  'POST /wallet/{uid}/mode',
+  'POST /wallet/{uid}/move-funds',
+  'PUT /admin/off-peak',
+  'PUT /admin/rules',
+  'DELETE /admin/off-peak/{countryCode}',
+  'DELETE /wallet/{uid}/linked-wallets/{walletAddress}',
+] as const;
+
+function normaliseInventoryRoute(route: string): string {
+  return route.replace(/:([A-Za-z0-9_]+)/g, '{$1}');
+}
+
+function joinMountedInventoryRoute(mount: string, child: string): string {
+  const normalizedMount = mount.replace(/\/$/, '') || '/';
+  return normaliseInventoryRoute(`${normalizedMount}${child === '/' ? '' : child}` || '/');
+}
+
+function routeInventory(source: string, receiver: 'app' | 'router'): string[] {
+  return [...source.matchAll(new RegExp(`${receiver}\\.(get|post|put|patch|delete)\\((['"])([^'"]+)\\2`, 'g'))]
+    .map(match => `${match[1].toUpperCase()} ${normaliseInventoryRoute(match[3])}`);
+}
+
+function mountedRouteInventory(apiSource: string): string[] {
+  const operations: string[] = [];
+  const mountPattern = /app\.use\(\s*(['"])(\/[^'"]+)\1[\s\S]{0,2000}?([A-Za-z_$][A-Za-z0-9_$]*Router)\s*\(/g;
+  for (const match of apiSource.matchAll(mountPattern)) {
+    const routerFactory = match[3];
+    const importMatch = apiSource.match(new RegExp(`import\\s+\\{[^}]*\\b${routerFactory}\\b[^}]*\\}\\s+from\\s+['"]([^'"]+)['"]`));
+    if (!importMatch) continue;
+    const modulePath = path.resolve(__dirname, importMatch[1].endsWith('.ts') ? importMatch[1] : `${importMatch[1]}.ts`);
+    if (!fs.existsSync(modulePath)) continue;
+    const routerSource = fs.readFileSync(modulePath, 'utf8');
+    for (const operation of routeInventory(routerSource, 'router')) {
+      const [method, child] = operation.split(' ');
+      operations.push(`${method} ${joinMountedInventoryRoute(match[2], child)}`);
+    }
+  }
+  return operations;
+}
 
 let mockIndexModule: Record<string, jest.Mock> | undefined;
 
@@ -141,6 +219,18 @@ jest.spyOn(ethers.JsonRpcProvider.prototype, 'call').mockResolvedValue(
 
 let mockServiceModule: Record<string, any> | undefined;
 
+let mockAdminAlertSettingsRow: {
+  id: number;
+  recipient_email: string;
+  channel: string;
+  updated_at: string;
+} | undefined = {
+  id: 1,
+  recipient_email: 'admin@example.com',
+  channel: 'webhook',
+  updated_at: '2026-10-14T00:00:00.000Z',
+};
+
 jest.mock('./database/service', () => {
   if (mockServiceModule) return mockServiceModule;
   mockServiceModule = {
@@ -205,9 +295,17 @@ jest.mock('./database/service', () => {
 });
 
 jest.mock('./database/connection', () => ({
-  getDatabase: jest.fn(() => ({
-    raw: jest.fn().mockResolvedValue([{ ok: 1 }]),
-  })),
+  getDatabase: jest.fn(() => {
+    const database = jest.fn((table: string) => ({
+      where: jest.fn().mockReturnValue({
+        first: jest.fn().mockResolvedValue(table === 'admin_alert_settings' ? mockAdminAlertSettingsRow : undefined),
+      }),
+    })) as jest.Mock & { raw: jest.Mock; transaction: jest.Mock; fn: { now: jest.Mock } };
+    database.raw = jest.fn().mockResolvedValue([{ ok: 1 }]);
+    database.transaction = jest.fn(async (handler: (trx: typeof database) => Promise<unknown>) => handler(database));
+    database.fn = { now: jest.fn(() => new Date()) };
+    return database;
+  }),
 }));
 
 jest.mock('./database/tokenOperationSchema', () => ({
@@ -316,6 +414,12 @@ describe('api integration contracts', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockAdminAlertSettingsRow = {
+      id: 1,
+      recipient_email: 'admin@example.com',
+      channel: 'webhook',
+      updated_at: '2026-10-14T00:00:00.000Z',
+    };
     resetMockPolicy();
     mockProviderTransactions.clear();
     mockProviderReceipts.clear();
@@ -504,6 +608,93 @@ describe('api integration contracts', () => {
         code: 'INVALID_CDR',
         message: 'evseId is required',
       });
+    expect(body.components.schemas.CustodialSpendIntentRequest.properties.amount)
+      .toMatchObject({ type: 'number', minimum: 0, exclusiveMinimum: true });
+    expect(body.components.schemas.AdminRecoveryResponse.properties).toEqual(expect.objectContaining({
+      transactionHash: expect.any(Object),
+      recoveryStatus: expect.any(Object),
+      projectionStatus: expect.any(Object),
+      receiptStatus: expect.any(Object),
+      movementOutcome: expect.any(Object),
+      noReplacementTransfer: expect.any(Object),
+      amount: expect.any(Object),
+    }));
+    expect(body.components.schemas.AdminAlertDeliveryStatus).toMatchObject({
+      required: expect.arrayContaining(['configurationIssue']),
+      properties: {
+        configurationIssue: {
+          type: 'string',
+          nullable: true,
+          enum: ['selected_channel_provider_incomplete'],
+        },
+      },
+    });
+    for (const status of ['404', '409', '422', '503']) {
+      expect(body.paths['/admin/operations/recover'].post.responses[status].content['application/json'].schema.$ref)
+        .toBe('#/components/schemas/AdminRecoveryResponse');
+    }
+    const invalidOpenApi30ExclusiveBounds: string[] = [];
+    const inspectOpenApi30Bounds = (value: unknown, location = '#'): void => {
+      if (Array.isArray(value)) {
+        value.forEach((child, index) => inspectOpenApi30Bounds(child, `${location}/${index}`));
+        return;
+      }
+      if (!value || typeof value !== 'object') return;
+      for (const [key, child] of Object.entries(value)) {
+        if ((key === 'exclusiveMinimum' || key === 'exclusiveMaximum') && typeof child !== 'boolean') {
+          invalidOpenApi30ExclusiveBounds.push(`${location}/${key}`);
+        }
+        inspectOpenApi30Bounds(child, `${location}/${key}`);
+      }
+    };
+    inspectOpenApi30Bounds(body);
+    expect(invalidOpenApi30ExclusiveBounds).toEqual([]);
+
+    const localReferences: string[] = [];
+    const collectReferences = (value: unknown): void => {
+      if (Array.isArray(value)) {
+        value.forEach(collectReferences);
+        return;
+      }
+      if (!value || typeof value !== 'object') return;
+      for (const [key, child] of Object.entries(value)) {
+        if (key === '$ref' && typeof child === 'string' && child.startsWith('#/')) {
+          localReferences.push(child);
+        } else {
+          collectReferences(child);
+        }
+      }
+    };
+    const resolveReference = (root: unknown, reference: string): unknown => {
+      return reference.slice(2).split('/').reduce<unknown>((current, segment) => {
+        if (!current || typeof current !== 'object') return undefined;
+        return (current as Record<string, unknown>)[segment.replace(/~1/g, '/').replace(/~0/g, '~')];
+      }, root);
+    };
+    collectReferences(body);
+    for (const reference of localReferences) {
+      expect(resolveReference(body, reference)).toBeDefined();
+    }
+  });
+
+  it('keeps the published OpenAPI operations aligned with the source inventory', async () => {
+    const source = fs.readFileSync(path.join(__dirname, 'api.ts'), 'utf8');
+    const sourceOperations = routeInventory(source, 'app')
+      .filter(operation => !operation.startsWith('GET /openapi.json') && operation !== 'GET *');
+    sourceOperations.push(...mountedRouteInventory(source));
+
+    const specRes = await fetch(`${baseUrl}/openapi.json`);
+    const spec = await specRes.json();
+    const specOperations = Object.entries(spec.paths as Record<string, Record<string, unknown>>)
+      .flatMap(([route, operations]) => Object.keys(operations)
+        .filter(method => ['get', 'post', 'put', 'patch', 'delete'].includes(method))
+        .map(method => `${method.toUpperCase()} ${route}`));
+
+    const expectedOperations = [...new Set(sourceOperations)].sort();
+    expect(expectedOperations.length).toBeGreaterThanOrEqual(REQUIRED_CORE_API_OPERATIONS.length);
+    expect(expectedOperations).toEqual(expect.arrayContaining(REQUIRED_CORE_API_OPERATIONS));
+    expect(new Set(specOperations)).toEqual(new Set(expectedOperations));
+    expect(specOperations).toHaveLength(expectedOperations.length);
   });
 
   it('uses the forwarded HTTPS scheme in the published server URL', async () => {
@@ -689,6 +880,62 @@ describe('api integration contracts', () => {
     expect(manualBody.message).toContain('/wallet/me');
   });
 
+  it('rejects malformed wallet address query values before wallet reads', async () => {
+    const { LinkedWallets, Users } = await import('./database/service');
+    (Users.findByUid as jest.Mock).mockClear();
+    (LinkedWallets.findByUid as jest.Mock).mockClear();
+
+    const malformed = await apiFetch('/wallet/me?walletAddress=not-an-address', {
+      headers: { 'x-contract-id': 'contract-wallet-validation' },
+    });
+    const repeated = await apiFetch('/wallet/me?walletAddress=0x1111111111111111111111111111111111111111&walletAddress=0x2222222222222222222222222222222222222222', {
+      headers: { 'x-contract-id': 'contract-wallet-validation' },
+    });
+    const objectValue = await apiFetch('/wallet/me?walletAddress%5Bvalue%5D=not-an-address', {
+      headers: { 'x-contract-id': 'contract-wallet-validation' },
+    });
+
+    expect(malformed.status).toBe(400);
+    expect(await malformed.json()).toMatchObject({
+      status: 'error',
+      code: 'INVALID_WALLET_ADDRESS',
+      message: 'walletAddress must be a valid Ethereum address',
+    });
+    expect(repeated.status).toBe(400);
+    expect(await repeated.json()).toMatchObject({
+      status: 'error',
+      code: 'INVALID_WALLET_ADDRESS',
+    });
+    expect(objectValue.status).toBe(400);
+    expect(await objectValue.json()).toMatchObject({
+      status: 'error',
+      code: 'INVALID_WALLET_ADDRESS',
+    });
+    expect(Users.findByUid).not.toHaveBeenCalled();
+    expect(LinkedWallets.findByUid).not.toHaveBeenCalled();
+  });
+
+  it('returns a caller error for an unlinked wallet query and still permits a linked address', async () => {
+    const unlinkedAddress = '0x2222222222222222222222222222222222222222';
+    const forbidden = await apiFetch(`/wallet/me?walletAddress=${unlinkedAddress}`, {
+      headers: { 'x-contract-id': 'contract-wallet-validation' },
+    });
+    const forbiddenBody = await forbidden.json();
+
+    expect(forbidden.status).toBe(403);
+    expect(forbiddenBody).toMatchObject({
+      status: 'error',
+      code: 'WALLET_NOT_LINKED',
+      message: 'Wallet address is not linked to this EMP contract',
+    });
+
+    const linked = await apiFetch(`/wallet/me?walletAddress=${encodeURIComponent(linkedWallet.address)}`, {
+      headers: { 'x-contract-id': 'contract-wallet-validation' },
+    });
+    expect(linked.status).toBe(200);
+    expect((await linked.json()).walletAddress).toBe(ethers.getAddress(linkedWallet.address));
+  });
+
   it('requires a stable identity before starting a managed-wallet transfer', async () => {
     const res = await apiFetch('/wallet/contract-wallet-move/move-funds', {
       method: 'POST',
@@ -847,6 +1094,19 @@ describe('api integration contracts', () => {
       },
     });
     expect(revokeAudit?.metadata?.diagnostic).not.toHaveProperty('savedHash');
+
+    // Review-required financial audit events must reach the admin-alert path;
+    // otherwise unresolved hashless operations can remain invisible to the
+    // operator even though their audit status is durable.
+    const reviewAlert = (AuditLogs.create as jest.Mock).mock.calls
+      .map(([event]) => event as { eventType?: string; status?: string; metadata?: Record<string, unknown> })
+      .find(event => event.eventType === 'admin_alert.delivery_skipped' || event.eventType === 'admin_alert.delivered');
+    expect(reviewAlert).toMatchObject({
+      metadata: {
+        sourceEventType: 'wallet.mode_allowance_revoke_failed',
+        sourceStatus: 'requires_review',
+      },
+    });
   });
 
   it('allows mode persistence without an optional allowance-revoke action key', async () => {
@@ -1363,6 +1623,187 @@ describe('api integration contracts', () => {
     expect(body.checks.some((check: { key: string }) => check.key === 'admin_email')).toBe(true);
     expect(body.checks.some((check: { key: string }) => check.key === 'database')).toBe(true);
     expect(body.checks.some((check: { key: string }) => check.key === 'reward_policy')).toBe(true);
+  });
+
+  it('bases readiness on the selected persisted alert channel and provider state', async () => {
+    const alertModule = await import('./adminAlerts');
+    const getConfiguration = jest.spyOn(alertModule, 'getAdminAlertConfiguration');
+    const configured: Awaited<ReturnType<typeof alertModule.getAdminAlertConfiguration>> = {
+      settings: { recipientEmail: 'alerts@example.test', channel: 'email', updatedAt: '2026-10-14T09:00:00.000Z' },
+      email: {
+        configured: true,
+        provider: 'sendgrid' as const,
+        apiKeyConfigured: true,
+        fromConfigured: true,
+        acceptedStatus: 202 as const,
+        acceptanceMeaning: 'provider_accepted' as const,
+      },
+      webhook: { configured: false },
+      canDeliver: true,
+      configurationIssue: null,
+      deliveryNote: 'provider_acceptance_is_not_inbox_delivery' as const,
+    };
+    const unconfigured = {
+      ...configured,
+      email: { ...configured.email, configured: false, apiKeyConfigured: false, fromConfigured: false },
+      canDeliver: false,
+    };
+    const partial = {
+      ...configured,
+      settings: { ...configured.settings, channel: 'both' as const },
+      webhook: { configured: false },
+      canDeliver: false,
+      configurationIssue: 'selected_channel_provider_incomplete' as const,
+    };
+    const token = await adminToken();
+
+    try {
+      getConfiguration
+        .mockResolvedValueOnce(configured)
+        .mockResolvedValueOnce(unconfigured)
+        .mockResolvedValueOnce(partial);
+
+      const configuredResponse = await apiFetch('/admin/readiness', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const configuredBody = await configuredResponse.json();
+      const configuredCheck = configuredBody.checks.find((check: { key: string }) => check.key === 'admin_alerts');
+      expect(configuredCheck).toMatchObject({ key: 'admin_alerts', status: 'pass' });
+      expect(configuredCheck.message).toContain('email alert provider configured');
+      expect(JSON.stringify(configuredBody)).not.toMatch(/SENDGRID_API_KEY|ADMIN_ALERT_EMAIL_FROM|provider-secret/i);
+
+      const unconfiguredResponse = await apiFetch('/admin/readiness', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const unconfiguredBody = await unconfiguredResponse.json();
+      const unconfiguredCheck = unconfiguredBody.checks.find((check: { key: string }) => check.key === 'admin_alerts');
+      expect(unconfiguredCheck).toMatchObject({ key: 'admin_alerts', status: 'warn' });
+      expect(unconfiguredCheck.message).toContain('email alert provider is not configured');
+      expect(JSON.stringify(unconfiguredBody)).not.toMatch(/SENDGRID_API_KEY|ADMIN_ALERT_EMAIL_FROM|provider-secret/i);
+
+      const partialResponse = await apiFetch('/admin/readiness', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const partialBody = await partialResponse.json();
+      const partialCheck = partialBody.checks.find((check: { key: string }) => check.key === 'admin_alerts');
+      expect(partialCheck).toMatchObject({ key: 'admin_alerts', status: 'warn' });
+      expect(partialCheck.message).toContain('partial delivery');
+      expect(partialCheck.message).toContain('both providers');
+      expect(partialCheck.message).not.toContain('alerts will be audited but not sent');
+    } finally {
+      getConfiguration.mockRestore();
+    }
+  });
+
+  it('uses the persisted alert recipient for test-alert targeting without exposing provider credentials', async () => {
+    const alertModule = await import('./adminAlerts');
+    const persistedConfiguration: Awaited<ReturnType<typeof alertModule.getAdminAlertConfiguration>> = {
+      settings: { recipientEmail: 'alerts@example.test', channel: 'email', updatedAt: '2026-10-14T09:00:00.000Z' },
+      email: {
+        configured: false,
+        provider: 'sendgrid',
+        apiKeyConfigured: false,
+        fromConfigured: false,
+        acceptedStatus: 202,
+        acceptanceMeaning: 'provider_accepted',
+      },
+      webhook: { configured: false },
+      canDeliver: false,
+      configurationIssue: null,
+      deliveryNote: 'provider_acceptance_is_not_inbox_delivery',
+    };
+    const getConfiguration = jest.spyOn(alertModule, 'getAdminAlertConfiguration').mockResolvedValue(persistedConfiguration);
+    const updateSettings = jest.spyOn(alertModule, 'updateAdminAlertSettings').mockResolvedValue(persistedConfiguration.settings);
+
+    try {
+      const token = await adminToken();
+      const settingsRes = await apiFetch('/admin/alerts/settings', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const settingsBody = await settingsRes.json();
+      expect(settingsRes.status).toBe(200);
+      expect(settingsBody).toMatchObject({
+        status: 'ok',
+        settings: { recipientEmail: 'alerts@example.test', channel: 'email' },
+        delivery: {
+          email: { configured: false, apiKeyConfigured: false, fromConfigured: false },
+          webhook: { configured: false },
+          canDeliver: false,
+          configurationIssue: null,
+        },
+      });
+      expect(JSON.stringify(settingsBody)).not.toMatch(/SENDGRID_API_KEY|ADMIN_ALERT_EMAIL_FROM|provider-secret/i);
+
+      const patchRes = await apiFetch('/admin/alerts/settings', {
+        method: 'PATCH',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ channel: 'email' }),
+      });
+      const patchBody = await patchRes.json();
+      expect(patchRes.status).toBe(200);
+      expect(patchBody.delivery).toMatchObject({ configurationIssue: null });
+      expect(JSON.stringify(patchBody)).not.toMatch(/SENDGRID_API_KEY|ADMIN_ALERT_EMAIL_FROM|provider-secret/i);
+
+      const res = await apiFetch('/admin/alerts/test', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const body = await res.json();
+      expect(res.status).toBe(202);
+      expect(body).toMatchObject({
+        status: 'delivery_skipped',
+        adminEmailConfigured: true,
+        webhookConfigured: false,
+      });
+      const requested = mockAuditLogs.create.mock.calls
+        .map(([event]) => event as { eventType?: string; targetId?: string })
+        .find(event => event.eventType === 'admin_alert.test_requested');
+      expect(requested).toMatchObject({ targetId: 'alerts@example.test' });
+      expect(JSON.stringify(body)).not.toMatch(/SENDGRID_API_KEY|ADMIN_ALERT_EMAIL_FROM|provider-secret/i);
+    } finally {
+      getConfiguration.mockRestore();
+      updateSettings.mockRestore();
+    }
+  });
+
+  it('does not fall back to a legacy recipient or webhook when alert settings are unavailable', async () => {
+    const previousWebhook = process.env.ADMIN_ALERT_WEBHOOK_URL;
+    const previousFetch = globalThis.fetch;
+    const externalFetch = jest.fn().mockRejectedValue(new Error('legacy webhook must not be called'));
+    mockAdminAlertSettingsRow = undefined;
+    process.env.ADMIN_ALERT_WEBHOOK_URL = 'https://alerts.example.test/legacy';
+    globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => (
+      typeof input === 'string' && input.startsWith(baseUrl)
+        ? previousFetch(input, init)
+        : externalFetch(input, init)
+    )) as typeof fetch;
+
+    try {
+      const token = await adminToken();
+      const res = await apiFetch('/admin/alerts/test', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const body = await res.json();
+
+      expect(res.status).toBe(503);
+      expect(body).toMatchObject({
+        status: 'delivery_skipped',
+        deliveryStatus: 'delivery_skipped',
+        deliveryReason: 'settings_unavailable',
+        adminEmailConfigured: false,
+        webhookConfigured: false,
+      });
+      expect(externalFetch).not.toHaveBeenCalled();
+      expect(mockAuditLogs.create).toHaveBeenCalledWith(expect.objectContaining({
+        eventType: 'admin_alert.delivery_skipped',
+        metadata: expect.objectContaining({ reason: 'settings_unavailable' }),
+      }));
+    } finally {
+      globalThis.fetch = previousFetch;
+      if (previousWebhook === undefined) delete process.env.ADMIN_ALERT_WEBHOOK_URL;
+      else process.env.ADMIN_ALERT_WEBHOOK_URL = previousWebhook;
+    }
   });
 
   it('protects the admin operations view and rejects legacy UID filters', async () => {
