@@ -165,6 +165,38 @@ class AutomaticWorkflowTests(unittest.TestCase):
         self.assertIn('pg_restore --list < "$backup_file"', self.deploy_script)
         self.assertNotIn("${GITHUB_SHA}", self.deploy_script)
 
+    def test_optional_alert_webhook_secret_preserves_existing_target_value_when_blank(self):
+        self.assertIn("ADMIN_ALERT_WEBHOOK_URL: ${{ secrets.ADMIN_ALERT_WEBHOOK_URL }}", self.workflow)
+        self.assertIn("ADMIN_ALERT_WEBHOOK_URL,SENDGRID_API_KEY", self.workflow)
+        self.assertIn("alert_webhook = os.environ.get('ADMIN_ALERT_WEBHOOK_URL', '').strip()", self.deploy_script)
+        self.assertIn("if alert_webhook:", self.deploy_script)
+        self.assertIn("updates['ADMIN_ALERT_WEBHOOK_URL'] = alert_webhook", self.deploy_script)
+
+    def test_optional_sendgrid_secrets_preserve_existing_target_values_when_blank(self):
+        self.assertIn("SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}", self.workflow)
+        self.assertIn("ADMIN_ALERT_EMAIL_FROM: ${{ secrets.ADMIN_ALERT_EMAIL_FROM }}", self.workflow)
+        self.assertIn("SENDGRID_API_KEY,ADMIN_ALERT_EMAIL_FROM,GHCR_USER", self.workflow)
+        self.assertIn("sendgrid_api_key = os.environ.get('SENDGRID_API_KEY', '').strip()", self.deploy_script)
+        self.assertIn("updates['SENDGRID_API_KEY'] = sendgrid_api_key", self.deploy_script)
+        self.assertIn("email_from = os.environ.get('ADMIN_ALERT_EMAIL_FROM', '').strip()", self.deploy_script)
+        self.assertIn("updates['ADMIN_ALERT_EMAIL_FROM'] = email_from", self.deploy_script)
+
+    def test_post_start_smoke_uses_bounded_node22_and_existing_safe_credentials(self):
+        self.assertIn("- name: Verify deployed API contract with read-only smoke", self.workflow)
+        self.assertIn("node-version: '22'", self.workflow)
+        self.assertIn("timeout-minutes: 5", self.workflow)
+        self.assertIn("BEIA_API_KEY: ${{ secrets.BEIA_API_KEY }}", self.workflow)
+        self.assertIn("ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}", self.workflow)
+        self.assertIn("ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}", self.workflow)
+        self.assertIn("run: node scripts/verify-live-api-smoke.js", self.workflow)
+
+    def test_post_start_smoke_always_uploads_bounded_sanitized_evidence(self):
+        self.assertIn("- name: Upload sanitized live API smoke evidence", self.workflow)
+        self.assertIn("if: always()", self.workflow)
+        self.assertIn("uses: actions/upload-artifact@v4", self.workflow)
+        self.assertIn("outputs/live-api-remediation-2026-10-14/live-api-smoke.json", self.workflow)
+        self.assertIn("retention-days: 14", self.workflow)
+
     def run_workflow_script(self, script: str, root: Path, mode: str = "success") -> tuple[subprocess.CompletedProcess[str], Path]:
         bash = bash_path()
         target = root / "neverflat"

@@ -208,6 +208,12 @@ async function runMigrations() {
     await migrateTransactionReliability(db);
     console.log('[Migration] 023: Transaction reliability state is present');
 
+    // Migration 024: persist the owner-controlled alert recipient and channel
+    // without storing provider credentials in Postgres.
+    const { up: migrateAdminAlertSettings } = await import('./migrations/024_add_admin_alert_settings');
+    await migrateAdminAlertSettings(db);
+    console.log('[Migration] 024: Admin alert settings are present');
+
     console.log('[Migration] All migrations completed successfully');
   } catch (err) {
     console.error('[Migration] Error:', err);

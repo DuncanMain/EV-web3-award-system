@@ -13,6 +13,7 @@ import type {
 } from './types';
 import {
   apiUrl,
+  classifyWalletQueryError,
   isTerminalReservationSettlement,
   matchesReservationContext,
   normalizeApiBaseUrl,
@@ -100,9 +101,29 @@ const activeSessionStatuses: SparkzActiveSessionStatus[] = ['CHARGER_OPENED', 'P
 async function readJson<T>(res: Response): Promise<T> {
   const data = await res.json().catch(() => null);
   if (!res.ok) {
-    throw data || { status: 'error', message: `Request failed with ${res.status}` };
+    const failure: Record<string, unknown> = data && typeof data === 'object'
+      ? { ...(data as Record<string, unknown>) }
+      : { status: 'error', message: `Request failed with ${res.status}` };
+    failure.httpStatus = res.status;
+    throw failure;
   }
   return data as T;
+}
+
+function isUnavailableWalletResponse(data: unknown): boolean {
+  if (!data || typeof data !== 'object') return true;
+  const candidate = data as { balance?: unknown; balanceStatus?: unknown };
+  return candidate.balance === null
+    || candidate.balance === undefined
+    || String(candidate.balanceStatus ?? '').toLowerCase() === 'unavailable';
+}
+
+function unavailableWalletQueryError(): Record<string, unknown> {
+  return {
+    status: 'error',
+    code: 'WALLET_QUERY_UNAVAILABLE',
+    httpStatus: 200,
+  };
 }
 
 function getErrorMessage(err: unknown): string {
@@ -269,6 +290,8 @@ export default function SparkzChargingCard({
   const [signingWallet, setSigningWallet] = useState(false);
   const [error, setError] = useState('');
   const [walletError, setWalletError] = useState('');
+  const [walletErrorRetryable, setWalletErrorRetryable] = useState(false);
+  const [walletReloadNonce, setWalletReloadNonce] = useState(0);
   const [receipt, setReceipt] = useState<SparkzSpendReceipt | null>(null);
   const [reservation, setReservation] = useState<SparkzReservation | null>(null);
   const [settlement, setSettlement] = useState<SparkzReservationSettlement | null>(null);
@@ -358,6 +381,7 @@ export default function SparkzChargingCard({
   const walletBalance = visibleSession?.wallet.availableBalance ?? visibleWallet?.balance ?? 0;
   const walletEarned = visibleWallet?.totalAwarded || visibleSession?.wallet.totalEarned || 0;
   const walletSpent = visibleWallet?.totalSpent || visibleSession?.wallet.totalSpent || 0;
+  const walletUnavailable = !visibleSession && !visibleWallet && Boolean(walletError);
 
   const isSpendOwnerOperationCurrent = (operation: SpendOperationContext): boolean => {
     if (!mountedRef.current) return false;
@@ -421,6 +445,7 @@ export default function SparkzChargingCard({
     setSigningWallet(false);
     setError('');
     setWalletError('');
+    setWalletErrorRetryable(false);
     notifiedSettlementId.current = null;
     setDismissed(false);
   }, [contractId, normalizedApiBaseUrl]);
@@ -549,26 +574,34 @@ export default function SparkzChargingCard({
       if (!isWalletCurrent()) return;
       setLoadingWallet(true);
       setWalletError('');
+      setWalletErrorRetryable(false);
       try {
         const res = await fetch(apiUrl(normalizedApiBaseUrl, '/wallet/me'), {
           method: 'GET',
           headers: contractHeaders(contractId),
         });
         const data = await readJson<SparkzWalletResponse>(res);
+        if (isUnavailableWalletResponse(data)) throw unavailableWalletQueryError();
         if (!isWalletCurrent()) return;
         setWallet(data);
         setWalletOwnerContractId(contractId);
         setWalletOwnerApiBaseUrl(normalizedApiBaseUrl);
         setConnectedWallet(data.walletMode === 'custodial' ? data.walletAddress : '');
         invokeHostCallback(() => onWalletLoaded?.(data), (callbackError) => {
-          if (isWalletCurrent()) setWalletError(`Wallet loaded, but the host callback failed: ${getErrorMessage(callbackError)}`);
+          if (isWalletCurrent()) {
+            setWalletError(`Wallet loaded, but the host callback failed: ${getErrorMessage(callbackError)}`);
+            setWalletErrorRetryable(false);
+          }
         });
       } catch (err) {
         if (!isWalletCurrent()) return;
         setWallet(null);
         setWalletOwnerContractId(null);
         setWalletOwnerApiBaseUrl(null);
-        setWalletError(getErrorMessage(err));
+        setConnectedWallet('');
+        const failure = classifyWalletQueryError(err);
+        setWalletError(failure.message);
+        setWalletErrorRetryable(failure.retryable);
       } finally {
         if (isWalletCurrent()) setLoadingWallet(false);
       }
@@ -581,13 +614,14 @@ export default function SparkzChargingCard({
       setWalletOwnerContractId(null);
       setWalletOwnerApiBaseUrl(null);
       setWalletError('');
+      setWalletErrorRetryable(false);
       setLoadingWallet(false);
     }
 
     return () => {
       cancelled = true;
     };
-  }, [contractId, normalizedApiBaseUrl, onWalletLoaded]);
+  }, [contractId, normalizedApiBaseUrl, onWalletLoaded, walletReloadNonce]);
 
   useEffect(() => {
     let cancelled = false;
@@ -915,6 +949,7 @@ export default function SparkzChargingCard({
       headers: contractHeaders(contractId),
     });
     const walletData = await readJson<SparkzWalletResponse>(walletRes);
+    if (isUnavailableWalletResponse(walletData)) throw unavailableWalletQueryError();
     if (!isCurrent()) throw new StaleSpendOperationError();
     setWallet(walletData);
     setWalletOwnerContractId(contractId);
@@ -979,6 +1014,7 @@ export default function SparkzChargingCard({
       && activeWalletOperationTokenRef.current === operationToken;
     setSwitchingMode(true);
     setWalletError('');
+    setWalletErrorRetryable(false);
     try {
       if (!isCurrent()) throw new StaleSpendOperationError();
       let walletAddress: string | undefined;
@@ -1026,7 +1062,24 @@ export default function SparkzChargingCard({
       });
     } catch (err) {
       if (err instanceof StaleSpendOperationError || !isCurrent()) return;
-      setWalletError(getErrorMessage(err));
+      // Wallet-mode signing and linking errors are caller actions, not balance
+      // query failures. Keep their existing specific guidance, while clearing
+      // stale wallet state when the post-mode read returns a known query error.
+      const failure = classifyWalletQueryError(err);
+      if (failure.code === 'WALLET_QUERY_UNAVAILABLE'
+        || failure.code === 'INVALID_WALLET_ADDRESS'
+        || failure.code === 'WALLET_NOT_LINKED'
+        || (failure.statusCode !== null && failure.statusCode >= 500)) {
+        setWallet(null);
+        setWalletOwnerContractId(null);
+        setWalletOwnerApiBaseUrl(null);
+        setConnectedWallet('');
+        setWalletError(failure.message);
+        setWalletErrorRetryable(failure.retryable);
+      } else {
+        setWalletError(getErrorMessage(err));
+        setWalletErrorRetryable(false);
+      }
     } finally {
       if (isCurrent()) {
         setSwitchingMode(false);
@@ -1130,7 +1183,6 @@ export default function SparkzChargingCard({
           </button>
         )}
 
-        {walletError && <p className="sparkz-card__error" role="alert">{walletError}</p>}
       </div>
     );
   }
@@ -1178,6 +1230,25 @@ export default function SparkzChargingCard({
 
       {loading && <p className="sparkz-card__muted">Loading session rewards...</p>}
       {loadingWallet && !visibleWallet && <p className="sparkz-card__muted">Loading SPARKZ account...</p>}
+      {walletError && (
+        <div className="sparkz-card__wallet-error" role="alert">
+          <span>{walletError}</span>
+          {walletErrorRetryable && (
+            <button
+              className="sparkz-card__secondary-button"
+              type="button"
+              onClick={() => {
+                setWalletError('');
+                setWalletErrorRetryable(false);
+                setWalletReloadNonce(value => value + 1);
+              }}
+              disabled={loadingWallet}
+            >
+              Retry account
+            </button>
+          )}
+        </div>
+      )}
 
       {!visibleSession && !loading && (
         <div className="sparkz-card__idle">
@@ -1188,17 +1259,17 @@ export default function SparkzChargingCard({
       <div className={`sparkz-card__stats${visibleSession ? ' sparkz-card__stats--session' : ''}`}>
         <div>
           <span>Available</span>
-          <strong>{money(walletBalance)}</strong>
+          <strong>{walletUnavailable ? 'Unavailable' : money(walletBalance)}</strong>
         </div>
         {!visibleSession && (
           <>
             <div>
               <span>Earned</span>
-              <strong>{money(walletEarned)}</strong>
+              <strong>{walletUnavailable ? 'Unavailable' : money(walletEarned)}</strong>
             </div>
             <div>
               <span>Spent</span>
-              <strong>{money(walletSpent)}</strong>
+              <strong>{walletUnavailable ? 'Unavailable' : money(walletSpent)}</strong>
             </div>
           </>
         )}

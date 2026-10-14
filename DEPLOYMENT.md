@@ -46,7 +46,17 @@ new app. GHCR login uses a temporary DOCKER_CONFIG directory below
 discoverable through that temporary config; the owned temporary directory is
 removed on exit and shared Docker credentials are left alone. The current
 secret resolver remains in the automatic workflow and its values are passed
-only to the target-side process.
+only to the target-side process. `ADMIN_ALERT_WEBHOOK_URL` is an optional
+repository secret. When it is set, the deployment updates that target setting
+without printing it; when it is blank, the existing target `.env` value is
+preserved. The HTTPS email path uses the optional `SENDGRID_API_KEY` and
+`ADMIN_ALERT_EMAIL_FROM` repository secrets, which are handled the same way:
+blank values preserve an existing target value and non-blank values update it
+without printing it. The sender must be verified with the email provider.
+The deployment does not call the alert test endpoint, and a SendGrid HTTP 202
+only proves provider acceptance rather than inbox delivery. Configure the
+recipient and channel through the authenticated admin alert settings route
+after deployment; provider credentials remain environment-only.
 
 After the backup is verified, the service operations are explicitly scoped to
 Neverflat:
@@ -95,9 +105,17 @@ workflow takes the target-local pg_dump backup and verifies its readable
 manifest before compose up; it does not run a second database creation or a
 loopback migration runner. A target owner must still confirm that the existing
 data is compatible with migrations 001 through 017, active-wallet migration
-022, and transaction-reliability migration 023 before accepting the new app.
-Migration 023 covers durable prepared context, approval funding attempts,
-immutable settlement context, the treasury lease table, and nonce uniqueness.
+022, transaction-reliability migration 023, and additive admin-alert settings
+migration `024_add_admin_alert_settings`
+before accepting the new app. The alert migration seeds a placeholder or the
+configured `ADMIN_ALERT_RECIPIENT`/`ADMIN_EMAIL`; set the owner recipient
+through the authenticated admin settings route after deployment. Migration
+023 covers durable prepared context, approval funding attempts, immutable
+settlement context, the treasury lease table, and nonce uniqueness.
+When an existing `ADMIN_ALERT_WEBHOOK_URL` is present and no explicit channel
+is selected, migration 024 preserves the legacy `webhook` channel. Selecting
+`both` requires both the webhook and email providers to be configured before
+delivery is reported as complete.
 
 For any target migration decision, quiesce writers through the target's normal
 maintenance process, retain the verified backup, and restore-test a disposable

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   apiUrl,
+  classifyWalletQueryError,
   isTerminalReservationSettlement,
   matchesReservationContext,
   normalizeApiBaseUrl,
@@ -57,4 +58,35 @@ test('requires the expected reservation session and provider context', () => {
   assert.equal(matchesReservationContext({ ...baseSettlement, reservationId: 'reservation-2' }, context), false);
   assert.equal(matchesReservationContext({ ...baseSettlement, sessionId: '' }, context), false);
   assert.equal(matchesReservationContext(baseSettlement, { ...context, sessionId: '' }), false);
+});
+
+test('classifies wallet validation and linkage failures without retry handles', () => {
+  const invalid = classifyWalletQueryError({
+    code: 'INVALID_WALLET_ADDRESS',
+    httpStatus: 400,
+    message: 'server detail must not be shown',
+  });
+  assert.equal(invalid.kind, 'invalid_address');
+  assert.equal(invalid.statusCode, 400);
+  assert.equal(invalid.retryable, false);
+  assert.match(invalid.message, /invalid/i);
+  assert.doesNotMatch(invalid.message, /server detail/);
+
+  const notLinked = classifyWalletQueryError({ code: 'WALLET_NOT_LINKED', httpStatus: 403 });
+  assert.equal(notLinked.kind, 'not_linked');
+  assert.equal(notLinked.statusCode, 403);
+  assert.equal(notLinked.retryable, false);
+  assert.match(notLinked.message, /not linked/i);
+});
+
+test('classifies dependency and transport failures as read-only retryable balance errors', () => {
+  const dependency = classifyWalletQueryError({ code: 'WALLET_QUERY_UNAVAILABLE', httpStatus: 500 });
+  assert.equal(dependency.kind, 'unavailable');
+  assert.equal(dependency.retryable, true);
+  assert.match(dependency.message, /temporarily unavailable/i);
+
+  const transport = classifyWalletQueryError(new TypeError('network failed'));
+  assert.equal(transport.kind, 'unavailable');
+  assert.equal(transport.retryable, true);
+  assert.match(transport.message, /retry/i);
 });

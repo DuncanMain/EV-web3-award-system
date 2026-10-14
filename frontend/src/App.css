@@ -1219,6 +1219,24 @@ button:disabled {
   gap: 1.2rem;
 }
 
+.section-heading-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.section-heading-row h2 {
+  margin: 0 0 0.25rem;
+}
+
+.actions-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.7rem;
+  align-items: center;
+}
+
 .admin-rule-group {
   display: flex;
   flex-direction: column;

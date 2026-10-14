@@ -20,13 +20,13 @@ release candidate with:
 npm ci
 npm run build
 npm pack
-npm install ./neverflat-sparkz-charging-card-0.2.1-rc.1.tgz
+npm install ./neverflat-sparkz-charging-card-0.2.1-rc.2.tgz
 ```
 
 The checked-in `neverflat-sparkz-charging-card-0.2.0.tgz` archive is the
-historical 0.2.0 artifact and remains unchanged. The current 0.2.1-rc.1
-artifact's SHA-256 is recorded in the external release handoff documents
-after packing.
+historical 0.2.0 artifact and remains unchanged. The current 0.2.1-rc.2
+artifact's SHA-256 is recorded in the workspace release handoff JSON after
+packing.
 
 Import the component and styles:
 
@@ -95,6 +95,16 @@ x-contract-id: <emaid>
 It shows balance, totals, recent activity, blockchain address, contract ID,
 wallet mode, Polygon explorer links, and custodial wallet connection controls.
 It does not show spend controls.
+
+Wallet query errors are shown without exposing raw server details. An invalid
+wallet address (`INVALID_WALLET_ADDRESS`) and an eMAID linkage mismatch
+(`WALLET_NOT_LINKED`) require the host integration to correct the wallet
+configuration; the card does not retry either response. A temporary balance or
+dependency failure (`WALLET_QUERY_UNAVAILABLE`, a server error, or a transport
+failure, including a successful response whose balance is explicitly
+unavailable, shows the balance as unavailable and offers a read-only wallet GET
+retry. The retry keeps the same `x-contract-id` eMAID binding and never creates
+an approval, reservation, transfer, or other financial action.
 
 ### Active charging-session mode
 
