@@ -214,6 +214,13 @@ async function runMigrations() {
     await migrateAdminAlertSettings(db);
     console.log('[Migration] 024: Admin alert settings are present');
 
+    // Migration 025: append-only metadata for authenticated admin correction
+    // annotations.  This table references existing evidence subjects by
+    // typed UUID and deliberately does not modify or backfill financial rows.
+    const { up: migrateAdminCorrectionAnnotations } = await import('./migrations/025_add_admin_correction_annotations');
+    await migrateAdminCorrectionAnnotations(db);
+    console.log('[Migration] 025: Admin correction annotations are present');
+
     console.log('[Migration] All migrations completed successfully');
   } catch (err) {
     console.error('[Migration] Error:', err);

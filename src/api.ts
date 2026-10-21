@@ -67,6 +67,16 @@ import {
   getAdminAlertConfiguration,
   updateAdminAlertSettings,
 } from './adminAlerts';
+import {
+  AdminEvidenceError,
+  createAdminCorrectionAnnotation,
+  getAdminEvidenceReport,
+  listAdminCorrectionAnnotations,
+  parseAdminCorrectionAnnotationRequest,
+  parseAdminEvidenceQuery,
+  parseAnnotationListQuery,
+  renderAdminEvidenceCsv,
+} from './adminEvidence';
 
 const app = express();
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
@@ -3958,6 +3968,75 @@ function buildOpenApiSpec(req: Request) {
           },
         },
       },
+      '/admin/evidence-report': {
+        get: {
+          tags: ['Admin'],
+          summary: 'Read a bounded retained-data evidence report',
+          description: 'Reads retained database projections and persisted reconciliation metadata. It does not call the chain, run reconciliation, or expose raw CDR/intent payloads. JSON and CSV responses mask eMAID and wallet values by default.',
+          security: adminSecurity,
+          parameters: [
+            { name: 'from', in: 'query', schema: { type: 'string', format: 'date-time' }, description: 'Inclusive ISO timestamp ending in Z; defaults to 30 days before to.' },
+            { name: 'to', in: 'query', schema: { type: 'string', format: 'date-time' }, description: 'Inclusive ISO timestamp ending in Z; defaults to now.' },
+            { name: 'limit', in: 'query', schema: { type: 'integer', minimum: 1, maximum: 500, default: 100 } },
+            { name: 'offset', in: 'query', schema: { type: 'integer', minimum: 0, maximum: 100000, default: 0 } },
+            { name: 'scope', in: 'query', schema: { type: 'string', enum: ['all', 'unresolved'], default: 'all' } },
+            { name: 'emaid', in: 'query', schema: { type: 'string', maxLength: 255 }, description: 'Exact server-side eMAID filter; response values remain masked.' },
+            { name: 'operationType', in: 'query', schema: { type: 'string', enum: ['award', 'spend'] } },
+            { name: 'status', in: 'query', schema: { type: 'string', maxLength: 40 }, description: 'Exact retained status token; legacy status values are supported.' },
+            { name: 'format', in: 'query', schema: { type: 'string', enum: ['json', 'csv'], default: 'json' } },
+          ],
+          responses: {
+            200: {
+              description: 'Bounded JSON report or formula-escaped CSV export',
+              content: {
+                'application/json': { schema: { $ref: '#/components/schemas/AdminEvidenceReportResponse' } },
+                'text/csv': { schema: { type: 'string' } },
+              },
+            },
+            400: errorResponse,
+            401: errorResponse,
+            503: errorResponse,
+          },
+        },
+      },
+      '/admin/correction-annotations': {
+        get: {
+          tags: ['Admin'],
+          summary: 'List append-only correction annotations for one evidence subject',
+          security: adminSecurity,
+          parameters: [
+            { name: 'subjectType', in: 'query', required: true, schema: { type: 'string', enum: ['token_operation', 'award', 'spend'] } },
+            { name: 'subjectId', in: 'query', required: true, schema: { type: 'string', format: 'uuid' } },
+            { name: 'limit', in: 'query', schema: { type: 'integer', minimum: 1, maximum: 100, default: 25 } },
+            { name: 'offset', in: 'query', schema: { type: 'integer', minimum: 0, maximum: 100000, default: 0 } },
+          ],
+          responses: {
+            200: { description: 'Stored annotations', content: { 'application/json': { schema: { $ref: '#/components/schemas/AdminCorrectionAnnotationListResponse' } } } },
+            400: errorResponse,
+            401: errorResponse,
+            404: errorResponse,
+            503: errorResponse,
+          },
+        },
+        post: {
+          tags: ['Admin'],
+          summary: 'Append one authenticated correction annotation',
+          description: 'The original transaction reference must already exist in retained award, spend, or token-operation data. A case reference is an external support record. clientRequestId is unique per actor and must be reused for a transport retry; a different payload with the same id returns 409. This endpoint writes metadata only and has no financial side effects.',
+          security: adminSecurity,
+          requestBody: {
+            required: true,
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/AdminCorrectionAnnotationRequest' } } },
+          },
+          responses: {
+            201: { description: 'Annotation durably appended', content: { 'application/json': { schema: { $ref: '#/components/schemas/AdminCorrectionAnnotationResponse' } } } },
+            400: errorResponse,
+            401: errorResponse,
+            404: errorResponse,
+            409: errorResponse,
+            503: errorResponse,
+          },
+        },
+      },
       '/admin/reconciliation/run': {
         post: {
           tags: ['Admin'],
@@ -5086,6 +5165,135 @@ function buildOpenApiSpec(req: Request) {
             status: { type: 'string', enum: ['ok'] },
             settings: { $ref: '#/components/schemas/AdminAlertSettings' },
             delivery: { $ref: '#/components/schemas/AdminAlertDeliveryStatus' },
+          },
+        },
+        AdminEvidenceAsset: {
+          type: 'object',
+          required: ['chainId', 'tokenContractAddress', 'provenance'],
+          properties: {
+            chainId: { type: 'string', nullable: true },
+            tokenContractAddress: { type: 'string', nullable: true },
+            provenance: { type: 'string', enum: ['stored_operation_context', 'legacy_unknown', 'conflict_unknown'] },
+          },
+        },
+        AdminEvidenceHistoricalPolicy: {
+          type: 'object',
+          required: ['source', 'revision', 'rulesVersion', 'safePolicyFingerprint'],
+          properties: {
+            source: { type: 'string', enum: ['operation_snapshot', 'not_applicable', 'unknown'] },
+            revision: { type: 'integer', nullable: true },
+            rulesVersion: { type: 'string', nullable: true },
+            safePolicyFingerprint: { type: 'string', nullable: true },
+          },
+        },
+        AdminEvidenceReportResponse: {
+          type: 'object',
+          required: ['status', 'generatedAt', 'period', 'policy', 'summary', 'coverage', 'reconciliation', 'pagination', 'rows'],
+          properties: {
+            status: { type: 'string', enum: ['ok'] },
+            generatedAt: { type: 'string', format: 'date-time' },
+            period: { type: 'object', required: ['from', 'to', 'observationAt'], properties: { from: { type: 'string', format: 'date-time' }, to: { type: 'string', format: 'date-time' }, observationAt: { type: 'string', format: 'date-time' } } },
+            policy: { type: 'object', required: ['currentRevision', 'currentUpdatedAt'], properties: { currentRevision: { type: 'integer', nullable: true }, currentUpdatedAt: { type: 'string', format: 'date-time', nullable: true } } },
+            summary: {
+              type: 'object',
+              required: ['basis', 'issuedMovementCount', 'returnedMovementCount', 'confirmedMovementCount', 'exceptionCount', 'totalsByAsset'],
+              properties: {
+                basis: { type: 'string', enum: ['selected retained data in requested window'] },
+                issuedMovementCount: { type: 'integer' },
+                returnedMovementCount: { type: 'integer' },
+                confirmedMovementCount: { type: 'integer' },
+                exceptionCount: { type: 'integer' },
+                totalsByAsset: { type: 'array', items: { allOf: [{ $ref: '#/components/schemas/AdminEvidenceAsset' }], properties: { awardedSparkz: { type: 'string' }, spentSparkz: { type: 'string' }, netIssuedSparkz: { type: 'string' } } } },
+              },
+            },
+            coverage: { type: 'object', additionalProperties: true },
+            reconciliation: { type: 'object', additionalProperties: true },
+            pagination: { type: 'object', required: ['limit', 'offset', 'hasMore', 'nextOffset'], properties: { limit: { type: 'integer' }, offset: { type: 'integer' }, hasMore: { type: 'boolean' }, nextOffset: { type: 'integer', nullable: true } } },
+            rows: {
+              type: 'array',
+              items: {
+                type: 'object',
+                required: ['subjectType', 'subjectId', 'operationType', 'eMAID', 'walletAddress', 'amountSparkz', 'asset', 'historicalPolicy', 'timestamps', 'annotationCount'],
+                properties: {
+                  subjectType: { type: 'string', enum: ['token_operation', 'award', 'spend'] },
+                  subjectId: { type: 'string', format: 'uuid' },
+                  operationKey: { type: 'string', nullable: true },
+                  operationType: { type: 'string', enum: ['award', 'spend'] },
+                  eMAID: { type: 'string', nullable: true },
+                  walletAddress: { type: 'string', nullable: true },
+                  amountSparkz: { type: 'string' },
+                  status: { type: 'string', nullable: true },
+                  movementOutcome: { type: 'string', nullable: true },
+                  transactionHash: { type: 'string', nullable: true },
+                  asset: { $ref: '#/components/schemas/AdminEvidenceAsset' },
+                  historicalPolicy: { $ref: '#/components/schemas/AdminEvidenceHistoricalPolicy' },
+                  timestamps: { type: 'object', additionalProperties: true },
+                  exceptionCategory: { type: 'string', nullable: true },
+                  annotationCount: { type: 'integer' },
+                },
+              },
+            },
+          },
+        },
+        AdminCorrectionAnnotation: {
+          type: 'object',
+          required: ['id', 'clientRequestId', 'subjectType', 'subjectId', 'referenceType', 'reference', 'reason', 'actorType', 'actorId', 'createdAt', 'resolvedReference'],
+          properties: {
+            id: { type: 'string', format: 'uuid' },
+            clientRequestId: { type: 'string', format: 'uuid' },
+            subjectType: { type: 'string', enum: ['token_operation', 'award', 'spend'] },
+            subjectId: { type: 'string', format: 'uuid' },
+            referenceType: { type: 'string', enum: ['transaction', 'case'] },
+            reference: { type: 'string' },
+            reason: { type: 'string' },
+            actorType: { type: 'string', enum: ['admin_session'] },
+            actorId: { type: 'string' },
+            createdAt: { type: 'string', format: 'date-time' },
+            resolvedReference: {
+              type: 'object',
+              required: ['provenance', 'operationKey', 'chainId', 'tokenContractAddress'],
+              properties: {
+                provenance: { type: 'string', enum: ['retained_operation', 'retained_award', 'retained_spend', 'external_case', 'unknown', 'conflict_unknown'] },
+                operationKey: { type: 'string', nullable: true },
+                chainId: { type: 'string', nullable: true },
+                tokenContractAddress: { type: 'string', nullable: true },
+              },
+            },
+          },
+        },
+        AdminCorrectionAnnotationRequest: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['clientRequestId', 'subjectType', 'subjectId', 'referenceType', 'reference', 'reason'],
+          properties: {
+            clientRequestId: { type: 'string', format: 'uuid' },
+            subjectType: { type: 'string', enum: ['token_operation', 'award', 'spend'] },
+            subjectId: { type: 'string', format: 'uuid' },
+            referenceType: { type: 'string', enum: ['transaction', 'case'] },
+            reference: { type: 'string', maxLength: 320 },
+            reason: { type: 'string', maxLength: 2000 },
+          },
+        },
+        AdminCorrectionAnnotationResponse: {
+          type: 'object',
+          required: ['status', 'sideEffects', 'annotation'],
+          properties: {
+            status: { type: 'string', enum: ['ok'] },
+            sideEffects: { type: 'object', required: ['financial'], properties: { financial: { type: 'boolean', enum: [false] } } },
+            annotation: { $ref: '#/components/schemas/AdminCorrectionAnnotation' },
+          },
+        },
+        AdminCorrectionAnnotationListResponse: {
+          type: 'object',
+          required: ['status', 'count', 'limit', 'offset', 'hasMore', 'nextOffset', 'annotations'],
+          properties: {
+            status: { type: 'string', enum: ['ok'] },
+            count: { type: 'integer' },
+            limit: { type: 'integer' },
+            offset: { type: 'integer' },
+            hasMore: { type: 'boolean' },
+            nextOffset: { type: 'integer', nullable: true },
+            annotations: { type: 'array', items: { $ref: '#/components/schemas/AdminCorrectionAnnotation' } },
           },
         },
         EvidencePackResponse: {
@@ -9167,6 +9375,93 @@ app.get('/admin/evidence-pack', validateAdmin, async (_req: Request, res: Respon
       retryable: true,
       message: 'The evidence pack could not be generated. Please retry shortly.',
       error: 'The evidence pack could not be generated. Please retry shortly.',
+    });
+  }
+});
+
+/**
+ * Read a bounded database-only operational evidence report.  This route never
+ * calls the chain, runs reconciliation, or writes financial state.
+ * GET /admin/evidence-report?from=...&to=...&format=json|csv
+ */
+app.get('/admin/evidence-report', validateAdmin, async (req: Request, res: Response) => {
+  try {
+    const query = parseAdminEvidenceQuery(req.query);
+    const report = await getAdminEvidenceReport(query);
+    if (query.format === 'csv') {
+      res.status(200)
+        .type('text/csv')
+        .set('Content-Disposition', 'attachment; filename="neverflat-admin-evidence.csv"')
+        .send(renderAdminEvidenceCsv(report));
+      return;
+    }
+    res.status(200).json(report);
+  } catch (err) {
+    if (err instanceof AdminEvidenceError) {
+      res.status(err.statusCode).json({ status: 'error', code: err.code, message: err.message });
+      return;
+    }
+    console.error('Admin evidence report failed:', toServerAuditDiagnostic(err));
+    res.status(503).json({
+      status: 'error',
+      code: 'ADMIN_EVIDENCE_UNAVAILABLE',
+      retryable: true,
+      message: 'The admin evidence report is temporarily unavailable. Try again shortly.',
+    });
+  }
+});
+
+/**
+ * Append one authenticated operator annotation to an existing evidence
+ * subject.  The handler only writes migration-025 metadata; it never updates
+ * awards, spends, token operations, balances, receipts, or chain state.
+ * POST /admin/correction-annotations
+ */
+app.post('/admin/correction-annotations', validateAdmin, async (req: Request, res: Response) => {
+  try {
+    const request = parseAdminCorrectionAnnotationRequest(req.body);
+    const actorId = (req as Request & { adminIdentity?: string }).adminIdentity;
+    if (!actorId) {
+      res.status(401).json({ status: 'error', code: 'ADMIN_AUTHENTICATION_REQUIRED', message: 'Admin authentication required' });
+      return;
+    }
+    const response = await createAdminCorrectionAnnotation(request, actorId);
+    res.status(201).json(response);
+  } catch (err) {
+    if (err instanceof AdminEvidenceError) {
+      res.status(err.statusCode).json({ status: 'error', code: err.code, message: err.message });
+      return;
+    }
+    console.error('Admin correction annotation failed:', toServerAuditDiagnostic(err));
+    res.status(503).json({
+      status: 'error',
+      code: 'ANNOTATION_UNAVAILABLE',
+      retryable: true,
+      message: 'The correction annotation could not be saved. No financial state was changed.',
+    });
+  }
+});
+
+/**
+ * Read append-only annotations for one existing evidence subject.
+ * GET /admin/correction-annotations?subjectType=...&subjectId=...
+ */
+app.get('/admin/correction-annotations', validateAdmin, async (req: Request, res: Response) => {
+  try {
+    const query = parseAnnotationListQuery(req.query);
+    const response = await listAdminCorrectionAnnotations(query);
+    res.status(200).json(response);
+  } catch (err) {
+    if (err instanceof AdminEvidenceError) {
+      res.status(err.statusCode).json({ status: 'error', code: err.code, message: err.message });
+      return;
+    }
+    console.error('Admin correction annotation list failed:', toServerAuditDiagnostic(err));
+    res.status(503).json({
+      status: 'error',
+      code: 'ANNOTATION_UNAVAILABLE',
+      retryable: true,
+      message: 'Correction annotations are temporarily unavailable. Try again shortly.',
     });
   }
 });
