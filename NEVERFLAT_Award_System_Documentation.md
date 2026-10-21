@@ -163,15 +163,47 @@ presence alone. Reconciliation compares stored wallet state with chain
 balances and stores a report; evidence export is a point-in-time snapshot and
 returns a safe retry error when a dependency is unavailable.
 
+The admin evidence report (`GET /admin/evidence-report`) is a bounded,
+read-only view of retained `token_operations`, `awards`, and `spends` rows plus
+the latest persisted reconciliation report. It defaults to a 30-day UTC window,
+limits the window to 366 days, caps each source at 5,000 rows, and exposes
+truthful pagination and coverage warnings when a source is unavailable,
+truncated, has an invalid transaction hash, has unknown movement outcome, or
+has conflicting duplicate evidence. Summary totals are labelled as selected
+retained-data/window totals and are grouped by chain and token contract with
+asset provenance; the response does not expose an aggregate outstanding
+balance, liability, or fiat value. eMAID and wallet values are masked, and
+operation/session/provider/reservation labels are opaque digests. Historical
+policy is reported as `operation_snapshot`, `not_applicable`, or `unknown`; the
+current policy revision in the header is never used as a historical fallback.
+JSON and formula-escaped CSV never include raw CDR, intent, provider errors,
+secrets, or private signing material. The report does not contact the chain,
+run reconciliation, or mutate financial tables.
+
+`POST /admin/correction-annotations` appends authenticated operator metadata
+to one existing award, spend, or token-operation UUID. Its `clientRequestId`
+is unique per admin actor and makes the same request safe to replay; a changed
+payload returns `409`. A transaction reference must be a canonical hash found
+in retained evidence and refers to the original transaction, which may differ
+from the annotated row's own hash. Account and asset context are checked when
+retained data can infer them; unresolved or conflicting provenance is stored
+explicitly. Case references identify external support records. Migration 025
+contains only the append-only annotation table and its indexes. Annotation
+writes never create, retry, recover, project, adjust, or otherwise change
+financial movement, receipts, balances, or chain state.
+
 ## 3. Data, security, and schema boundaries
 
 The database mirror stores users/wallet mappings, awards, spends, balances,
 receipts, reservations, token operations, approval preparations, policies,
-audit events, and reconciliation reports. Existing columns and historical
-records are retained. Migration 016 adds durable policy state. Migration 017
+audit events, reconciliation reports, and admin correction metadata. Existing
+columns and historical records are retained. Migration 016 adds durable policy
+state. Migration 017
 adds `token_operations.charging_session_id` and the provider-plus-physical-
 session uniqueness guard for new explicit OCPI sessions; it does not rewrite
-old records. The standalone migration 022 adds an explicit active-wallet
+old records. Migration 025 adds only the append-only admin correction
+annotation metadata table and indexes; it does not alter or backfill financial
+tables. The standalone migration 022 adds an explicit active-wallet
 selection while retaining historical wallet rows. A rollback to an older image
 must review active-wallet selection and pending financial operations; it must
 not drop those preferences or rewrite wallet mappings or financial rows.

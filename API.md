@@ -156,6 +156,9 @@ the contract inventory used by the local matrix.
 | PATCH | `/admin/alerts/settings` | Admin bearer | Update `recipientEmail` and/or `channel`; provider credentials remain server-side. |
 | POST | `/admin/alerts/test` | Admin bearer | Exercise configured alert delivery and record result. |
 | GET | `/admin/evidence-pack` | Admin bearer | Export a point-in-time evidence snapshot. |
+| GET | `/admin/evidence-report` | Admin bearer | Read a bounded retained-data operations report as JSON or formula-escaped CSV. |
+| GET | `/admin/correction-annotations` | Admin bearer | List append-only correction annotations for an existing award, spend, or token operation. |
+| POST | `/admin/correction-annotations` | Admin bearer | Append an authenticated operator annotation to an existing evidence subject. |
 | POST | `/admin/reconciliation/run` | Admin bearer | Run DB-versus-chain reconciliation. |
 | GET | `/admin/reconciliation` | Admin bearer | List stored reconciliation reports. |
 | PUT | `/admin/off-peak` | Admin bearer | Replace country windows. |
@@ -560,6 +563,38 @@ returns `404` when it is absent. Writes are revisioned and durable.
   RPC diagnostics without raw provider errors, URLs, signed bytes, or secrets.
   If a dependency is unavailable it returns `EVIDENCE_PACK_UNAVAILABLE` with a
   safe retry message.
+- `GET /admin/evidence-report` reads only bounded retained rows from
+  `token_operations`, `awards`, and `spends`, plus the latest persisted
+  reconciliation report. It defaults to the previous 30 days, accepts a
+  maximum 366-day UTC window, and paginates with `limit` 1–500 and `offset`
+  0–100000. `scope=unresolved` limits rows to records needing review;
+  `operationType`, `status`, and exact `emaid` filters are optional. The
+  response labels totals as selected retained data in the requested window and
+  reports totals per `{chainId, tokenContractAddress, provenance}` asset group;
+  it does not present balances, liability, fiat, or an aggregate across assets.
+  Unknown asset provenance, duplicate conflicts, invalid hashes, missing
+  movement outcomes, source caps, and unavailable tables are surfaced in
+  `coverage.warnings` and the lower-bound flags. eMAID and wallet values are
+  masked in rows and CSV, and operation/session/provider/reservation labels are
+  opaque digests; historical policy is `operation_snapshot`,
+  `not_applicable`, or `unknown`, and only the safe policy fingerprint is
+  exposed. The report never calls the chain, runs reconciliation, or returns
+  raw CDR/intent data. `format=csv` returns a bounded CSV with formula-leading
+  cells escaped.
+- `POST /admin/correction-annotations` accepts exactly
+  `{ clientRequestId, subjectType, subjectId, referenceType, reference, reason }`.
+  `subjectId` must identify an existing retained row. A transaction reference
+  must be a canonical hash present in retained award, spend, or token-operation
+  data; it refers to the original transaction and may differ from the subject
+  row's own hash. The server checks retained account and asset context when it
+  is available and stores the resolved provenance, or an explicit unknown or
+  conflict state. A case reference is an external support record. The admin
+  bearer identity is stored server-side with the append-only metadata. Reusing
+  a `clientRequestId` with the same actor and payload replays the durable
+  annotation; a different payload returns `409`. The response includes
+  `sideEffects.financial: false`; no financial table, receipt, balance, chain,
+  recovery, or projection state is changed. `GET /admin/correction-annotations`
+  requires `subjectType` and UUID `subjectId` and returns bounded pages.
 
 ### Reconciliation
 

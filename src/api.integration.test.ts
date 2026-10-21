@@ -537,6 +537,15 @@ describe('api integration contracts', () => {
     expect(body.paths['/ingest/cdr/preview']).toBeDefined();
     expect(body.paths['/spend/session']).toBeDefined();
     expect(body.paths['/spend/reservations/{reservationId}']).toBeDefined();
+    expect(body.paths['/admin/evidence-report'].get.security).toEqual([{ AdminBearerAuth: [] }]);
+    expect(body.paths['/admin/correction-annotations'].get.security).toEqual([{ AdminBearerAuth: [] }]);
+    expect(body.paths['/admin/correction-annotations'].post.security).toEqual([{ AdminBearerAuth: [] }]);
+    expect(body.components.schemas.AdminEvidenceReportResponse).toBeDefined();
+    expect(body.components.schemas.AdminCorrectionAnnotationRequest.required).toEqual([
+      'clientRequestId', 'subjectType', 'subjectId', 'referenceType', 'reference', 'reason',
+    ]);
+    expect(body.components.schemas.AdminCorrectionAnnotationResponse.properties.sideEffects.properties.financial)
+      .toMatchObject({ type: 'boolean', enum: [false] });
     expect(body.components.schemas.ReservationStatusResponse).toBeDefined();
     expect(body.components.schemas.SpendSessionRequest).toBeDefined();
     expect(body.components.schemas.SpendSessionResponse.properties.rewardRates).toBeDefined();
@@ -1818,6 +1827,25 @@ describe('api integration contracts', () => {
     expect(invalid.status).toBe(400);
     expect(body).toMatchObject({ status: 'error', code: 'INVALID_OPERATIONS_QUERY' });
     expect(body.message).toContain('emaid');
+  });
+
+  it('protects evidence reports and correction annotations with bearer sessions only', async () => {
+    const reportWithApiKeyOnly = await apiFetch('/admin/evidence-report');
+    expect(reportWithApiKeyOnly.status).toBe(401);
+
+    const annotationWithApiKeyOnly = await apiFetch('/admin/correction-annotations', {
+      method: 'POST',
+      body: JSON.stringify({}),
+    });
+    expect(annotationWithApiKeyOnly.status).toBe(401);
+
+    const token = await adminToken();
+    const malformedReport = await apiFetch('/admin/evidence-report?limit=501', {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const reportBody = await malformedReport.json();
+    expect(malformedReport.status).toBe(400);
+    expect(reportBody).toMatchObject({ status: 'error', code: 'INVALID_EVIDENCE_QUERY' });
   });
 
   it('keeps an admin operations database failure generic', async () => {

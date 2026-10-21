@@ -1,6 +1,7 @@
 ﻿import React, { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import AdminDashboard from './AdminDashboard';
 import AdminAlertSettings from './AdminAlertSettings';
+import AdminEvidenceReports from './AdminEvidenceReports';
 import AuthGate from './AuthGate';
 import { shouldReleaseSpendRequest } from '../../src/auditPresentation';
 
@@ -209,12 +210,13 @@ function recoveryFeedbackForResponse(
   };
 }
 
-type AdminTab = 'overview' | 'identities' | 'transactions' | 'rules' | 'alerts' | 'audit' | 'health';
+type AdminTab = 'overview' | 'identities' | 'transactions' | 'evidence' | 'rules' | 'alerts' | 'audit' | 'health';
 
 const adminNavItems: Array<{ id: AdminTab; label: string; description: string }> = [
   { id: 'overview', label: 'Overview', description: 'Pilot activity and readiness' },
   { id: 'identities', label: 'eMAIDs & balances', description: 'Look up ownership and balances' },
   { id: 'transactions', label: 'Transactions', description: 'Run controlled award and spend tests' },
+  { id: 'evidence', label: 'Evidence reports', description: 'Inspect retained evidence and correction notes' },
   { id: 'rules', label: 'Token rules', description: 'Manage award rates and windows' },
   { id: 'alerts', label: 'Alerts', description: 'Choose alert recipient and delivery channel' },
   { id: 'audit', label: 'Audit log', description: 'Review operational events' },
@@ -226,6 +228,7 @@ function AdminNavIcon({ tab }: { tab: AdminTab }) {
     overview: <><rect x="4" y="4" width="6" height="6" rx="1" /><rect x="14" y="4" width="6" height="6" rx="1" /><rect x="4" y="14" width="6" height="6" rx="1" /><rect x="14" y="14" width="6" height="6" rx="1" /></>,
     identities: <><circle cx="12" cy="8" r="3" /><path d="M5 20c.7-3 3.2-5 7-5s6.3 2 7 5" /></>,
     transactions: <><path d="M5 7h12" /><path d="m14 4 3 3-3 3" /><path d="M19 17H7" /><path d="m10 14-3 3 3 3" /></>,
+    evidence: <><path d="M6 3h9l3 3v15H6z" /><path d="M15 3v4h4" /><path d="M9 12h6M9 16h6" /></>,
     rules: <><path d="M5 6h14M5 12h14M5 18h14" /><circle cx="9" cy="6" r="2" /><circle cx="15" cy="12" r="2" /><circle cx="11" cy="18" r="2" /></>,
     alerts: <><path d="M18 9a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9" /><path d="M10 21h4" /></>,
     audit: <><circle cx="12" cy="12" r="8" /><path d="M12 7v5l3 2" /></>,
@@ -552,6 +555,8 @@ function AdminShell({ baseUrl, adminToken, onLogout, onBack }: AdminShellProps) 
       <main className="main-view" aria-live="polite">
         {activeTab === 'alerts' ? (
           <AdminAlertSettings baseUrl={baseUrl} adminToken={adminToken} />
+        ) : activeTab === 'evidence' ? (
+          <AdminEvidenceReports baseUrl={baseUrl} adminToken={adminToken} />
         ) : activeTab === 'overview' || activeTab === 'rules' || activeTab === 'audit' || activeTab === 'health' ? (
           <AdminDashboard
             baseUrl={baseUrl}
