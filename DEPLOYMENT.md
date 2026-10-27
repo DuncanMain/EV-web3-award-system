@@ -18,6 +18,9 @@ resources and never supplies live credentials or production data.
 The production workflow is limited to a push on main and keeps a single serial
 build-and-deploy job. It checks out the commit, builds the existing Dockerfile,
 and pushes the existing latest and commit tags to GHCR. The Dockerfile
+pins both its build and runtime stages to `node:24.22.1-alpine`, so local
+container builds and production deployments use Node.js 24.22.1. The image
+includes the backend and frontend built with that version. The Dockerfile
 entrypoint remains:
 
 ~~~text

@@ -45,7 +45,13 @@ Preserve the eMAID spelling used by the existing integration. Changing identity 
 
 ## Installation
 
+Use Node.js **24.22.1** for the backend, frontend, and charging-card package.
+The package engine requirements and `.npmrc` files reject installation with a
+different Node.js version.
+
 ```bash
+nvm install
+nvm use
 npm install
 ```
 
