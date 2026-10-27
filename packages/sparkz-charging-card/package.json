@@ -4,6 +4,9 @@
   "private": false,
   "description": "Embeddable SPARKZ charging-session and wallet account React component for BEIA integration.",
   "type": "module",
+  "engines": {
+    "node": "24.22.1"
+  },
   "main": "./dist/sparkz-charging-card.umd.cjs",
   "module": "./dist/sparkz-charging-card.js",
   "types": "./dist/index.d.ts",

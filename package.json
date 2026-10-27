@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "NEVERFLAT Award Core Backend",
   "main": "dist/index.js",
+  "engines": {
+    "node": "24.22.1"
+  },
   "scripts": {
     "build": "tsc",
     "test": "jest",
