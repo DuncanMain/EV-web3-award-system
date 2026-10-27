@@ -567,6 +567,15 @@ Purpose:
 - Load SPARKZ wallet balance.
 - Load recent activity.
 - Load wallet mode and wallet addresses.
+- This read does not create a durable wallet, sign/approve, or move tokens; it may refresh the in-memory address registry.
+
+The optional `walletAddress` query is for a wallet already linked to the eMAID;
+the component normally omits it. NEVERFLAT returns `400 INVALID_WALLET_ADDRESS`
+for a malformed or non-scalar value and `403 WALLET_NOT_LINKED` for a valid
+address outside
+the eMAID's linked or active wallet set. A dependency outage remains the safe
+`500 WALLET_QUERY_UNAVAILABLE` response, so the component should show a retry
+state rather than treating it as an empty wallet.
 
 ### `POST /spend/session`
 

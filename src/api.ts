@@ -61,6 +61,22 @@ import { createAdminOperationsRouter, getAdminOperationRecoveryStatus } from './
 import type { AdminRecoveryOutcome } from './adminOperations';
 import { createRpcProvider, getPolygonRpcUrl } from './rpcProvider';
 import { presentAuditEvent } from './auditPresentation';
+import {
+  AdminAlertSettingsError,
+  dispatchAdminAlert,
+  getAdminAlertConfiguration,
+  updateAdminAlertSettings,
+} from './adminAlerts';
+import {
+  AdminEvidenceError,
+  createAdminCorrectionAnnotation,
+  getAdminEvidenceReport,
+  listAdminCorrectionAnnotations,
+  parseAdminCorrectionAnnotationRequest,
+  parseAdminEvidenceQuery,
+  parseAnnotationListQuery,
+  renderAdminEvidenceCsv,
+} from './adminEvidence';
 
 const app = express();
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
@@ -187,6 +203,52 @@ function normalizeUid(value: string): string {
   return trimmed;
 }
 
+class WalletQueryRequestError extends Error {
+  readonly statusCode: 400 | 403;
+  readonly code: 'INVALID_WALLET_ADDRESS' | 'WALLET_NOT_LINKED';
+
+  constructor(
+    statusCode: 400 | 403,
+    code: 'INVALID_WALLET_ADDRESS' | 'WALLET_NOT_LINKED',
+    message: string,
+  ) {
+    super(message);
+    this.name = 'WalletQueryRequestError';
+    this.statusCode = statusCode;
+    this.code = code;
+  }
+}
+
+function normalizeWalletAddressOverride(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || !ethers.isAddress(value)) {
+    throw new WalletQueryRequestError(
+      400,
+      'INVALID_WALLET_ADDRESS',
+      'walletAddress must be a valid Ethereum address',
+    );
+  }
+  return ethers.getAddress(value);
+}
+
+function sendWalletQueryError(res: Response, error: unknown, logLabel: string): void {
+  if (error instanceof WalletQueryRequestError) {
+    res.status(error.statusCode).json({
+      status: 'error',
+      code: error.code,
+      message: error.message,
+    });
+    return;
+  }
+
+  console.error(`${logLabel}:`, toServerAuditDiagnostic(error));
+  res.status(500).json({
+    status: 'error',
+    code: 'WALLET_QUERY_UNAVAILABLE',
+    message: 'The wallet could not be loaded right now. Please retry shortly.',
+  });
+}
+
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function getErrorMessage(err: unknown): string {
@@ -291,7 +353,26 @@ async function getReadinessChecks(): Promise<Array<{
   addCheck('manual_uid_lookup', 'Manual contract lookup', !ENABLE_TEST_UID_LOOKUP, 'Manual /wallet/:uid lookup disabled', 'ENABLE_TEST_UID_LOOKUP should be false in pilot/production', 'warn');
   addCheck('token_contract', 'Token contract address', ethers.isAddress(TOKEN_CONTRACT_ADDRESS), 'Token contract address is valid', 'TOKEN_CONTRACT_ADDRESS is missing or invalid');
   addCheck('treasury_address', 'Treasury address', !TREASURY_ADDRESS || ethers.isAddress(TREASURY_ADDRESS), 'Treasury address is valid or derived from signer', 'TREASURY_ADDRESS is invalid');
-  addCheck('admin_alerts', 'Admin alert delivery', Boolean(getAdminAlertWebhookUrl()), 'ADMIN_ALERT_WEBHOOK_URL configured', 'ADMIN_ALERT_WEBHOOK_URL is not configured; alerts will be audited but not sent', 'warn');
+  try {
+    const alertConfiguration = await getAdminAlertConfiguration();
+    const selectedChannel = alertConfiguration.settings.channel;
+    const channelCanDeliver = selectedChannel !== 'disabled' && alertConfiguration.canDeliver;
+    const passMessage = `${selectedChannel} alert provider configured`;
+    const failMessage = selectedChannel === 'disabled'
+      ? 'Admin alert delivery is disabled; review-required events will be audited only'
+      : alertConfiguration.configurationIssue === 'selected_channel_provider_incomplete'
+        ? 'Both alert providers are selected but one is unavailable; partial delivery may occur until both providers are configured'
+        : `${selectedChannel} alert provider is not configured; alerts will be audited but not sent`;
+    addCheck('admin_alerts', 'Admin alert delivery', channelCanDeliver, passMessage, failMessage, 'warn');
+  } catch (err) {
+    // Keep readiness useful during an additive migration. A missing settings
+    // row is an actionable warning, not a reason to hide the rest of the
+    // deployment state or fall back to the legacy webhook flag.
+    const message = err instanceof AdminAlertSettingsError
+      ? 'Admin alert settings are unavailable; run the additive alert-settings migration'
+      : 'Admin alert settings could not be read; alerts will be audited until configuration is available';
+    addCheck('admin_alerts', 'Admin alert delivery', false, 'Admin alert provider configured', message, 'warn');
+  }
 
   try {
     await treasurySigner.getAddress();
@@ -968,21 +1049,12 @@ function verifyLinkedWalletSignature(uid: string, walletAddress: string, action:
 }
 
 async function getWalletPayload(normalizedUid: string, walletAddressOverride?: string) {
+  const normalizedWalletAddressOverride = normalizeWalletAddressOverride(walletAddressOverride);
   const walletConfig = await getUserWalletConfig(normalizedUid);
-  const userAddress = walletAddressOverride && ethers.isAddress(walletAddressOverride)
-    ? ethers.getAddress(walletAddressOverride)
-    : walletConfig.walletAddress;
-
-  // Get user (if exists)
-  const user = walletAddressOverride
-    ? await Users.findByUidAndWallet(normalizedUid, userAddress)
-    : await Users.findByUid(normalizedUid);
-  const linkedUsers = await Users.findAllByWallet(userAddress);
-  const contractIds = linkedUsers.length ? linkedUsers.map(u => u.uid) : [normalizedUid];
-  const walletName = linkedUsers.find(u => u.wallet_name)?.wallet_name || null;
+  const userAddress = normalizedWalletAddressOverride || walletConfig.walletAddress;
   const linkedWalletRecords = await LinkedWallets.findByUid(normalizedUid);
   const linkedWalletAddresses = linkedWalletRecords.map(w => w.wallet_address);
-  if (walletAddressOverride) {
+  if (normalizedWalletAddressOverride) {
     const allowedWalletAddresses = [
       walletConfig.walletAddress,
       walletConfig.managedWalletAddress,
@@ -990,9 +1062,22 @@ async function getWalletPayload(normalizedUid: string, walletAddressOverride?: s
     ].map(address => address.toLowerCase());
 
     if (!allowedWalletAddresses.includes(userAddress.toLowerCase())) {
-      throw new Error('Wallet address is not linked to this EMP contract');
+      throw new WalletQueryRequestError(
+        403,
+        'WALLET_NOT_LINKED',
+        'Wallet address is not linked to this EMP contract',
+      );
     }
   }
+
+  // Get user (if exists) only after validating an optional address override.
+  // This keeps malformed and unlinked lookups from becoming dependency errors.
+  const user = normalizedWalletAddressOverride
+    ? await Users.findByUidAndWallet(normalizedUid, userAddress)
+    : await Users.findByUid(normalizedUid);
+  const linkedUsers = await Users.findAllByWallet(userAddress);
+  const contractIds = linkedUsers.length ? linkedUsers.map(u => u.uid) : [normalizedUid];
+  const walletName = linkedUsers.find(u => u.wallet_name)?.wallet_name || null;
   const linkedWallets = linkedWalletRecords.map(w => ({
     walletAddress: w.wallet_address,
     walletName: w.wallet_name || null,
@@ -2557,7 +2642,7 @@ function shouldAlertAdmin(data: {
   if (data.eventType.startsWith('admin_alert.')) {
     return false;
   }
-  if (data.status === 'warning' || data.status === 'retry_required') {
+  if (data.status === 'warning' || data.status === 'retry_required' || data.status === 'requires_review') {
     return true;
   }
   return data.status === 'error' && (
@@ -2616,10 +2701,24 @@ async function getPilotMetrics(hours = 24) {
 
 type AdminAlertDeliveryResult = {
   status: 'sent' | 'delivery_skipped' | 'delivery_failed';
-  reason?: 'admin_email_not_configured' | 'admin_alert_webhook_not_configured' | 'request_failed' | 'non_success_response';
+  reason?:
+    | 'email_provider_not_configured'
+    | 'webhook_not_configured'
+    | 'alert_channel_disabled'
+    | 'settings_unavailable'
+    | 'request_failed'
+    | 'redirect_blocked'
+    | 'non_success_response';
   webhookStatus?: number;
+  providerAccepted?: boolean;
+  partialFailure?: boolean;
 };
 
+/**
+ * Dispatch through the durable owner-selected alert settings. An unavailable
+ * settings store is a truthful skipped delivery; it must never fall back to a
+ * different recipient or legacy channel after an owner selection is missing.
+ */
 async function sendAdminAlert(data: {
   eventType: string;
   actorType: string;
@@ -2629,98 +2728,59 @@ async function sendAdminAlert(data: {
   status: string;
   metadata?: Record<string, unknown>;
 }): Promise<AdminAlertDeliveryResult> {
-  const adminEmail = getRegisteredAdminEmail();
-  const webhookUrl = getAdminAlertWebhookUrl();
-  if (!adminEmail || !webhookUrl) {
-    try {
-      await AuditLogs.create({
-        eventType: 'admin_alert.delivery_skipped',
-        actorType: 'system',
-        actorId: 'api',
-        targetType: data.targetType || null,
-        targetId: data.targetId || null,
-        status: 'warning',
-        metadata: {
-          reason: !adminEmail ? 'admin_email_not_configured' : 'admin_alert_webhook_not_configured',
-          sourceEventType: data.eventType,
-          sourceStatus: data.status,
-        },
-      });
-    } catch {
-      // Alert audit evidence must never break the user/API path.
-    }
-    return {
+  let delivery: Awaited<ReturnType<typeof dispatchAdminAlert>>;
+  try {
+    delivery = await dispatchAdminAlert(data);
+  } catch (error) {
+    console.warn('Admin alert settings dispatch failed:', toServerAuditDiagnostic(error));
+    delivery = {
       status: 'delivery_skipped',
-      reason: !adminEmail ? 'admin_email_not_configured' : 'admin_alert_webhook_not_configured',
+      providerAccepted: false,
+      partialFailure: false,
+      channels: [{ channel: 'email', status: 'skipped', reason: 'settings_unavailable' }],
     };
   }
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 5000);
+  const failedChannel = delivery.channels.find(channel => channel.status === 'failed');
+  const skippedChannel = delivery.channels.find(channel => channel.status === 'skipped');
+  const reason = failedChannel?.reason || skippedChannel?.reason;
+  const webhookStatus = delivery.channels.find(channel => channel.channel === 'webhook')?.httpStatus;
   try {
-    const response = await fetch(webhookUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        to: adminEmail,
-        subject: `NEVERFLAT ${data.status}: ${data.eventType}`,
-        eventType: data.eventType,
-        status: data.status,
-        actorType: data.actorType,
-        actorId: data.actorId || null,
-        targetType: data.targetType || null,
-        targetId: data.targetId || null,
-        metadata: data.metadata || {},
-        createdAt: new Date().toISOString(),
-      }),
-      signal: controller.signal,
+    await AuditLogs.create({
+      eventType: delivery.status === 'sent'
+        ? 'admin_alert.delivered'
+        : delivery.status === 'delivery_failed'
+          ? 'admin_alert.delivery_failed'
+          : 'admin_alert.delivery_skipped',
+      actorType: 'system',
+      actorId: 'api',
+      targetType: data.targetType || null,
+      targetId: data.targetId || null,
+      status: delivery.status === 'sent' ? 'success' : delivery.status === 'delivery_failed' ? 'error' : 'warning',
+      metadata: {
+        sourceEventType: data.eventType,
+        sourceStatus: data.status,
+        providerAccepted: delivery.providerAccepted,
+        partialFailure: delivery.partialFailure,
+        channels: delivery.channels.map(channel => ({
+          channel: channel.channel,
+          status: channel.status,
+          ...(channel.provider ? { provider: channel.provider } : {}),
+          ...(channel.httpStatus ? { httpStatus: channel.httpStatus } : {}),
+          ...(channel.reason ? { reason: channel.reason } : {}),
+        })),
+      },
     });
-
-    const deliveryResult: AdminAlertDeliveryResult = response.ok
-      ? { status: 'sent', webhookStatus: response.status }
-      : { status: 'delivery_failed', reason: 'non_success_response', webhookStatus: response.status };
-    try {
-      await AuditLogs.create({
-        eventType: response.ok ? 'admin_alert.delivered' : 'admin_alert.delivery_failed',
-        actorType: 'system',
-        actorId: 'api',
-        targetType: data.targetType || null,
-        targetId: data.targetId || null,
-        status: response.ok ? 'success' : 'error',
-        metadata: {
-          adminEmail,
-          webhookStatus: response.status,
-          sourceEventType: data.eventType,
-          sourceStatus: data.status,
-        },
-      });
-    } catch (auditErr) {
-      console.warn('Admin alert delivery audit write failed:', toServerAuditDiagnostic(auditErr));
-    }
-    return deliveryResult;
-  } catch (err) {
-    try {
-      await AuditLogs.create({
-        eventType: 'admin_alert.delivery_failed',
-        actorType: 'system',
-        actorId: 'api',
-        targetType: data.targetType || null,
-        targetId: data.targetId || null,
-        status: 'error',
-        metadata: {
-          adminEmail,
-          sourceEventType: data.eventType,
-          sourceStatus: data.status,
-          error: err instanceof Error ? err.message : String(err),
-        },
-      });
-    } catch {
-      // Alert audit evidence must never break the user/API path.
-    }
-    return { status: 'delivery_failed', reason: 'request_failed' };
-  } finally {
-    clearTimeout(timeout);
+  } catch (auditErr) {
+    console.warn('Admin alert delivery audit write failed:', toServerAuditDiagnostic(auditErr));
   }
+  return {
+    status: delivery.status,
+    ...(reason ? { reason } : {}),
+    ...(webhookStatus === undefined ? {} : { webhookStatus }),
+    providerAccepted: delivery.providerAccepted,
+    partialFailure: delivery.partialFailure,
+  };
 }
 
 /**
@@ -3195,6 +3255,64 @@ function buildOpenApiSpec(req: Request) {
           },
         },
       },
+      '/spend/custodial-intent': {
+        post: {
+          tags: ['Spends'],
+          summary: 'Build a user-signed custodial spend intent',
+          description: 'Validates that the wallet is linked to the eMAID and returns an ERC-20 transfer transaction for the user to sign. The route does not submit the transaction.',
+          security: apiKeySecurity,
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/CustodialSpendIntentRequest' },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: 'A user-signable custodial transfer intent',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/CustodialSpendIntentResponse' },
+                },
+              },
+            },
+            400: errorResponse,
+            401: errorResponse,
+            403: errorResponse,
+          },
+        },
+      },
+      '/spend/custodial-failure': {
+        post: {
+          tags: ['Spends'],
+          summary: 'Record an unresolved custodial spend submission',
+          description: 'Preserves the spend context when a user signature or submission result is uncertain. It does not claim that a transfer failed on chain and does not submit a replacement transaction.',
+          security: apiKeySecurity,
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/CustodialSpendFailureRequest' },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: 'The unresolved spend context was recorded and a retry intent was returned',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/CustodialSpendFailureResponse' },
+                },
+              },
+            },
+            400: errorResponse,
+            401: errorResponse,
+            403: errorResponse,
+          },
+        },
+      },
       '/spend-receipts/verify': {
         post: {
           tags: ['Spends'],
@@ -3258,7 +3376,10 @@ function buildOpenApiSpec(req: Request) {
               },
             },
             401: errorResponse,
-            403: errorResponse,
+            403: {
+              description: 'The supplied wallet address is not linked to this eMAID',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } },
+            },
             500: errorResponse,
           },
         },
@@ -3282,7 +3403,10 @@ function buildOpenApiSpec(req: Request) {
               },
             },
             401: errorResponse,
-            403: errorResponse,
+            403: {
+              description: 'The supplied wallet address is not linked to this eMAID',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } },
+            },
             500: errorResponse,
           },
         },
@@ -3713,6 +3837,299 @@ function buildOpenApiSpec(req: Request) {
           },
         },
       },
+      '/admin/audit': {
+        get: {
+          tags: ['Admin'],
+          summary: 'List safe operational audit events',
+          security: adminSecurity,
+          parameters: [
+            { name: 'limit', in: 'query', schema: { type: 'integer', minimum: 1, maximum: 500, default: 100 } },
+            { name: 'status', in: 'query', schema: { type: 'string' } },
+            { name: 'eventType', in: 'query', schema: { type: 'string' } },
+          ],
+          responses: {
+            200: {
+              description: 'Allowlisted audit events',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/AdminAuditResponse' } } },
+            },
+            401: errorResponse,
+            500: errorResponse,
+          },
+        },
+      },
+      '/admin/pilot-metrics': {
+        get: {
+          tags: ['Admin'],
+          summary: 'Read audit-derived pilot metrics',
+          security: adminSecurity,
+          parameters: [
+            { name: 'hours', in: 'query', schema: { type: 'number', minimum: 1, maximum: 168, default: 24 } },
+          ],
+          responses: {
+            200: {
+              description: 'Pilot metrics for the requested bounded window',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/PilotMetricsResponse' } } },
+            },
+            401: errorResponse,
+            500: errorResponse,
+          },
+        },
+      },
+      '/admin/readiness': {
+        get: {
+          tags: ['Admin'],
+          summary: 'Run deployment readiness checks',
+          security: adminSecurity,
+          responses: {
+            200: {
+              description: 'Readiness checks completed without failures',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/ReadinessResponse' } } },
+            },
+            401: errorResponse,
+            503: {
+              description: 'One or more readiness checks failed',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/ReadinessResponse' } } },
+            },
+          },
+        },
+      },
+      '/admin/alerts/settings': {
+        get: {
+          tags: ['Admin'],
+          summary: 'Read the owner-controlled alert destination and provider status',
+          security: adminSecurity,
+          responses: {
+            200: {
+              description: 'Alert destination and safe provider configuration status',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/AdminAlertSettingsResponse' } } },
+            },
+            401: errorResponse,
+            503: errorResponse,
+          },
+        },
+        patch: {
+          tags: ['Admin'],
+          summary: 'Update the owner-controlled alert destination or channel',
+          description: 'Only recipientEmail and channel are accepted. Provider credentials remain environment-only and are never returned or changed by this API.',
+          security: adminSecurity,
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/AdminAlertSettingsPatch' },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: 'Alert settings saved with current provider status',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/AdminAlertSettingsResponse' } } },
+            },
+            400: errorResponse,
+            401: errorResponse,
+            503: errorResponse,
+          },
+        },
+      },
+      '/admin/alerts/test': {
+        post: {
+          tags: ['Admin'],
+          summary: 'Send a configured admin alert test',
+          security: adminSecurity,
+          responses: {
+            202: {
+              description: 'Alert test was sent, queued, or safely recorded as skipped',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/AdminAlertTestResponse' } } },
+            },
+            401: errorResponse,
+            502: {
+              description: 'Configured alert delivery failed',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/AdminAlertTestResponse' } } },
+            },
+            503: {
+              description: 'Persisted alert settings are unavailable; no legacy recipient or webhook fallback is attempted',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/AdminAlertTestResponse' } } },
+            },
+          },
+        },
+      },
+      '/admin/evidence-pack': {
+        get: {
+          tags: ['Admin'],
+          summary: 'Export a point-in-time operational evidence snapshot',
+          security: adminSecurity,
+          responses: {
+            200: {
+              description: 'Evidence snapshot',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/EvidencePackResponse' } } },
+            },
+            401: errorResponse,
+            500: errorResponse,
+          },
+        },
+      },
+      '/admin/evidence-report': {
+        get: {
+          tags: ['Admin'],
+          summary: 'Read a bounded retained-data evidence report',
+          description: 'Reads retained database projections and persisted reconciliation metadata. It does not call the chain, run reconciliation, or expose raw CDR/intent payloads. JSON and CSV responses mask eMAID and wallet values by default.',
+          security: adminSecurity,
+          parameters: [
+            { name: 'from', in: 'query', schema: { type: 'string', format: 'date-time' }, description: 'Inclusive ISO timestamp ending in Z; defaults to 30 days before to.' },
+            { name: 'to', in: 'query', schema: { type: 'string', format: 'date-time' }, description: 'Inclusive ISO timestamp ending in Z; defaults to now.' },
+            { name: 'limit', in: 'query', schema: { type: 'integer', minimum: 1, maximum: 500, default: 100 } },
+            { name: 'offset', in: 'query', schema: { type: 'integer', minimum: 0, maximum: 100000, default: 0 } },
+            { name: 'scope', in: 'query', schema: { type: 'string', enum: ['all', 'unresolved'], default: 'all' } },
+            { name: 'emaid', in: 'query', schema: { type: 'string', maxLength: 255 }, description: 'Exact server-side eMAID filter; response values remain masked.' },
+            { name: 'operationType', in: 'query', schema: { type: 'string', enum: ['award', 'spend'] } },
+            { name: 'status', in: 'query', schema: { type: 'string', maxLength: 40 }, description: 'Exact retained status token; legacy status values are supported.' },
+            { name: 'format', in: 'query', schema: { type: 'string', enum: ['json', 'csv'], default: 'json' } },
+          ],
+          responses: {
+            200: {
+              description: 'Bounded JSON report or formula-escaped CSV export',
+              content: {
+                'application/json': { schema: { $ref: '#/components/schemas/AdminEvidenceReportResponse' } },
+                'text/csv': { schema: { type: 'string' } },
+              },
+            },
+            400: errorResponse,
+            401: errorResponse,
+            503: errorResponse,
+          },
+        },
+      },
+      '/admin/correction-annotations': {
+        get: {
+          tags: ['Admin'],
+          summary: 'List append-only correction annotations for one evidence subject',
+          security: adminSecurity,
+          parameters: [
+            { name: 'subjectType', in: 'query', required: true, schema: { type: 'string', enum: ['token_operation', 'award', 'spend'] } },
+            { name: 'subjectId', in: 'query', required: true, schema: { type: 'string', format: 'uuid' } },
+            { name: 'limit', in: 'query', schema: { type: 'integer', minimum: 1, maximum: 100, default: 25 } },
+            { name: 'offset', in: 'query', schema: { type: 'integer', minimum: 0, maximum: 100000, default: 0 } },
+          ],
+          responses: {
+            200: { description: 'Stored annotations', content: { 'application/json': { schema: { $ref: '#/components/schemas/AdminCorrectionAnnotationListResponse' } } } },
+            400: errorResponse,
+            401: errorResponse,
+            404: errorResponse,
+            503: errorResponse,
+          },
+        },
+        post: {
+          tags: ['Admin'],
+          summary: 'Append one authenticated correction annotation',
+          description: 'The original transaction reference must already exist in retained award, spend, or token-operation data. A case reference is an external support record. clientRequestId is unique per actor and must be reused for a transport retry; a different payload with the same id returns 409. This endpoint writes metadata only and has no financial side effects.',
+          security: adminSecurity,
+          requestBody: {
+            required: true,
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/AdminCorrectionAnnotationRequest' } } },
+          },
+          responses: {
+            201: { description: 'Annotation durably appended', content: { 'application/json': { schema: { $ref: '#/components/schemas/AdminCorrectionAnnotationResponse' } } } },
+            400: errorResponse,
+            401: errorResponse,
+            404: errorResponse,
+            409: errorResponse,
+            503: errorResponse,
+          },
+        },
+      },
+      '/admin/reconciliation/run': {
+        post: {
+          tags: ['Admin'],
+          summary: 'Run a bounded database versus chain reconciliation',
+          security: adminSecurity,
+          requestBody: {
+            required: false,
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ReconciliationRunRequest' },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: 'Reconciliation report generated',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/ReconciliationRunResponse' } } },
+            },
+            400: errorResponse,
+            401: errorResponse,
+            500: errorResponse,
+          },
+        },
+      },
+      '/admin/reconciliation': {
+        get: {
+          tags: ['Admin'],
+          summary: 'List stored reconciliation reports',
+          security: adminSecurity,
+          parameters: [
+            { name: 'limit', in: 'query', schema: { type: 'integer', minimum: 1, maximum: 100, default: 20 } },
+          ],
+          responses: {
+            200: {
+              description: 'Stored reconciliation reports',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/ReconciliationReportsResponse' } } },
+            },
+            400: errorResponse,
+            401: errorResponse,
+            500: errorResponse,
+          },
+        },
+      },
+      '/admin/operations': {
+        get: {
+          tags: ['Admin'],
+          summary: 'List durable token operation recovery visibility',
+          security: adminSecurity,
+          parameters: [
+            { name: 'scope', in: 'query', schema: { type: 'string', enum: ['unresolved', 'all'], default: 'unresolved' } },
+            { name: 'limit', in: 'query', schema: { type: 'integer', minimum: 1, maximum: 100, default: 25 } },
+            { name: 'offset', in: 'query', schema: { type: 'integer', minimum: 0, maximum: 100000, default: 0 } },
+            { name: 'emaid', in: 'query', schema: { type: 'string', maxLength: 255 } },
+          ],
+          responses: {
+            200: {
+              description: 'Safe operation rows and recovery decisions',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/AdminOperationsResponse' } } },
+            },
+            400: errorResponse,
+            401: errorResponse,
+            500: errorResponse,
+            503: errorResponse,
+          },
+        },
+      },
+      '/admin/operations/recover': {
+        post: {
+          tags: ['Admin'],
+          summary: 'Recover one existing token operation by its durable key',
+          description: 'Recovery accepts only the server-issued operationKey. It never accepts owner, amount, hash, or CDR overrides and never creates a replacement operation.',
+          security: adminSecurity,
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/AdminRecoveryRequest' },
+              },
+            },
+          },
+          responses: {
+            200: { description: 'Operation was recovered or is already projected', content: { 'application/json': { schema: { $ref: '#/components/schemas/AdminRecoveryResponse' } } } },
+            202: { description: 'Recovery remains pending', content: { 'application/json': { schema: { $ref: '#/components/schemas/AdminRecoveryResponse' } } } },
+            400: errorResponse,
+            401: errorResponse,
+            404: { description: 'The durable operation key was not found; no transfer was submitted', content: { 'application/json': { schema: { $ref: '#/components/schemas/AdminRecoveryResponse' } } } },
+            409: { description: 'Recovery is blocked and requires review; no replacement transfer was submitted', content: { 'application/json': { schema: { $ref: '#/components/schemas/AdminRecoveryResponse' } } } },
+            422: { description: 'The saved operation could not be recovered safely; no replacement transfer was submitted', content: { 'application/json': { schema: { $ref: '#/components/schemas/AdminRecoveryResponse' } } } },
+            503: { description: 'Recovery lookup or outcome audit is unavailable; retry the same operation key and no replacement transfer is submitted', content: { 'application/json': { schema: { $ref: '#/components/schemas/AdminRecoveryResponse' } } } },
+            500: { description: 'Recovery execution failed without a replacement transfer', content: { 'application/json': { schema: { $ref: '#/components/schemas/AdminRecoveryResponse' } } } },
+          },
+        },
+      },
     },
     components: {
       securitySchemes: {
@@ -3763,7 +4180,8 @@ function buildOpenApiSpec(req: Request) {
           name: 'walletAddress',
           in: 'query',
           required: false,
-          schema: { type: 'string', example: '0x281cdB9F9407Ad029a6d7d5d9989a8362CDb7A59' },
+          description: 'Optional wallet override. It must be a valid Ethereum address linked to the requested eMAID; omit it to read the active wallet.',
+          schema: { type: 'string', pattern: '^0x[a-fA-F0-9]{40}$' },
         },
       },
       schemas: {
@@ -4280,6 +4698,75 @@ function buildOpenApiSpec(req: Request) {
             providerId: { type: 'string', example: 'NF' },
           },
         },
+        CustodialSpendIntentRequest: {
+          type: 'object',
+          required: ['uid', 'walletAddress', 'amount'],
+          properties: {
+            uid: { type: 'string', description: 'eMAID/contract ID that owns the linked wallet', example: '000' },
+            walletAddress: { type: 'string', description: 'Checksum or lowercase address linked to the eMAID', example: '0x281cdB9F9407Ad029a6d7d5d9989a8362CDb7A59' },
+            amount: { type: 'number', minimum: 0, exclusiveMinimum: true, multipleOf: 0.01, example: 5 },
+            sessionId: { type: 'string', nullable: true, example: 'spend-001' },
+            providerId: { type: 'string', nullable: true, example: 'NF' },
+          },
+        },
+        CustodialSpendFailureRequest: {
+          allOf: [
+            { $ref: '#/components/schemas/CustodialSpendIntentRequest' },
+            {
+              type: 'object',
+              properties: {
+                intentId: { type: 'string', description: 'Previously returned intent ID, when available', example: 'csi_0123456789abcdef01234567' },
+                reason: { type: 'string', maxLength: 500, description: 'Safe caller explanation for the unresolved submission' },
+              },
+            },
+          ],
+        },
+        CustodialSpendIntent: {
+          type: 'object',
+          required: ['intentId', 'contractId', 'walletAddress', 'amount', 'chainId', 'tokenContractAddress', 'treasuryAddress', 'retryable', 'transaction'],
+          properties: {
+            intentId: { type: 'string', example: 'csi_0123456789abcdef01234567' },
+            contractId: { type: 'string', example: '000' },
+            walletAddress: { type: 'string' },
+            amount: { type: 'string', example: '5.00' },
+            sessionId: { type: 'string', nullable: true },
+            providerId: { type: 'string', nullable: true },
+            chainId: { type: 'integer', example: 80002 },
+            tokenContractAddress: { type: 'string' },
+            treasuryAddress: { type: 'string' },
+            retryable: { type: 'boolean', example: true },
+            transaction: {
+              type: 'object',
+              required: ['from', 'to', 'value', 'data'],
+              properties: {
+                from: { type: 'string' },
+                to: { type: 'string' },
+                value: { type: 'string', example: '0' },
+                data: { type: 'string' },
+              },
+            },
+          },
+        },
+        CustodialSpendIntentResponse: {
+          type: 'object',
+          required: ['status', 'uid', 'message', 'spendIntent'],
+          properties: {
+            status: { type: 'string', enum: ['requires_signature'] },
+            uid: { type: 'string' },
+            message: { type: 'string' },
+            spendIntent: { $ref: '#/components/schemas/CustodialSpendIntent' },
+          },
+        },
+        CustodialSpendFailureResponse: {
+          type: 'object',
+          required: ['status', 'uid', 'message', 'spendIntent'],
+          properties: {
+            status: { type: 'string', enum: ['retry_required'] },
+            uid: { type: 'string' },
+            message: { type: 'string' },
+            spendIntent: { $ref: '#/components/schemas/CustodialSpendIntent' },
+          },
+        },
         WalletResponse: {
           type: 'object',
           properties: {
@@ -4516,6 +5003,495 @@ function buildOpenApiSpec(req: Request) {
                 GB: [{ start: '22:00', end: '06:00' }],
               },
             },
+          },
+        },
+        AdminAuditEvent: {
+          type: 'object',
+          required: ['id', 'event_type', 'actor_type', 'status', 'created_at', 'presentation'],
+          properties: {
+            id: { type: 'string' },
+            event_type: { type: 'string' },
+            actor_type: { type: 'string' },
+            actor_id: { type: 'string', nullable: true },
+            target_type: { type: 'string', nullable: true },
+            target_id: { type: 'string', nullable: true },
+            status: { type: 'string' },
+            created_at: { type: 'string', format: 'date-time' },
+            presentation: { type: 'object', additionalProperties: true },
+          },
+        },
+        AdminAuditResponse: {
+          type: 'object',
+          required: ['status', 'count', 'events'],
+          properties: {
+            status: { type: 'string', enum: ['ok'] },
+            count: { type: 'integer' },
+            events: { type: 'array', items: { $ref: '#/components/schemas/AdminAuditEvent' } },
+          },
+        },
+        PilotMetricsResponse: {
+          type: 'object',
+          required: ['status', 'metrics'],
+          properties: {
+            status: { type: 'string', enum: ['ok'] },
+            metrics: {
+              type: 'object',
+              required: ['windowHours', 'since', 'generatedAt', 'totalEvents', 'lastEventAt', 'awards', 'spends', 'operations', 'eventTypes'],
+              properties: {
+                windowHours: { type: 'number' },
+                since: { type: 'string', format: 'date-time' },
+                generatedAt: { type: 'string', format: 'date-time' },
+                totalEvents: { type: 'integer' },
+                lastEventAt: { type: 'string', format: 'date-time', nullable: true },
+                awards: {
+                  type: 'object',
+                  properties: {
+                    completed: { type: 'integer' },
+                    notEligible: { type: 'integer' },
+                    duplicates: { type: 'integer' },
+                    failures: { type: 'integer' },
+                  },
+                },
+                spends: {
+                  type: 'object',
+                  properties: {
+                    completed: { type: 'integer' },
+                    custodialRecorded: { type: 'integer' },
+                    custodialIntentsCreated: { type: 'integer' },
+                    retryRequired: { type: 'integer' },
+                    failures: { type: 'integer' },
+                  },
+                },
+                operations: {
+                  type: 'object',
+                  properties: {
+                    warnings: { type: 'integer' },
+                    errors: { type: 'integer' },
+                    retryRequired: { type: 'integer' },
+                    deliveredAlerts: { type: 'integer' },
+                    skippedAlerts: { type: 'integer' },
+                    reconciliationRuns: { type: 'integer' },
+                  },
+                },
+                eventTypes: { type: 'object', additionalProperties: { type: 'integer' } },
+              },
+            },
+          },
+        },
+        ReadinessCheck: {
+          type: 'object',
+          required: ['key', 'label', 'status', 'message'],
+          properties: {
+            key: { type: 'string' },
+            label: { type: 'string' },
+            status: { type: 'string', enum: ['pass', 'fail', 'warn'] },
+            message: { type: 'string' },
+          },
+        },
+        ReadinessResponse: {
+          type: 'object',
+          required: ['status', 'failedCount', 'warningCount', 'checks'],
+          properties: {
+            status: { type: 'string', enum: ['ready', 'ready_with_warnings', 'not_ready'] },
+            failedCount: { type: 'integer' },
+            warningCount: { type: 'integer' },
+            checks: { type: 'array', items: { $ref: '#/components/schemas/ReadinessCheck' } },
+          },
+        },
+        AdminAlertTestResponse: {
+          type: 'object',
+          required: ['status', 'deliveryStatus', 'providerAccepted', 'partialFailure', 'deliveryReason', 'message', 'adminEmailConfigured', 'webhookConfigured'],
+          properties: {
+            status: { type: 'string', enum: ['sent_or_queued', 'delivery_skipped', 'delivery_failed'] },
+            deliveryStatus: { type: 'string', enum: ['sent_or_queued', 'delivery_skipped', 'delivery_failed'] },
+            providerAccepted: { type: 'boolean' },
+            partialFailure: { type: 'boolean' },
+            deliveryReason: { type: 'string', nullable: true },
+            message: { type: 'string' },
+            webhookStatus: { type: 'integer', nullable: true },
+            adminEmailConfigured: { type: 'boolean' },
+            webhookConfigured: { type: 'boolean' },
+          },
+        },
+        AdminAlertSettingsPatch: {
+          type: 'object',
+          minProperties: 1,
+          additionalProperties: false,
+          properties: {
+            recipientEmail: { type: 'string', format: 'email', maxLength: 320, example: 'alerts@example.test' },
+            channel: { type: 'string', enum: ['email', 'webhook', 'both', 'disabled'], example: 'email' },
+          },
+        },
+        AdminAlertSettings: {
+          type: 'object',
+          required: ['recipientEmail', 'channel', 'updatedAt'],
+          properties: {
+            recipientEmail: { type: 'string', format: 'email' },
+            channel: { type: 'string', enum: ['email', 'webhook', 'both', 'disabled'] },
+            updatedAt: { type: 'string', format: 'date-time' },
+          },
+        },
+        AdminAlertEmailProviderStatus: {
+          type: 'object',
+          required: ['configured', 'provider', 'apiKeyConfigured', 'fromConfigured', 'acceptedStatus', 'acceptanceMeaning'],
+          properties: {
+            configured: { type: 'boolean' },
+            provider: { type: 'string', enum: ['sendgrid'] },
+            apiKeyConfigured: { type: 'boolean' },
+            fromConfigured: { type: 'boolean' },
+            acceptedStatus: { type: 'integer', enum: [202] },
+            acceptanceMeaning: { type: 'string', enum: ['provider_accepted'] },
+          },
+        },
+        AdminAlertDeliveryStatus: {
+          type: 'object',
+          required: ['email', 'webhook', 'canDeliver', 'configurationIssue', 'deliveryNote'],
+          properties: {
+            email: { $ref: '#/components/schemas/AdminAlertEmailProviderStatus' },
+            webhook: {
+              type: 'object',
+              required: ['configured'],
+              properties: { configured: { type: 'boolean' } },
+            },
+            canDeliver: { type: 'boolean' },
+            configurationIssue: { type: 'string', enum: ['selected_channel_provider_incomplete'], nullable: true },
+            deliveryNote: { type: 'string', enum: ['provider_acceptance_is_not_inbox_delivery'] },
+          },
+        },
+        AdminAlertSettingsResponse: {
+          type: 'object',
+          required: ['status', 'settings', 'delivery'],
+          properties: {
+            status: { type: 'string', enum: ['ok'] },
+            settings: { $ref: '#/components/schemas/AdminAlertSettings' },
+            delivery: { $ref: '#/components/schemas/AdminAlertDeliveryStatus' },
+          },
+        },
+        AdminEvidenceAsset: {
+          type: 'object',
+          required: ['chainId', 'tokenContractAddress', 'provenance'],
+          properties: {
+            chainId: { type: 'string', nullable: true },
+            tokenContractAddress: { type: 'string', nullable: true },
+            provenance: { type: 'string', enum: ['stored_operation_context', 'legacy_unknown', 'conflict_unknown'] },
+          },
+        },
+        AdminEvidenceHistoricalPolicy: {
+          type: 'object',
+          required: ['source', 'revision', 'rulesVersion', 'safePolicyFingerprint'],
+          properties: {
+            source: { type: 'string', enum: ['operation_snapshot', 'not_applicable', 'unknown'] },
+            revision: { type: 'integer', nullable: true },
+            rulesVersion: { type: 'string', nullable: true },
+            safePolicyFingerprint: { type: 'string', nullable: true },
+          },
+        },
+        AdminEvidenceReportResponse: {
+          type: 'object',
+          required: ['status', 'generatedAt', 'period', 'policy', 'summary', 'coverage', 'reconciliation', 'pagination', 'rows'],
+          properties: {
+            status: { type: 'string', enum: ['ok'] },
+            generatedAt: { type: 'string', format: 'date-time' },
+            period: { type: 'object', required: ['from', 'to', 'observationAt'], properties: { from: { type: 'string', format: 'date-time' }, to: { type: 'string', format: 'date-time' }, observationAt: { type: 'string', format: 'date-time' } } },
+            policy: { type: 'object', required: ['currentRevision', 'currentUpdatedAt'], properties: { currentRevision: { type: 'integer', nullable: true }, currentUpdatedAt: { type: 'string', format: 'date-time', nullable: true } } },
+            summary: {
+              type: 'object',
+              required: ['basis', 'issuedMovementCount', 'returnedMovementCount', 'confirmedMovementCount', 'exceptionCount', 'totalsByAsset'],
+              properties: {
+                basis: { type: 'string', enum: ['selected retained data in requested window'] },
+                issuedMovementCount: { type: 'integer' },
+                returnedMovementCount: { type: 'integer' },
+                confirmedMovementCount: { type: 'integer' },
+                exceptionCount: { type: 'integer' },
+                totalsByAsset: { type: 'array', items: { allOf: [{ $ref: '#/components/schemas/AdminEvidenceAsset' }], properties: { awardedSparkz: { type: 'string' }, spentSparkz: { type: 'string' }, netIssuedSparkz: { type: 'string' } } } },
+              },
+            },
+            coverage: { type: 'object', additionalProperties: true },
+            reconciliation: { type: 'object', additionalProperties: true },
+            pagination: { type: 'object', required: ['limit', 'offset', 'hasMore', 'nextOffset'], properties: { limit: { type: 'integer' }, offset: { type: 'integer' }, hasMore: { type: 'boolean' }, nextOffset: { type: 'integer', nullable: true } } },
+            rows: {
+              type: 'array',
+              items: {
+                type: 'object',
+                required: ['subjectType', 'subjectId', 'operationType', 'eMAID', 'walletAddress', 'amountSparkz', 'asset', 'historicalPolicy', 'timestamps', 'annotationCount'],
+                properties: {
+                  subjectType: { type: 'string', enum: ['token_operation', 'award', 'spend'] },
+                  subjectId: { type: 'string', format: 'uuid' },
+                  operationKey: { type: 'string', nullable: true },
+                  operationType: { type: 'string', enum: ['award', 'spend'] },
+                  eMAID: { type: 'string', nullable: true },
+                  walletAddress: { type: 'string', nullable: true },
+                  amountSparkz: { type: 'string' },
+                  status: { type: 'string', nullable: true },
+                  movementOutcome: { type: 'string', nullable: true },
+                  transactionHash: { type: 'string', nullable: true },
+                  asset: { $ref: '#/components/schemas/AdminEvidenceAsset' },
+                  historicalPolicy: { $ref: '#/components/schemas/AdminEvidenceHistoricalPolicy' },
+                  timestamps: { type: 'object', additionalProperties: true },
+                  exceptionCategory: { type: 'string', nullable: true },
+                  annotationCount: { type: 'integer' },
+                },
+              },
+            },
+          },
+        },
+        AdminCorrectionAnnotation: {
+          type: 'object',
+          required: ['id', 'clientRequestId', 'subjectType', 'subjectId', 'referenceType', 'reference', 'reason', 'actorType', 'actorId', 'createdAt', 'resolvedReference'],
+          properties: {
+            id: { type: 'string', format: 'uuid' },
+            clientRequestId: { type: 'string', format: 'uuid' },
+            subjectType: { type: 'string', enum: ['token_operation', 'award', 'spend'] },
+            subjectId: { type: 'string', format: 'uuid' },
+            referenceType: { type: 'string', enum: ['transaction', 'case'] },
+            reference: { type: 'string' },
+            reason: { type: 'string' },
+            actorType: { type: 'string', enum: ['admin_session'] },
+            actorId: { type: 'string' },
+            createdAt: { type: 'string', format: 'date-time' },
+            resolvedReference: {
+              type: 'object',
+              required: ['provenance', 'operationKey', 'chainId', 'tokenContractAddress'],
+              properties: {
+                provenance: { type: 'string', enum: ['retained_operation', 'retained_award', 'retained_spend', 'external_case', 'unknown', 'conflict_unknown'] },
+                operationKey: { type: 'string', nullable: true },
+                chainId: { type: 'string', nullable: true },
+                tokenContractAddress: { type: 'string', nullable: true },
+              },
+            },
+          },
+        },
+        AdminCorrectionAnnotationRequest: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['clientRequestId', 'subjectType', 'subjectId', 'referenceType', 'reference', 'reason'],
+          properties: {
+            clientRequestId: { type: 'string', format: 'uuid' },
+            subjectType: { type: 'string', enum: ['token_operation', 'award', 'spend'] },
+            subjectId: { type: 'string', format: 'uuid' },
+            referenceType: { type: 'string', enum: ['transaction', 'case'] },
+            reference: { type: 'string', maxLength: 320 },
+            reason: { type: 'string', maxLength: 2000 },
+          },
+        },
+        AdminCorrectionAnnotationResponse: {
+          type: 'object',
+          required: ['status', 'sideEffects', 'annotation'],
+          properties: {
+            status: { type: 'string', enum: ['ok'] },
+            sideEffects: { type: 'object', required: ['financial'], properties: { financial: { type: 'boolean', enum: [false] } } },
+            annotation: { $ref: '#/components/schemas/AdminCorrectionAnnotation' },
+          },
+        },
+        AdminCorrectionAnnotationListResponse: {
+          type: 'object',
+          required: ['status', 'count', 'limit', 'offset', 'hasMore', 'nextOffset', 'annotations'],
+          properties: {
+            status: { type: 'string', enum: ['ok'] },
+            count: { type: 'integer' },
+            limit: { type: 'integer' },
+            offset: { type: 'integer' },
+            hasMore: { type: 'boolean' },
+            nextOffset: { type: 'integer', nullable: true },
+            annotations: { type: 'array', items: { $ref: '#/components/schemas/AdminCorrectionAnnotation' } },
+          },
+        },
+        EvidencePackResponse: {
+          type: 'object',
+          required: ['status', 'generatedAt', 'readiness', 'configuration', 'reconciliation', 'pilotMetrics', 'audit'],
+          properties: {
+            status: { type: 'string', enum: ['ok'] },
+            generatedAt: { type: 'string', format: 'date-time' },
+            readiness: { $ref: '#/components/schemas/ReadinessResponse' },
+            configuration: {
+              type: 'object',
+              required: [
+                'apiKeyConfigured',
+                'ingestApiKeyConfigured',
+                'adminEmailConfigured',
+                'adminAlertWebhookConfigured',
+                'manualUidLookupEnabled',
+                'tokenContractAddress',
+                'treasuryAddress',
+                'polygonRpcConfigured',
+              ],
+              properties: {
+                apiKeyConfigured: { type: 'boolean' },
+                ingestApiKeyConfigured: { type: 'boolean' },
+                adminEmailConfigured: { type: 'boolean' },
+                adminAlertWebhookConfigured: { type: 'boolean' },
+                manualUidLookupEnabled: { type: 'boolean' },
+                tokenContractAddress: { type: 'string' },
+                treasuryAddress: { type: 'string', nullable: true },
+                polygonRpcConfigured: { type: 'boolean' },
+              },
+            },
+            reconciliation: {
+              type: 'object',
+              required: ['latest'],
+              properties: {
+                latest: { allOf: [{ $ref: '#/components/schemas/ReconciliationReport' }], nullable: true },
+              },
+            },
+            pilotMetrics: { $ref: '#/components/schemas/PilotMetricsResponse/properties/metrics' },
+            audit: {
+              type: 'object',
+              required: ['retryRequired', 'warnings', 'errors', 'reviewRequired', 'deliveredAlerts'],
+              properties: {
+                retryRequired: { type: 'array', items: { $ref: '#/components/schemas/AdminAuditEvent' } },
+                warnings: { type: 'array', items: { $ref: '#/components/schemas/AdminAuditEvent' } },
+                errors: { type: 'array', items: { $ref: '#/components/schemas/AdminAuditEvent' } },
+                reviewRequired: { type: 'array', items: { $ref: '#/components/schemas/AdminAuditEvent' } },
+                deliveredAlerts: { type: 'array', items: { $ref: '#/components/schemas/AdminAuditEvent' } },
+              },
+            },
+          },
+        },
+        ReconciliationItem: {
+          type: 'object',
+          required: ['uid', 'walletAddress', 'dbBalance', 'chainBalance', 'difference', 'status'],
+          properties: {
+            uid: { type: 'string' },
+            walletAddress: { type: 'string' },
+            dbBalance: { type: 'string', nullable: true },
+            chainBalance: { type: 'string', nullable: true },
+            difference: { type: 'string', nullable: true },
+            status: { type: 'string', enum: ['matched', 'amount_mismatch', 'missing_db_balance', 'chain_read_failed'] },
+            error: { type: 'string', nullable: true },
+          },
+        },
+        ReconciliationReport: {
+          type: 'object',
+          required: ['id', 'status', 'checked_count', 'matched_count', 'mismatch_count', 'items', 'metadata', 'created_at'],
+          properties: {
+            id: { type: 'string' },
+            status: { type: 'string', enum: ['matched', 'mismatch'] },
+            checked_count: { type: 'integer' },
+            matched_count: { type: 'integer' },
+            mismatch_count: { type: 'integer' },
+            items: { type: 'array', items: { $ref: '#/components/schemas/ReconciliationItem' } },
+            metadata: { type: 'object', additionalProperties: true },
+            created_at: { type: 'string', format: 'date-time' },
+          },
+        },
+        ReconciliationRunRequest: {
+          type: 'object',
+          additionalProperties: false,
+          properties: { limit: { type: 'integer', minimum: 1, maximum: 1000, default: 500 } },
+        },
+        ReconciliationRunResponse: {
+          type: 'object',
+          required: ['status', 'report'],
+          properties: {
+            status: { type: 'string', enum: ['ok'] },
+            report: { $ref: '#/components/schemas/ReconciliationReport' },
+          },
+        },
+        ReconciliationReportsResponse: {
+          type: 'object',
+          required: ['status', 'count', 'latest', 'reports'],
+          properties: {
+            status: { type: 'string', enum: ['ok'] },
+            count: { type: 'integer' },
+            latest: { allOf: [{ $ref: '#/components/schemas/ReconciliationReport' }], nullable: true },
+            reports: { type: 'array', items: { $ref: '#/components/schemas/ReconciliationReport' } },
+          },
+        },
+        AdminRecoveryRequest: {
+          type: 'object',
+          required: ['operationKey'],
+          additionalProperties: false,
+          properties: { operationKey: { type: 'string', minLength: 1 } },
+        },
+        AdminRecoveryResponse: {
+          type: 'object',
+          description: 'Allowlisted recovery lifecycle response. Completed, pending, blocked, invalid, not-found, and unavailable outcomes use this structured shape; blocked and unavailable outcomes do not claim a replacement transfer.',
+          required: ['status'],
+          properties: {
+            status: { type: 'string', enum: ['ok', 'pending', 'blocked', 'error'] },
+            recoveryStatus: { type: 'string', enum: ['completed', 'completed_audit_pending', 'pending', 'blocked', 'error', 'audit_pending'], nullable: true },
+            code: { type: 'string', nullable: true },
+            message: { type: 'string', nullable: true },
+            operationKey: { type: 'string', nullable: true },
+            operationType: { type: 'string', enum: ['award', 'spend'], nullable: true },
+            eMAID: { type: 'string', nullable: true },
+            transactionHash: { type: 'string', nullable: true },
+            amount: { type: 'number', nullable: true },
+            projectionStatus: { type: 'string', nullable: true },
+            receiptStatus: { type: 'string', nullable: true },
+            movementOutcome: { type: 'string', enum: ['confirmed', 'no_movement', 'unknown', 'review'], nullable: true },
+            noReplacementTransfer: { type: 'boolean', example: true },
+            retryable: { type: 'boolean', nullable: true },
+            requiresReview: { type: 'boolean', nullable: true },
+            spendReceipt: { type: 'object', nullable: true, additionalProperties: true },
+          },
+        },
+        AdminOperationDiagnostic: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            stage: { type: 'string' },
+            rpcMethod: { type: 'string' },
+            rpcCode: { type: 'string' },
+            httpStatus: { type: 'integer' },
+            traceId: { type: 'string' },
+            rpcEndpoint: { type: 'string' },
+            rpcFailover: { type: 'array', items: { type: 'object', additionalProperties: true } },
+            errorCode: { type: 'string' },
+            retryable: { type: 'boolean' },
+            savedHash: { type: 'string' },
+            nonce: { type: 'string' },
+          },
+        },
+        AdminOperationRow: {
+          type: 'object',
+          required: ['id', 'operationKey', 'operationType', 'eMAID', 'walletAddress', 'amount', 'status', 'movementOutcome', 'nextAction', 'recovery'],
+          properties: {
+            id: { type: 'string' },
+            operationKey: { type: 'string' },
+            operationType: { type: 'string', enum: ['award', 'spend'] },
+            eMAID: { type: 'string' },
+            walletAddress: { type: 'string' },
+            amount: { type: 'string' },
+            sessionId: { type: 'string', nullable: true },
+            providerId: { type: 'string', nullable: true },
+            reservationId: { type: 'string', nullable: true },
+            status: { type: 'string' },
+            movementOutcome: { type: 'string', enum: ['unknown', 'confirmed', 'no_movement', 'review'] },
+            transactionHash: { type: 'string', nullable: true },
+            errorMessage: { type: 'string', nullable: true },
+            errorCode: { type: 'string', nullable: true },
+            failureStage: { type: 'string', nullable: true },
+            diagnostic: { allOf: [{ $ref: '#/components/schemas/AdminOperationDiagnostic' }], nullable: true },
+            submittedAt: { type: 'string', format: 'date-time', nullable: true },
+            confirmedAt: { type: 'string', format: 'date-time', nullable: true },
+            projectedAt: { type: 'string', format: 'date-time', nullable: true },
+            createdAt: { type: 'string', format: 'date-time', nullable: true },
+            updatedAt: { type: 'string', format: 'date-time', nullable: true },
+            nextAction: { type: 'string' },
+            recovery: {
+              type: 'object',
+              required: ['eligible', 'reasonCode', 'reason'],
+              properties: {
+                eligible: { type: 'boolean' },
+                reasonCode: { type: 'string' },
+                reason: { type: 'string' },
+              },
+            },
+          },
+        },
+        AdminOperationsResponse: {
+          type: 'object',
+          required: ['status', 'count', 'total', 'limit', 'offset', 'hasMore', 'nextOffset', 'operations'],
+          properties: {
+            status: { type: 'string', enum: ['ok'] },
+            count: { type: 'integer' },
+            total: { type: 'integer' },
+            limit: { type: 'integer' },
+            offset: { type: 'integer' },
+            hasMore: { type: 'boolean' },
+            nextOffset: { type: 'integer', nullable: true },
+            operations: { type: 'array', items: { $ref: '#/components/schemas/AdminOperationRow' } },
           },
         },
         TimeRange: {
@@ -7252,16 +8228,11 @@ app.get('/wallet/me', validateApiKey, async (req: Request, res: Response) => {
       });
     }
 
-    const walletAddress = typeof req.query.walletAddress === 'string' ? req.query.walletAddress : '';
+    const walletAddress = normalizeWalletAddressOverride(req.query.walletAddress);
     const payload = await getWalletPayload(contractId, walletAddress);
     return res.status(200).json(payload);
   } catch (err) {
-    console.error('Wallet query (me) error:', err);
-    res.status(500).json({
-      status: 'error',
-      code: 'WALLET_QUERY_UNAVAILABLE',
-      message: 'The wallet could not be loaded right now. Please retry shortly.',
-    });
+    sendWalletQueryError(res, err, 'Wallet query (me) error');
   }
 });
 
@@ -7275,16 +8246,11 @@ app.get('/wallet/me', validateApiKey, async (req: Request, res: Response) => {
 app.get('/wallet/:uid', validateApiKey, ensureTestUidLookupEnabled, async (req: Request, res: Response) => {
   try {
     const normalizedUid = normalizeUid(req.params.uid || '');
-    const walletAddress = typeof req.query.walletAddress === 'string' ? req.query.walletAddress : '';
+    const walletAddress = normalizeWalletAddressOverride(req.query.walletAddress);
     const payload = await getWalletPayload(normalizedUid, walletAddress);
     return res.status(200).json(payload);
   } catch (err) {
-    console.error('Wallet query error:', err);
-    res.status(500).json({
-      status: 'error',
-      code: 'WALLET_QUERY_UNAVAILABLE',
-      message: 'The wallet could not be loaded right now. Please retry shortly.',
-    });
+    sendWalletQueryError(res, err, 'Wallet query error');
   }
 });
 
@@ -8181,11 +9147,127 @@ app.get('/admin/readiness', validateAdmin, async (_req: Request, res: Response) 
 });
 
 /**
- * Send a test alert to the registered admin alert target.
+ * Read the owner-controlled alert destination and safe provider status.
+ * GET /admin/alerts/settings
+ */
+app.get('/admin/alerts/settings', validateAdmin, async (_req: Request, res: Response) => {
+  try {
+    const configuration = await getAdminAlertConfiguration();
+    return res.status(200).json({
+      status: 'ok',
+      settings: configuration.settings,
+      delivery: {
+        email: configuration.email,
+        webhook: configuration.webhook,
+        canDeliver: configuration.canDeliver,
+        configurationIssue: configuration.configurationIssue || null,
+        deliveryNote: configuration.deliveryNote,
+      },
+    });
+  } catch (err) {
+    console.error('Admin alert settings read failed:', toServerAuditDiagnostic(err));
+    if (err instanceof AdminAlertSettingsError) {
+      return res.status(503).json({
+        status: 'error',
+        code: err.code,
+        message: err.message,
+      });
+    }
+    return res.status(503).json({
+      status: 'error',
+      code: 'ADMIN_ALERT_SETTINGS_UNAVAILABLE',
+      message: 'Admin alert settings could not be loaded. Please retry shortly.',
+    });
+  }
+});
+
+/**
+ * Update the owner-controlled alert destination or delivery channel. Provider
+ * credentials remain environment-only and are never accepted in this body.
+ * PATCH /admin/alerts/settings
+ */
+app.patch('/admin/alerts/settings', validateAdmin, async (req: Request, res: Response) => {
+  try {
+    const settings = await updateAdminAlertSettings(req.body);
+    const configuration = await getAdminAlertConfiguration();
+    return res.status(200).json({
+      status: 'ok',
+      settings,
+      delivery: {
+        email: configuration.email,
+        webhook: configuration.webhook,
+        canDeliver: configuration.canDeliver,
+        configurationIssue: configuration.configurationIssue || null,
+        deliveryNote: configuration.deliveryNote,
+      },
+    });
+  } catch (err) {
+    const isValidationError = err instanceof AdminAlertSettingsError
+      && err.code.startsWith('INVALID_ADMIN_ALERT_');
+    if (isValidationError) {
+      return res.status(400).json({
+        status: 'error',
+        code: err.code,
+        message: err.message,
+      });
+    }
+    console.error('Admin alert settings update failed:', toServerAuditDiagnostic(err));
+    if (err instanceof AdminAlertSettingsError) {
+      return res.status(503).json({
+        status: 'error',
+        code: err.code,
+        message: err.message,
+      });
+    }
+    return res.status(503).json({
+      status: 'error',
+      code: 'ADMIN_ALERT_SETTINGS_UNAVAILABLE',
+      message: 'Admin alert settings could not be saved. Please retry shortly.',
+    });
+  }
+});
+
+/**
+ * Send a test alert to the persisted admin alert target.
  * POST /admin/alerts/test
  */
 app.post('/admin/alerts/test', validateAdmin, async (req: Request, res: Response) => {
-  const adminEmail = getRegisteredAdminEmail();
+  let alertConfiguration: Awaited<ReturnType<typeof getAdminAlertConfiguration>>;
+  try {
+    alertConfiguration = await getAdminAlertConfiguration();
+  } catch (err) {
+    console.error('Admin alert test settings read failed:', toServerAuditDiagnostic(err));
+    await safeAuditLog({
+      eventType: 'admin_alert.test_requested',
+      actorType: 'admin_session',
+      actorId: req.header('Authorization')?.slice(7, 15) || null,
+      targetType: 'admin_alert_settings',
+      targetId: null,
+      status: 'warning',
+      metadata: { reason: 'settings_unavailable' },
+    });
+    const deliveryReason = 'settings_unavailable' as const;
+    await safeAuditLog({
+      eventType: 'admin_alert.delivery_skipped',
+      actorType: 'system',
+      actorId: 'api',
+      targetType: 'admin_alert_settings',
+      targetId: null,
+      status: 'warning',
+      metadata: { sourceEventType: 'admin_alert.test', sourceStatus: 'warning', reason: deliveryReason },
+    });
+    return res.status(503).json({
+      status: 'delivery_skipped',
+      deliveryStatus: 'delivery_skipped',
+      providerAccepted: false,
+      partialFailure: false,
+      deliveryReason,
+      message: 'Test alert was not sent because persisted alert settings are unavailable. Run the additive alert-settings migration and retry.',
+      adminEmailConfigured: false,
+      webhookConfigured: false,
+    });
+  }
+  const alertRecipient = alertConfiguration.settings.recipientEmail;
   const actorId = req.header('Authorization')?.slice(7, 15) || null;
 
   await safeAuditLog({
@@ -8193,10 +9275,10 @@ app.post('/admin/alerts/test', validateAdmin, async (req: Request, res: Response
     actorType: 'admin_session',
     actorId,
     targetType: 'admin_email',
-    targetId: adminEmail,
+    targetId: alertRecipient,
     status: 'success',
     metadata: {
-      webhookConfigured: Boolean(getAdminAlertWebhookUrl()),
+      webhookConfigured: alertConfiguration.webhook.configured,
     },
   });
 
@@ -8205,7 +9287,7 @@ app.post('/admin/alerts/test', validateAdmin, async (req: Request, res: Response
     actorType: 'admin_session',
     actorId,
     targetType: 'admin_email',
-    targetId: adminEmail,
+    targetId: alertRecipient,
     status: 'warning',
     metadata: {
       message: 'Manual NEVERFLAT admin alert test',
@@ -8213,17 +9295,26 @@ app.post('/admin/alerts/test', validateAdmin, async (req: Request, res: Response
     },
   });
 
-  const webhookConfigured = Boolean(getAdminAlertWebhookUrl());
-  res.status(delivery.status === 'delivery_failed' ? 502 : 202).json({
-    status: delivery.status === 'sent' ? 'sent_or_queued' : delivery.status,
+  const webhookConfigured = alertConfiguration.webhook.configured;
+  const deliveryStatus = delivery.status === 'sent' ? 'sent_or_queued' : delivery.status;
+  const responseStatus = delivery.reason === 'settings_unavailable'
+    ? 503
+    : delivery.status === 'delivery_failed' ? 502 : 202;
+  res.status(responseStatus).json({
+    status: deliveryStatus,
+    deliveryStatus,
+    providerAccepted: delivery.providerAccepted === true,
+    partialFailure: delivery.partialFailure === true,
+    deliveryReason: delivery.reason || null,
     message: delivery.status === 'sent'
-      ? 'Test alert sent to configured admin alert webhook.'
+      ? 'The configured alert provider accepted the test; inbox delivery is not confirmed by this response.'
       : delivery.status === 'delivery_failed'
         ? 'Test alert delivery failed; inspect the audit log and retry after the alert target is healthy.'
-        : 'Test alert recorded, but delivery was skipped because admin email or alert webhook is not configured.',
-    deliveryReason: delivery.reason,
+        : delivery.reason === 'settings_unavailable'
+          ? 'Test alert was not sent because persisted alert settings are unavailable. Run the additive alert-settings migration and retry.'
+          : 'Test alert recorded, but delivery was skipped because the selected alert channel is not configured.',
     webhookStatus: delivery.webhookStatus,
-    adminEmailConfigured: Boolean(adminEmail),
+    adminEmailConfigured: Boolean(alertRecipient),
     webhookConfigured,
   });
 });
@@ -8284,6 +9375,93 @@ app.get('/admin/evidence-pack', validateAdmin, async (_req: Request, res: Respon
       retryable: true,
       message: 'The evidence pack could not be generated. Please retry shortly.',
       error: 'The evidence pack could not be generated. Please retry shortly.',
+    });
+  }
+});
+
+/**
+ * Read a bounded database-only operational evidence report.  This route never
+ * calls the chain, runs reconciliation, or writes financial state.
+ * GET /admin/evidence-report?from=...&to=...&format=json|csv
+ */
+app.get('/admin/evidence-report', validateAdmin, async (req: Request, res: Response) => {
+  try {
+    const query = parseAdminEvidenceQuery(req.query);
+    const report = await getAdminEvidenceReport(query);
+    if (query.format === 'csv') {
+      res.status(200)
+        .type('text/csv')
+        .set('Content-Disposition', 'attachment; filename="neverflat-admin-evidence.csv"')
+        .send(renderAdminEvidenceCsv(report));
+      return;
+    }
+    res.status(200).json(report);
+  } catch (err) {
+    if (err instanceof AdminEvidenceError) {
+      res.status(err.statusCode).json({ status: 'error', code: err.code, message: err.message });
+      return;
+    }
+    console.error('Admin evidence report failed:', toServerAuditDiagnostic(err));
+    res.status(503).json({
+      status: 'error',
+      code: 'ADMIN_EVIDENCE_UNAVAILABLE',
+      retryable: true,
+      message: 'The admin evidence report is temporarily unavailable. Try again shortly.',
+    });
+  }
+});
+
+/**
+ * Append one authenticated operator annotation to an existing evidence
+ * subject.  The handler only writes migration-025 metadata; it never updates
+ * awards, spends, token operations, balances, receipts, or chain state.
+ * POST /admin/correction-annotations
+ */
+app.post('/admin/correction-annotations', validateAdmin, async (req: Request, res: Response) => {
+  try {
+    const request = parseAdminCorrectionAnnotationRequest(req.body);
+    const actorId = (req as Request & { adminIdentity?: string }).adminIdentity;
+    if (!actorId) {
+      res.status(401).json({ status: 'error', code: 'ADMIN_AUTHENTICATION_REQUIRED', message: 'Admin authentication required' });
+      return;
+    }
+    const response = await createAdminCorrectionAnnotation(request, actorId);
+    res.status(201).json(response);
+  } catch (err) {
+    if (err instanceof AdminEvidenceError) {
+      res.status(err.statusCode).json({ status: 'error', code: err.code, message: err.message });
+      return;
+    }
+    console.error('Admin correction annotation failed:', toServerAuditDiagnostic(err));
+    res.status(503).json({
+      status: 'error',
+      code: 'ANNOTATION_UNAVAILABLE',
+      retryable: true,
+      message: 'The correction annotation could not be saved. No financial state was changed.',
+    });
+  }
+});
+
+/**
+ * Read append-only annotations for one existing evidence subject.
+ * GET /admin/correction-annotations?subjectType=...&subjectId=...
+ */
+app.get('/admin/correction-annotations', validateAdmin, async (req: Request, res: Response) => {
+  try {
+    const query = parseAnnotationListQuery(req.query);
+    const response = await listAdminCorrectionAnnotations(query);
+    res.status(200).json(response);
+  } catch (err) {
+    if (err instanceof AdminEvidenceError) {
+      res.status(err.statusCode).json({ status: 'error', code: err.code, message: err.message });
+      return;
+    }
+    console.error('Admin correction annotation list failed:', toServerAuditDiagnostic(err));
+    res.status(503).json({
+      status: 'error',
+      code: 'ANNOTATION_UNAVAILABLE',
+      retryable: true,
+      message: 'Correction annotations are temporarily unavailable. Try again shortly.',
     });
   }
 });

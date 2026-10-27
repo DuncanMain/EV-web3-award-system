@@ -161,6 +161,178 @@ afterEach(async () => {
   else globalThis.window = originalWindow;
 });
 
+test('shows invalid wallet address as a caller error and clears it after an eMAID owner recovery', async () => {
+  const requests = [];
+  const loadedOwners = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const path = String(url);
+    requests.push({ path, init });
+    assert.match(path, /\/wallet\/me$/);
+    if (requests.length === 1) {
+      return response({ status: 'error', code: 'INVALID_WALLET_ADDRESS', message: 'raw server detail' }, 400);
+    }
+    return response(wallet('emaid-recovered'));
+  };
+
+  const renderer = await renderCard({
+    apiBaseUrl: 'http://local.test/api',
+    contractId: 'emaid-invalid',
+    sessionStatus: 'UNPLUGGED',
+    onWalletLoaded: value => loadedOwners.push(value.uid),
+  });
+  const failedText = text(renderer.toJSON());
+  assert.match(failedText, /linked wallet address is invalid/i);
+  assert.match(failedText, /Unavailable/);
+  assert.doesNotMatch(failedText, /Retry account/);
+  assert.doesNotMatch(failedText, /raw server detail/);
+  assert.equal(requests[0].init.method, 'GET');
+  assert.equal(requests[0].init.headers['x-contract-id'], 'emaid-invalid');
+  assert.equal(requests.filter(request => /\/spend\//.test(request.path)).length, 0);
+
+  await updateCard(renderer, {
+    apiBaseUrl: 'http://local.test/api',
+    contractId: 'emaid-recovered',
+    sessionStatus: 'UNPLUGGED',
+    onWalletLoaded: value => loadedOwners.push(value.uid),
+  });
+  const recoveredText = text(renderer.toJSON());
+  assert.match(recoveredText, /10\.00/);
+  assert.doesNotMatch(recoveredText, /linked wallet address is invalid/i);
+  assert.deepEqual(loadedOwners, ['emaid-recovered']);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].init.headers['x-contract-id'], 'emaid-recovered');
+  assert.equal(requests.filter(request => /\/spend\//.test(request.path)).length, 0);
+});
+
+test('shows an unlinked wallet as a linkage error and recovers without a financial action', async () => {
+  const requests = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const path = String(url);
+    requests.push({ path, init });
+    assert.match(path, /\/wallet\/me$/);
+    return requests.length === 1
+      ? response({ status: 'error', code: 'WALLET_NOT_LINKED', message: 'raw linkage detail' }, 403)
+      : response(wallet('emaid-linked'));
+  };
+
+  const renderer = await renderCard({
+    apiBaseUrl: 'http://local.test/api',
+    contractId: 'emaid-unlinked',
+    sessionStatus: 'UNPLUGGED',
+  });
+  const failedText = text(renderer.toJSON());
+  assert.match(failedText, /not linked to this eMAID/i);
+  assert.match(failedText, /Unavailable/);
+  assert.doesNotMatch(failedText, /Retry account/);
+  assert.doesNotMatch(failedText, /raw linkage detail/);
+  assert.equal(requests[0].init.headers['x-contract-id'], 'emaid-unlinked');
+
+  await updateCard(renderer, {
+    apiBaseUrl: 'http://local.test/api',
+    contractId: 'emaid-linked',
+    sessionStatus: 'UNPLUGGED',
+  });
+  const recoveredText = text(renderer.toJSON());
+  assert.match(recoveredText, /10\.00/);
+  assert.doesNotMatch(recoveredText, /not linked to this eMAID/i);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].init.headers['x-contract-id'], 'emaid-linked');
+  assert.equal(requests.filter(request => /\/spend\//.test(request.path)).length, 0);
+});
+
+test('offers a bounded read-only wallet retry for unavailable balance and recovers without repeated financial actions', async () => {
+  const requests = [];
+  let loadedCount = 0;
+  globalThis.fetch = async (url, init = {}) => {
+    const path = String(url);
+    requests.push({ path, init });
+    assert.match(path, /\/wallet\/me$/);
+    return requests.length === 1
+      ? response({ status: 'error', code: 'WALLET_QUERY_UNAVAILABLE', message: 'raw provider detail' }, 500)
+      : response(wallet('emaid-retry'));
+  };
+
+  const renderer = await renderCard({
+    apiBaseUrl: 'http://local.test/api',
+    contractId: 'emaid-retry',
+    sessionStatus: 'UNPLUGGED',
+    onWalletLoaded: () => { loadedCount += 1; },
+  });
+  const failedText = text(renderer.toJSON());
+  assert.match(failedText, /temporarily unavailable/i);
+  assert.match(failedText, /Unavailable/);
+  assert.match(failedText, /Retry account/);
+  assert.doesNotMatch(failedText, /raw provider detail/);
+  assert.equal(requests.length, 1);
+
+  const retryButton = renderer.root.findAllByType('button').find(button => text(button) === 'Retry account');
+  assert.ok(retryButton, 'retry action is present only for unavailable balance');
+  await act(async () => {
+    retryButton.props.onClick();
+  });
+  await flush();
+
+  const recoveredText = text(renderer.toJSON());
+  assert.match(recoveredText, /10\.00/);
+  assert.doesNotMatch(recoveredText, /temporarily unavailable/i);
+  assert.equal(requests.length, 2, 'retry performs exactly one additional wallet GET');
+  assert.equal(requests[0].init.method, 'GET');
+  assert.equal(requests[1].init.method, 'GET');
+  assert.equal(requests[0].init.headers['x-contract-id'], 'emaid-retry');
+  assert.equal(requests[1].init.headers['x-contract-id'], 'emaid-retry');
+  assert.equal(loadedCount, 1);
+  assert.equal(requests.filter(request => /\/spend\//.test(request.path)).length, 0);
+});
+
+test('rejects a 200 wallet response with an unavailable balance before owner state is committed', async () => {
+  const requests = [];
+  let loadedCount = 0;
+  globalThis.fetch = async (url, init = {}) => {
+    const path = String(url);
+    requests.push({ path, init });
+    assert.match(path, /\/wallet\/me$/);
+    return requests.length === 1
+      ? response({
+        status: 'success',
+        uid: 'emaid-200-unavailable',
+        balance: null,
+        balanceStatus: 'unavailable',
+      }, 200)
+      : response(wallet('emaid-200-unavailable'));
+  };
+
+  const renderer = await renderCard({
+    apiBaseUrl: 'http://local.test/api',
+    contractId: 'emaid-200-unavailable',
+    sessionStatus: 'UNPLUGGED',
+    onWalletLoaded: () => { loadedCount += 1; },
+  });
+  const failedText = text(renderer.toJSON());
+  assert.match(failedText, /temporarily unavailable/i);
+  assert.match(failedText, /Unavailable/);
+  assert.doesNotMatch(failedText, /0\.00/);
+  assert.match(failedText, /Retry account/);
+  assert.equal(loadedCount, 0, 'unavailable data does not reach the wallet callback');
+
+  const retryButton = renderer.root.findAllByType('button').find(button => text(button) === 'Retry account');
+  assert.ok(retryButton);
+  await act(async () => {
+    retryButton.props.onClick();
+  });
+  await flush();
+
+  const recoveredText = text(renderer.toJSON());
+  assert.match(recoveredText, /10\.00/);
+  assert.doesNotMatch(recoveredText, /temporarily unavailable/i);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].init.method, 'GET');
+  assert.equal(requests[1].init.method, 'GET');
+  assert.equal(requests[0].init.headers['x-contract-id'], 'emaid-200-unavailable');
+  assert.equal(requests[1].init.headers['x-contract-id'], 'emaid-200-unavailable');
+  assert.equal(loadedCount, 1);
+  assert.equal(requests.filter(request => /\/spend\//.test(request.path)).length, 0);
+});
+
 test('ignores delayed wallet and reservation responses from a previous owner', async () => {
   const oldWallet = deferred();
   const newWallet = deferred();

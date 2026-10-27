@@ -1219,6 +1219,24 @@ button:disabled {
   gap: 1.2rem;
 }
 
+.section-heading-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.section-heading-row h2 {
+  margin: 0 0 0.25rem;
+}
+
+.actions-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.7rem;
+  align-items: center;
+}
+
 .admin-rule-group {
   display: flex;
   flex-direction: column;
@@ -1571,6 +1589,298 @@ button:disabled {
   white-space: normal;
   overflow-wrap: anywhere;
   word-break: break-word;
+}
+
+/* ── Admin evidence reports ───────────────────────── */
+.admin-evidence-card {
+  gap: 1rem;
+}
+
+.admin-evidence-heading {
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+.admin-evidence-actions,
+.admin-evidence-pagination {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.admin-evidence-filter-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.75rem;
+  align-items: end;
+  padding: 0.85rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(245, 248, 255, 0.72);
+}
+
+.admin-evidence-filter-grid label,
+.admin-evidence-annotation-form label {
+  display: grid;
+  gap: 0.35rem;
+  color: var(--text-subtle);
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.admin-evidence-filter-grid button {
+  min-height: 2.45rem;
+}
+
+.admin-evidence-context {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem 1rem;
+  color: var(--text-subtle);
+  font-size: 0.78rem;
+}
+
+.admin-evidence-basis {
+  margin: -0.35rem 0 0;
+}
+
+.admin-evidence-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 0.65rem;
+}
+
+.admin-evidence-metric {
+  display: grid;
+  gap: 0.18rem;
+  min-width: 0;
+  padding: 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+}
+
+.admin-evidence-metric strong {
+  overflow-wrap: anywhere;
+  color: var(--text-main);
+  font-size: 1.05rem;
+}
+
+.admin-evidence-metric span {
+  color: var(--text-subtle);
+  font-size: 0.72rem;
+}
+
+.admin-evidence-support-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.admin-evidence-subpanel {
+  display: grid;
+  gap: 0.65rem;
+  min-width: 0;
+  padding: 0.85rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+}
+
+.admin-evidence-details {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0;
+}
+
+.admin-evidence-details > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  border-bottom: 1px solid rgba(51, 51, 51, 0.05);
+  padding-bottom: 0.3rem;
+}
+
+.admin-evidence-details dt,
+.admin-evidence-details dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.admin-evidence-details dt {
+  color: var(--text-subtle);
+  font-size: 0.75rem;
+}
+
+.admin-evidence-details dd {
+  text-align: right;
+  font-size: 0.78rem;
+}
+
+.admin-evidence-coverage {
+  display: grid;
+  gap: 0.4rem;
+  padding: 0.8rem;
+  border: 1px solid rgba(180, 83, 9, 0.25);
+  border-radius: 10px;
+  background: rgba(255, 247, 237, 0.9);
+  color: #92400e;
+  font-size: 0.8rem;
+}
+
+.admin-evidence-coverage ul {
+  display: grid;
+  gap: 0.25rem;
+  margin: 0;
+  padding-left: 1.15rem;
+}
+
+.admin-evidence-table-wrap {
+  width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.admin-evidence-table {
+  width: 100%;
+  min-width: 830px;
+  border-collapse: collapse;
+  font-size: 0.78rem;
+}
+
+.admin-evidence-table th,
+.admin-evidence-table td {
+  padding: 0.65rem 0.7rem;
+  border-bottom: 1px solid rgba(51, 51, 51, 0.06);
+  text-align: left;
+  vertical-align: top;
+}
+
+.admin-evidence-table thead th {
+  color: var(--text-subtle);
+  font-size: 0.7rem;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.admin-evidence-table tbody tr:last-child th,
+.admin-evidence-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.admin-evidence-table tbody tr.admin-evidence-row--selected {
+  background: rgba(20, 76, 221, 0.06);
+}
+
+.admin-evidence-table th[scope="row"] {
+  font-weight: 700;
+}
+
+.admin-evidence-secondary {
+  display: block;
+  margin-top: 0.16rem;
+  color: var(--text-subtle);
+  font-size: 0.7rem;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+.admin-evidence-select {
+  margin-top: 0.45rem;
+  padding: 0.3rem 0.5rem;
+  font-size: 0.72rem;
+}
+
+.admin-evidence-pagination {
+  justify-content: space-between;
+}
+
+.admin-evidence-annotation-panel {
+  display: grid;
+  gap: 0.85rem;
+  padding: 1rem;
+  border: 1px solid rgba(20, 76, 221, 0.18);
+  border-radius: 10px;
+  background: rgba(245, 248, 255, 0.74);
+}
+
+.admin-evidence-annotation-list {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.admin-evidence-annotation {
+  display: grid;
+  gap: 0.25rem;
+  padding: 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.admin-evidence-annotation p {
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.admin-evidence-annotation-form {
+  display: grid;
+  grid-template-columns: minmax(0, 0.7fr) minmax(0, 1.3fr);
+  gap: 0.75rem;
+  align-items: end;
+}
+
+.admin-evidence-annotation-form label:nth-of-type(3),
+.admin-evidence-annotation-form p,
+.admin-evidence-annotation-form button {
+  grid-column: 1 / -1;
+}
+
+.admin-evidence-annotation-form textarea {
+  resize: vertical;
+  min-height: 5rem;
+}
+
+@media (max-width: 900px) {
+  .admin-evidence-filter-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .admin-evidence-support-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 640px) {
+  .admin-evidence-heading,
+  .admin-evidence-pagination {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .admin-evidence-actions {
+    width: 100%;
+  }
+
+  .admin-evidence-actions button,
+  .admin-evidence-pagination button {
+    width: 100%;
+  }
+
+  .admin-evidence-filter-grid,
+  .admin-evidence-annotation-form {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-evidence-annotation-form label:nth-of-type(3),
+  .admin-evidence-annotation-form p,
+  .admin-evidence-annotation-form button {
+    grid-column: auto;
+  }
 }
 
 @keyframes fade-in {

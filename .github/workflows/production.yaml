@@ -122,6 +122,9 @@ jobs:
           BEIA_API_KEY: ${{ secrets.BEIA_API_KEY }}
           BEIA_ADMIN_EMAIL: ${{ secrets.BEIA_ADMIN_EMAIL }}
           BEIA_ADMIN_PASSWORD: ${{ secrets.BEIA_ADMIN_PASSWORD }}
+          ADMIN_ALERT_WEBHOOK_URL: ${{ secrets.ADMIN_ALERT_WEBHOOK_URL }}
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+          ADMIN_ALERT_EMAIL_FROM: ${{ secrets.ADMIN_ALERT_EMAIL_FROM }}
           GHCR_USER: ${{ github.actor }}
           GHCR_TOKEN: ${{ github.token }}
           SOURCE_COMMIT: ${{ github.sha }}
@@ -130,7 +133,7 @@ jobs:
           username: root
           key: ${{ secrets.SERVER_SSH_KEY }}
           command_timeout: 10m
-          envs: ADMIN_EMAIL,ADMIN_PASSWORD,BEIA_API_KEY,BEIA_ADMIN_EMAIL,BEIA_ADMIN_PASSWORD,GHCR_USER,GHCR_TOKEN,SOURCE_COMMIT
+          envs: ADMIN_EMAIL,ADMIN_PASSWORD,BEIA_API_KEY,BEIA_ADMIN_EMAIL,BEIA_ADMIN_PASSWORD,ADMIN_ALERT_WEBHOOK_URL,SENDGRID_API_KEY,ADMIN_ALERT_EMAIL_FROM,GHCR_USER,GHCR_TOKEN,SOURCE_COMMIT
           script: |
             set -euo pipefail
             DEPLOY_DIR=/root/neverflat
@@ -239,6 +242,17 @@ jobs:
                 'BEIA_ADMIN_EMAIL': os.environ['BEIA_ADMIN_EMAIL'],
                 'BEIA_ADMIN_PASSWORD': os.environ['BEIA_ADMIN_PASSWORD'],
             }
+            # A blank optional secret preserves the target-owned value. A
+            # non-blank secret is the explicit configuration action.
+            alert_webhook = os.environ.get('ADMIN_ALERT_WEBHOOK_URL', '').strip()
+            if alert_webhook:
+                updates['ADMIN_ALERT_WEBHOOK_URL'] = alert_webhook
+            sendgrid_api_key = os.environ.get('SENDGRID_API_KEY', '').strip()
+            if sendgrid_api_key:
+                updates['SENDGRID_API_KEY'] = sendgrid_api_key
+            email_from = os.environ.get('ADMIN_ALERT_EMAIL_FROM', '').strip()
+            if email_from:
+                updates['ADMIN_ALERT_EMAIL_FROM'] = email_from
             lines = path.read_text().splitlines() if path.exists() else []
             kept = [line for line in lines if not any(line.startswith(f'{key}=') for key in updates)]
             kept.extend(f'{key}={value}' for key, value in updates.items())
@@ -258,3 +272,26 @@ jobs:
               echo "Neverflat /ingest/health did not become ready" >&2
               exit 1
             fi
+
+      - name: Set up Node 22 for bounded live API smoke
+        timeout-minutes: 5
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Verify deployed API contract with read-only smoke
+        timeout-minutes: 5
+        env:
+          BEIA_API_KEY: ${{ secrets.BEIA_API_KEY }}
+          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+        run: node scripts/verify-live-api-smoke.js
+
+      - name: Upload sanitized live API smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neverflat-live-api-smoke-${{ github.run_id }}
+          path: outputs/live-api-remediation-2026-10-14/live-api-smoke.json
+          if-no-files-found: warn
+          retention-days: 14
